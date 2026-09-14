@@ -1,0 +1,17 @@
+# Used by Posit Connect Cloud (and rsconnect's writeManifest()/deployApp())
+# to decide which files in this repo belong to a given deployment, both
+# for bundling AND for R-package dependency scanning. This repo holds two
+# separate, unrelated Connect Cloud deployments:
+#   - shiny_app/app.R          -> the IM Monitoring Shiny dashboard
+#   - run_workflow.qmd (root)  -> the scheduled data pipeline
+# Without this file, publishing run_workflow.qmd fails with
+# "This content is missing the following dependencies: shiny" because the
+# dependency scanner walks the whole repo and picks up shiny_app/app.R's
+# library(shiny) call even though the pipeline itself never uses shiny.
+# These directories are irrelevant to the pipeline and safe to exclude
+# from ITS deployment entirely (shiny_app/ has its own manifest.json and
+# is unaffected by this file, since its bundle root is shiny_app/ itself).
+shiny_app/
+_archive/
+Claude outputs/
+AFRO_Independant_Monitoring_data_workflow/
