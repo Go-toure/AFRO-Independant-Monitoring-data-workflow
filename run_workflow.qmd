@@ -1,0 +1,148 @@
+---
+title: "AFRO IM Workflow — Scheduled Run"
+format:
+  html:
+    embed-resources: true
+    toc: false
+execute:
+  echo: true
+  warning: true
+---
+
+<!--
+This document exists because Posit Connect Cloud does not support scheduling
+a bare .R script on its own -- the supported, schedulable content types are
+things like Shiny apps, R Markdown, and Quarto documents (see
+https://docs.posit.co/connect-cloud/user/ and
+https://docs.posit.co/connect-cloud/user/manage/content_settings.html,
+"content with source code can be scheduled to republish"). This .qmd is a
+thin wrapper: its only job is to run the exact same scripts/run_workflow.R
+used locally, as a separate Rscript subprocess, and surface whatever it
+printed inside this rendered report so a scheduled run leaves behind a
+human-readable record every time (in addition to logs/run_history.csv,
+which run_workflow.R already writes on every run).
+
+One-time setup needed in Connect Cloud's content settings for this
+deployment (Environment Variables panel) -- none of these are committed to
+git (config/secrets.env is git-ignored), so they only exist as real values
+in your local file and in Connect Cloud's own secret store:
+  SHAREPOINT_TENANT_ID, SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET
+    (Microsoft Graph app-only auth -- required for every SharePoint
+    round-trip: raw/lookup/baseline recovery, report + data uploads)
+  GPEI_API_TOKEN   (refresh_preparedness_lookup.py, Step 0)
+  ONA_API_TOKEN    (Fetch_im_data.py, Step 1 -- not needed for a
+                    --skip-fetch test run, but required before switching
+                    this document to a full production run)
+  ALERT_EMAIL_FROM / ALERT_EMAIL_TO / ALERT_EMAIL_APP_PASSWORD /
+  ALERT_SMTP_HOST / ALERT_SMTP_PORT   (optional -- send_failure_alert.py)
+See config/secrets.env.example for what each one is and where to get it.
+-->
+
+## Environment diagnostics
+
+This chunk never stops the render (`error: true`) so the diagnostics below
+always show up in the report even if something later fails -- this is the
+fastest way to see, on the very first deployment, whether Python is even
+reachable from this container before waiting on a real (possibly 30+
+minute) pipeline run.
+
+```{r diagnostics}
+#| error: true
+
+cat("R version:      ", R.version.string, "\n")
+cat("Platform:        ", R.version$platform, "\n")
+cat("Working directory:", getwd(), "\n\n")
+
+rscript_path <- Sys.which("Rscript")
+cat("Rscript found at:", if (nzchar(rscript_path)) rscript_path else "NOT FOUND", "\n")
+
+python_path <- Sys.which("python3")
+if (!nzchar(python_path)) python_path <- Sys.which("python")
+cat("python found at: ", if (nzchar(python_path)) python_path else "NOT FOUND", "\n")
+
+if (nzchar(python_path)) {
+  py_version <- tryCatch(
+    system2(python_path, "--version", stdout = TRUE, stderr = TRUE),
+    error = function(e) paste("ERROR:", conditionMessage(e))
+  )
+  cat("python version:  ", paste(py_version, collapse = " "), "\n")
+
+  # The pipeline's Python scripts need these specific packages -- worth
+  # knowing up front whether they're already on the image or still need
+  # a requirements.txt declared for this Connect Cloud deployment.
+  pkg_check <- tryCatch(
+    system2(python_path, c("-c",
+      shQuote("import importlib,sys; mods=['pandas','requests','pyarrow','openpyxl']; [print(m, '->', 'OK' if importlib.util.find_spec(m) else 'MISSING') for m in mods]")
+    ), stdout = TRUE, stderr = TRUE),
+    error = function(e) paste("ERROR:", conditionMessage(e))
+  )
+  cat(paste(pkg_check, collapse = "\n"), "\n")
+}
+
+cat("\nIM_WORKFLOW_HOME (as inherited, before this document sets it):",
+    Sys.getenv("IM_WORKFLOW_HOME", unset = "(not set)"), "\n")
+
+for (v in c("SHAREPOINT_TENANT_ID", "SHAREPOINT_CLIENT_ID", "SHAREPOINT_CLIENT_SECRET",
+            "GPEI_API_TOKEN", "ONA_API_TOKEN")) {
+  cat(sprintf("%-24s %s\n", v, if (nzchar(Sys.getenv(v))) "set" else "NOT SET"))
+}
+```
+
+## Run the pipeline
+
+```{r run-pipeline}
+# ------------------------------------------------------------------
+# This deployed document's own directory IS the workflow's BASE_DIR on
+# Connect Cloud -- data/, config/, scripts/, outputs/, logs/ all deploy
+# alongside it from the same git repo (data/outputs/logs start out empty
+# here since they're git-ignored; the pipeline's own SharePoint recovery
+# steps -- Fetch_im_data.py's raw_state sync, refresh_preparedness_lookup's
+# lookup_state sync, run_workflow.R's sp_recover_baseline_file() -- are
+# exactly what repopulate them on a from-scratch container like this one).
+# run_workflow.R reads its BASE_DIR from the IM_WORKFLOW_HOME env var,
+# defaulting to a Windows-only laptop path -- set it here so the exact
+# same, unmodified script works on both.
+# ------------------------------------------------------------------
+base_dir <- getwd()
+if (!nzchar(Sys.getenv("IM_WORKFLOW_HOME"))) {
+  Sys.setenv(IM_WORKFLOW_HOME = base_dir)
+}
+
+workflow_script <- file.path(base_dir, "scripts", "run_workflow.R")
+stopifnot(file.exists(workflow_script))
+
+# run_workflow.R calls quit() at several points, including on a clean
+# success -- sourcing it directly into this chunk would kill this
+# Quarto render's own R session before it could finish producing this
+# report. Running it as its own Rscript subprocess (the same trick
+# run_workflow.R itself already uses internally for the R sub-steps that
+# call quit() -- see run_r_script()) keeps it isolated: quit() only ends
+# the child process, and this chunk gets the child's captured output and
+# exit code back cleanly.
+#
+# Args: start with "--skip-fetch" for the first few scheduled runs on
+# Connect Cloud (cheaper, and doesn't need ONA_API_TOKEN yet) -- once
+# those are confirmed working end-to-end, drop it for the real full
+# production run (fetch + build + clean + reports + upload).
+workflow_args <- c("--skip-fetch")
+
+result <- system2(
+  "Rscript",
+  args = c(shQuote(workflow_script), workflow_args),
+  stdout = TRUE, stderr = TRUE
+)
+
+cat(result, sep = "\n")
+
+exit_status <- attr(result, "status")
+if (is.null(exit_status)) exit_status <- 0L
+
+if (exit_status != 0L) {
+  stop(sprintf(
+    "run_workflow.R exited with non-zero status %s -- see the captured output above for the real error.",
+    exit_status
+  ))
+}
+
+cat("\nrun_workflow.R completed successfully (exit status 0).\n")
+```
