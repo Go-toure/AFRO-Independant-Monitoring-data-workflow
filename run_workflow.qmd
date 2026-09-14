@@ -49,6 +49,16 @@ minute) pipeline run.
 ```{r diagnostics}
 #| error: true
 
+# Connect Cloud's dependency detection flagged "shiny" as a missing
+# dependency for this content (most likely because this repo also
+# contains shiny_app/app.R, a separate, unrelated Shiny dashboard
+# deployment) even though this pipeline never uses Shiny itself. Adding
+# this call is a harmless way to satisfy that check -- library() just
+# attaches the package; it does not start a Shiny server (that only
+# happens with an explicit "server: shiny" in the YAML front matter
+# above, which this document does not have).
+library(shiny)
+
 cat("R version:      ", R.version.string, "\n")
 cat("Platform:        ", R.version$platform, "\n")
 cat("Working directory:", getwd(), "\n\n")
