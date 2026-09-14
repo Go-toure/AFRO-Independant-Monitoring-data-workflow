@@ -1,0 +1,468 @@
+<title>IM Workflow Command Reference</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+  :root{
+    --bg:#F2F5F1;
+    --surface:#FFFFFF;
+    --surface-2:#E9EFE9;
+    --ink:#1A2420;
+    --ink-muted:#55655D;
+    --ink-faint:#7C8B83;
+    --border:#D3DED2;
+    --accent:#1F6F63;
+    --accent-strong:#124039;
+    --accent-soft:#DCEAE7;
+    --copper:#A5652E;
+    --copper-soft:#F3E4D3;
+    --ok:#2F7A3C;
+    --ok-soft:#DFEEDF;
+    --warn:#93650E;
+    --warn-soft:#F5E9D2;
+    --crit:#9A3A26;
+    --crit-soft:#F5DFD8;
+    --code-bg:#16211D;
+    --code-ink:#E9EDE8;
+    --code-muted:#8FA79B;
+    --shadow: 0 1px 2px rgba(20,35,30,0.06), 0 6px 20px -8px rgba(20,35,30,0.15);
+  }
+
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#101B17; --surface:#16241E; --surface-2:#1D2F27;
+      --ink:#E8EFEA; --ink-muted:#9FB5AA; --ink-faint:#71887D;
+      --border:#2A4238; --accent:#6FC7B0; --accent-strong:#95E0CB; --accent-soft:#1D3A33;
+      --copper:#E1A868; --copper-soft:#3A2A18;
+      --ok:#7FCB8C; --ok-soft:#1E3620; --warn:#E3BE72; --warn-soft:#3B2E14;
+      --crit:#E3907A; --crit-soft:#3D211B;
+      --code-bg:#0B1310; --code-ink:#DCE8E1; --code-muted:#6E8A7C;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 10px 30px -10px rgba(0,0,0,0.5);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#101B17; --surface:#16241E; --surface-2:#1D2F27;
+    --ink:#E8EFEA; --ink-muted:#9FB5AA; --ink-faint:#71887D;
+    --border:#2A4238; --accent:#6FC7B0; --accent-strong:#95E0CB; --accent-soft:#1D3A33;
+    --copper:#E1A868; --copper-soft:#3A2A18;
+    --ok:#7FCB8C; --ok-soft:#1E3620; --warn:#E3BE72; --warn-soft:#3B2E14;
+    --crit:#E3907A; --crit-soft:#3D211B;
+    --code-bg:#0B1310; --code-ink:#DCE8E1; --code-muted:#6E8A7C;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 10px 30px -10px rgba(0,0,0,0.5);
+  }
+
+  *{box-sizing:border-box;}
+  html{ background:var(--bg); }
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+    line-height:1.55; -webkit-font-smoothing:antialiased;
+  }
+  h1,h2,h3{ font-family:'IBM Plex Serif', Georgia, serif; color:var(--ink); text-wrap:balance; margin:0 0 .35em; }
+  a{color:var(--accent);}
+  code, .mono{ font-family:'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  .page{ max-width:1180px; margin:0 auto; padding:0 24px 96px; }
+
+  .masthead{ padding:44px 0 28px; border-bottom:1px solid var(--border); }
+  .eyebrow{
+    display:inline-flex; align-items:center; gap:8px;
+    font-family:'IBM Plex Mono', monospace; font-size:.72rem; letter-spacing:.11em; text-transform:uppercase;
+    color:var(--accent-strong); background:var(--accent-soft); border:1px solid var(--border);
+    padding:5px 10px 4px; border-radius:4px; margin-bottom:16px;
+  }
+  .eyebrow .dot{ width:6px; height:6px; border-radius:50%; background:var(--ok); box-shadow:0 0 0 3px var(--ok-soft); }
+  .masthead h1{ font-size:clamp(1.9rem, 1.5rem + 1.6vw, 2.7rem); font-weight:600; letter-spacing:-0.01em; }
+  .masthead .dek{ max-width:62ch; color:var(--ink-muted); font-size:1.05rem; margin:0 0 6px; }
+  .masthead .meta{ font-size:.82rem; color:var(--ink-faint); font-family:'IBM Plex Mono',monospace; }
+
+  .quickgrid{ display:grid; grid-template-columns:repeat(2,1fr); gap:14px; margin-top:28px; }
+  @media (max-width:720px){ .quickgrid{ grid-template-columns:1fr; } }
+  .qcard{ background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:18px 18px 16px; box-shadow:var(--shadow); }
+  .qcard .qlabel{ font-family:'IBM Plex Mono',monospace; font-size:.7rem; letter-spacing:.08em; text-transform:uppercase; color:var(--ink-faint); margin-bottom:6px; }
+  .qcard h3{ font-size:1.05rem; margin-bottom:10px; }
+  .qcard .qwhere{ font-size:.8rem; color:var(--ink-faint); margin-top:10px; }
+
+  .layout{ display:grid; grid-template-columns:220px minmax(0,1fr); gap:44px; margin-top:36px; align-items:start; }
+  @media (max-width:900px){ .layout{ grid-template-columns:1fr; } }
+
+  nav.toc{ position:sticky; top:24px; display:flex; flex-direction:column; gap:2px; font-size:.88rem; }
+  @media (max-width:900px){
+    nav.toc{ position:static; flex-direction:row; flex-wrap:wrap; gap:8px; padding-bottom:18px; margin-bottom:8px; border-bottom:1px solid var(--border); }
+    nav.toc a{ border:1px solid var(--border); border-radius:999px; padding:5px 12px; background:var(--surface); }
+    nav.toc .toc-sub{ display:none; }
+  }
+  nav.toc a{ color:var(--ink-muted); text-decoration:none; padding:5px 8px; border-radius:6px; }
+  nav.toc a:hover{ color:var(--ink); background:var(--surface-2); }
+  nav.toc .toc-group{ margin-top:14px; }
+  nav.toc .toc-group:first-child{ margin-top:0; }
+  nav.toc .toc-h{ font-family:'IBM Plex Mono',monospace; font-size:.68rem; letter-spacing:.09em; text-transform:uppercase; color:var(--ink-faint); padding:5px 8px 2px; }
+  nav.toc .toc-sub{ padding-left:16px; font-size:.83rem; }
+
+  main{ min-width:0; }
+  section{ margin-bottom:56px; scroll-margin-top:20px; }
+  section > .section-head{ display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:6px; }
+  section h2{ font-size:1.5rem; font-weight:600; }
+  .section-path{ font-family:'IBM Plex Mono',monospace; font-size:.78rem; color:var(--ink-faint); background:var(--surface-2); border:1px solid var(--border); padding:2px 8px; border-radius:5px; white-space:nowrap; }
+  .section-intro{ color:var(--ink-muted); max-width:70ch; margin:10px 0 0; }
+
+  h3.subhead{ font-size:1.05rem; font-weight:600; margin:30px 0 10px; padding-top:2px; }
+  h3.subhead .num{ color:var(--copper); font-family:'IBM Plex Mono',monospace; margin-right:8px; }
+
+  p{ color:var(--ink); max-width:70ch; }
+  p.muted{ color:var(--ink-muted); font-size:.92rem; max-width:66ch; }
+
+  .chain{ display:flex; flex-wrap:wrap; align-items:center; gap:0; margin:14px 0 18px; }
+  .chain .step{ display:flex; align-items:center; gap:8px; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:8px 12px; font-size:.82rem; box-shadow:var(--shadow); }
+  .chain .step .n{ font-family:'IBM Plex Mono',monospace; font-size:.72rem; color:var(--accent-strong); background:var(--accent-soft); width:18px; height:18px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; flex:none; }
+  .chain .step.hardstop{ border-color:var(--crit); }
+  .chain .step.hardstop .n{ color:var(--crit); background:var(--crit-soft); }
+  .chain .step .tag{ font-family:'IBM Plex Mono',monospace; font-size:.68rem; color:var(--ink-faint); }
+  .chain .arrow{ color:var(--ink-faint); padding:0 6px; font-size:.9rem; flex:none; }
+  @media (max-width:640px){ .chain{ flex-direction:column; align-items:stretch; } .chain .arrow{ display:none; } .chain .step{ width:100%; } }
+
+  .cmd{ background:var(--code-bg); border-radius:9px; overflow:hidden; margin:14px 0 18px; box-shadow:var(--shadow); }
+  .cmd .cmd-bar{ display:flex; align-items:center; justify-content:space-between; padding:7px 12px; border-bottom:1px solid rgba(255,255,255,0.08); }
+  .cmd .cmd-shell{ font-family:'IBM Plex Mono',monospace; font-size:.68rem; letter-spacing:.06em; text-transform:uppercase; color:var(--code-muted); }
+  .cmd .copy-btn{ font-family:'IBM Plex Mono',monospace; font-size:.68rem; color:var(--code-muted); background:transparent; border:1px solid rgba(255,255,255,0.15); border-radius:5px; padding:3px 9px; cursor:pointer; }
+  .cmd .copy-btn:hover{ color:var(--code-ink); border-color:rgba(255,255,255,0.3); }
+  .cmd .copy-btn:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .cmd pre{ margin:0; padding:12px 14px 14px; overflow-x:auto; }
+  .cmd code{ font-size:.86rem; color:var(--code-ink); white-space:pre; }
+  .cmd .prompt{ color:var(--copper); user-select:none; }
+  .cmd .comment{ color:var(--code-muted); }
+
+  .flags{ margin:14px 0 8px; border-top:1px solid var(--border); }
+  .flag-row{ display:grid; grid-template-columns:minmax(150px,240px) 1fr; gap:16px; padding:11px 0; border-bottom:1px solid var(--border); }
+  @media (max-width:560px){ .flag-row{ grid-template-columns:1fr; gap:4px; } }
+  .flag-row .flag{ font-family:'IBM Plex Mono',monospace; font-size:.84rem; color:var(--copper); white-space:nowrap; }
+  .flag-row .desc{ font-size:.9rem; color:var(--ink-muted); }
+  .flag-row .desc b{ color:var(--ink); font-weight:600; }
+
+  .callout{ display:flex; gap:12px; align-items:flex-start; border:1px solid var(--border); border-left:3px solid var(--accent); background:var(--surface); border-radius:0 8px 8px 0; padding:13px 16px; margin:16px 0; box-shadow:var(--shadow); }
+  .callout.warn{ border-left-color:var(--warn); }
+  .callout.crit{ border-left-color:var(--crit); }
+  .callout .ctitle{ font-weight:600; font-size:.88rem; margin-bottom:3px; }
+  .callout p{ margin:0; font-size:.89rem; color:var(--ink-muted); }
+  .callout p b{ color:var(--ink); }
+
+  .pill{ display:inline-flex; align-items:center; gap:5px; font-family:'IBM Plex Mono',monospace; font-size:.68rem; letter-spacing:.04em; padding:2px 8px; border-radius:999px; font-weight:500; }
+  .pill.hard{ background:var(--crit-soft); color:var(--crit); }
+  .pill.soft{ background:var(--ok-soft); color:var(--ok); }
+
+  table.io{ width:100%; border-collapse:collapse; margin:12px 0 18px; font-size:.88rem; }
+  table.io th{ text-align:left; font-family:'IBM Plex Mono',monospace; font-size:.68rem; letter-spacing:.07em; text-transform:uppercase; color:var(--ink-faint); padding:0 10px 8px 0; border-bottom:1px solid var(--border); }
+  table.io td{ padding:9px 10px 9px 0; border-bottom:1px solid var(--border); color:var(--ink-muted); vertical-align:top; }
+  table.io td.f{ font-family:'IBM Plex Mono',monospace; color:var(--ink); white-space:nowrap; }
+  table.io tr:last-child td{ border-bottom:none; }
+  .io-wrap{ overflow-x:auto; }
+
+  hr.div{ border:none; border-top:1px solid var(--border); margin:40px 0; }
+  footer{ margin-top:8px; padding-top:22px; border-top:1px solid var(--border); font-size:.8rem; color:var(--ink-faint); max-width:70ch; }
+
+  @media (prefers-reduced-motion: reduce){ *{ transition:none !important; } }
+</style>
+
+<div class="page">
+
+  <header class="masthead">
+    <span class="eyebrow"><span class="dot"></span>AFRO Independent Monitoring &middot; Operations Runbook</span>
+    <h1>IM Workflow Command Reference</h1>
+    <p class="dek">Every command to run the IM pipeline, refresh its campaign-calendar lookup, open the dashboard, and manage the Mon–Fri unattended overnight run — read straight off <code>run_workflow.R</code> and its scripts, not from the older notes already in the project.</p>
+    <p class="meta">Verified against the scripts on your machine &middot; 2 Sept 2026</p>
+
+    <div class="quickgrid">
+      <div class="qcard">
+        <div class="qlabel">Full run, all 6 steps</div>
+        <h3>IM Workflow</h3>
+        <div class="cmd" style="margin:0;">
+          <div class="cmd-bar"><span class="cmd-shell">Git Bash / cmd</span><button class="copy-btn" data-copy="Rscript scripts\run_workflow.R">Copy</button></div>
+          <pre><code><span class="prompt">$</span> Rscript scripts\run_workflow.R</code></pre>
+        </div>
+        <div class="qwhere">im_workflow project root — or double-click run_workflow.bat</div>
+      </div>
+      <div class="qcard">
+        <div class="qlabel">Open in browser</div>
+        <h3>IM Dashboard</h3>
+        <div class="cmd" style="margin:0;">
+          <div class="cmd-bar"><span class="cmd-shell">cmd.exe</span><button class="copy-btn" data-copy="run_dashboard.bat">Copy</button></div>
+          <pre><code><span class="prompt">&gt;</span> run_dashboard.bat</code></pre>
+        </div>
+        <div class="qwhere">im_workflow project root</div>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="toc">
+      <a href="#pipeline">Full Pipeline</a>
+      <div class="toc-sub">
+        <a href="#pipe-run">One-command run</a>
+        <a href="#pipe-chain">Step chain</a>
+        <a href="#pipe-flags">Flags</a>
+        <a href="#pipe-solo">Run one step alone</a>
+        <a href="#pipe-recipes">Common recipes</a>
+      </div>
+      <div class="toc-group">
+        <a href="#dashboard">Dashboard</a>
+      </div>
+      <div class="toc-group">
+        <a href="#nightly">Nightly &amp; Alerts</a>
+        <div class="toc-sub">
+          <a href="#nightly-setup">One-time setup</a>
+          <a href="#nightly-alerts">Failure alerts</a>
+        </div>
+      </div>
+      <div class="toc-group">
+        <a href="#credentials">Credentials &amp; logs</a>
+        <a href="#drift">Known drift</a>
+      </div>
+    </nav>
+
+    <main>
+
+      <section id="pipeline">
+        <div class="section-head">
+          <h2>Full Pipeline</h2>
+          <span class="section-path">im_workflow\scripts\run_workflow.R</span>
+        </div>
+        <p class="section-intro">Located at <code>C:\Users\TOURE\Documents\im_workflow</code>. One orchestrator, <code>run_workflow.R</code>, runs all six steps in order and writes one row per run to <code>logs\run_history.csv</code>, whether it finishes or hard-stops partway through.</p>
+
+        <h3 class="subhead" id="pipe-run"><span class="num">01</span>One-command run</h3>
+        <div class="cmd">
+          <div class="cmd-bar"><span class="cmd-shell">Git Bash / cmd — from the project root</span><button class="copy-btn" data-copy="cd C:\Users\TOURE\Documents\im_workflow
+Rscript scripts\run_workflow.R">Copy</button></div>
+          <pre><code><span class="prompt">$</span> cd C:\Users\TOURE\Documents\im_workflow
+<span class="prompt">$</span> Rscript scripts\run_workflow.R</code></pre>
+        </div>
+        <p class="muted">Or double-click <code>run_workflow.bat</code> — identical command, run from a window that stays open and pauses at the end so you can read the summary.</p>
+
+        <h3 class="subhead" id="pipe-chain"><span class="num">02</span>Step chain</h3>
+        <div class="chain">
+          <div class="step"><span class="n">0</span>Refresh Lookup<span class="tag">.py &middot; soft</span></div><span class="arrow">→</span>
+          <div class="step"><span class="n">1</span>Fetch IM Data<span class="tag">.py &middot; soft</span></div><span class="arrow">→</span>
+          <div class="step hardstop"><span class="n">2</span>Build Repository<span class="tag">.R &middot; hard stop</span></div><span class="arrow">→</span>
+          <div class="step"><span class="n">3</span>Clean Geonames<span class="tag">.R &middot; soft</span></div><span class="arrow">→</span>
+          <div class="step"><span class="n">4</span>Upload SharePoint<span class="tag">.py &middot; soft</span></div><span class="arrow">→</span>
+          <div class="step"><span class="n">5</span>Reports ×3<span class="tag">.R &middot; soft</span></div>
+        </div>
+        <p class="muted">Step 5 runs three scripts in a fixed order: the <b style="color:var(--ink)">Intelligence Engine</b> first (its output tables feed the next one), then the <b style="color:var(--ink)">Advocacy Report</b>, then the <b style="color:var(--ink)">Deck</b>.</p>
+        <div class="callout crit">
+          <div>
+            <div class="ctitle"><span class="pill hard">hard stop</span> Step 2 is the only one that can kill the run</div>
+            <p>If <code>regional_im_repository_builder.R</code> fails or is missing, the pipeline writes <code>failed</code> to <code>run_history.csv</code>, emails a failure alert (if configured), and exits — Clean, Upload and Reports never run. Every other step is soft: it logs a warning and the pipeline carries on with whatever data was already there.</p>
+          </div>
+        </div>
+        <div class="callout">
+          <div>
+            <div class="ctitle">Step 4 protects you from uploading a stale file</div>
+            <p>If Step 3 (Clean Geonames) failed, Step 4 <b>skips itself</b> by default rather than pushing yesterday's file to SharePoint under today's name — pass <code>--force-upload</code> if you want it to push the stale file anyway (e.g. Clean failed on a file lock, but the data itself is fine).</p>
+          </div>
+        </div>
+
+        <h3 class="subhead" id="pipe-flags"><span class="num">03</span>Flags</h3>
+        <div class="flags">
+          <div class="flag-row"><div class="flag">--skip-lookup-refresh</div><div class="desc">Skip step 0 (<code>refresh_preparedness_lookup.py</code>) — reuse the existing <code>data/lookup/lookup.xlsx</code>.</div></div>
+          <div class="flag-row"><div class="flag">--skip-fetch</div><div class="desc">Skip step 1 — reuse whatever's already in <code>data/raw/</code>.</div></div>
+          <div class="flag-row"><div class="flag">--force-fetch</div><div class="desc">Passed to step 1 as <code>--force-full</code>; only matters if fetch isn't also skipped.</div></div>
+          <div class="flag-row"><div class="flag">--skip-build</div><div class="desc">Skip step 2 (<code>regional_im_repository_builder.R</code>).</div></div>
+          <div class="flag-row"><div class="flag">--skip-clean</div><div class="desc">Skip step 3 (<code>clean_geonames.R</code>).</div></div>
+          <div class="flag-row"><div class="flag">--skip-upload</div><div class="desc">Skip step 4 entirely — nothing reaches SharePoint this run.</div></div>
+          <div class="flag-row"><div class="flag">--force-upload</div><div class="desc">Upload anyway even though step 3 failed this run (pushes the previous, stale final file).</div></div>
+          <div class="flag-row"><div class="flag">--skip-reports</div><div class="desc">Skip step 5 — all three report scripts together; you can't skip just one of them from here.</div></div>
+          <div class="flag-row"><div class="flag">--upload-only</div><div class="desc">Standalone mode: ignores every other flag, runs <b>only</b> the SharePoint upload, then exits. Same as <code>upload_only.bat</code>.</div></div>
+        </div>
+
+        <h3 class="subhead" id="pipe-solo"><span class="num">04</span>Run one step by itself</h3>
+        <p class="muted">The five R scripts below take no flags of their own — they always process whatever is currently in <code>data/</code>. The Intelligence Engine must run before the Advocacy Report; <code>run_workflow.R</code> already handles that order for you.</p>
+        <div class="cmd">
+          <div class="cmd-bar"><span class="cmd-shell">Refresh the campaign-calendar lookup only</span><button class="copy-btn" data-copy="python scripts\refresh_preparedness_lookup.py --debug">Copy</button></div>
+          <pre><code><span class="prompt">$</span> python scripts\refresh_preparedness_lookup.py --debug</code></pre>
+        </div>
+        <div class="cmd">
+          <div class="cmd-bar"><span class="cmd-shell">Fetch raw IM data only</span><button class="copy-btn" data-copy="python scripts\Fetch_im_data.py --force-full">Copy</button></div>
+          <pre><code><span class="prompt">$</span> python scripts\Fetch_im_data.py --force-full
+<span class="comment"># other flags: --full-refresh-days 30 (default)   --form-ids 8587,7178
+#              --page-size 10000 (default)   --test   --config path\to\config.yaml</span></code></pre>
+        </div>
+        <div class="cmd">
+          <div class="cmd-bar"><span class="cmd-shell">Build / clean / report scripts — run directly, in this order</span><button class="copy-btn" data-copy="Rscript scripts\regional_im_repository_builder.R
+Rscript scripts\clean_geonames.R
+Rscript scripts\afro_im_intilligence_analysis_engine.R
+Rscript scripts\AFRO_Advocacy_Intelligence_Report.R
+Rscript scripts\afro_region_im_deck_generation.R">Copy</button></div>
+          <pre><code><span class="prompt">$</span> Rscript scripts\regional_im_repository_builder.R
+<span class="prompt">$</span> Rscript scripts\clean_geonames.R
+<span class="prompt">$</span> Rscript scripts\afro_im_intilligence_analysis_engine.R
+<span class="prompt">$</span> Rscript scripts\AFRO_Advocacy_Intelligence_Report.R
+<span class="prompt">$</span> Rscript scripts\afro_region_im_deck_generation.R</code></pre>
+        </div>
+        <div class="cmd">
+          <div class="cmd-bar"><span class="cmd-shell">Upload to SharePoint only</span><button class="copy-btn" data-copy="python scripts\upload_to_sharepoint.py --all">Copy</button></div>
+          <pre><code><span class="prompt">$</span> python scripts\upload_to_sharepoint.py --all
+<span class="comment"># other flags: --test   --check (list local files, don't upload)   --folder "Some/Other/Folder"
+# --file is accepted but not implemented yet -- it just prints a message</span></code></pre>
+        </div>
+
+        <h3 class="subhead" id="pipe-recipes"><span class="num">05</span>Common recipes</h3>
+        <div class="cmd">
+          <div class="cmd-bar"><span class="cmd-shell">Reuse today's data, skip lookup + fetch</span><button class="copy-btn" data-copy="Rscript scripts\run_workflow.R --skip-lookup-refresh --skip-fetch">Copy</button></div>
+          <pre><code><span class="prompt">$</span> Rscript scripts\run_workflow.R --skip-lookup-refresh --skip-fetch</code></pre>
+        </div>
+        <div class="cmd">
+          <div class="cmd-bar"><span class="cmd-shell">Fast data refresh, no reports</span><button class="copy-btn" data-copy="Rscript scripts\run_workflow.R --skip-reports">Copy</button></div>
+          <pre><code><span class="prompt">$</span> Rscript scripts\run_workflow.R --skip-reports</code></pre>
+        </div>
+        <div class="cmd">
+          <div class="cmd-bar"><span class="cmd-shell">Regenerate reports only — data untouched</span><button class="copy-btn" data-copy="Rscript scripts\run_workflow.R --skip-lookup-refresh --skip-fetch --skip-build --skip-clean --skip-upload">Copy</button></div>
+          <pre><code><span class="prompt">$</span> Rscript scripts\run_workflow.R --skip-lookup-refresh --skip-fetch --skip-build --skip-clean --skip-upload</code></pre>
+        </div>
+        <div class="cmd">
+          <div class="cmd-bar"><span class="cmd-shell">Push existing final files to SharePoint, nothing else</span><button class="copy-btn" data-copy="Rscript scripts\run_workflow.R --upload-only">Copy</button></div>
+          <pre><code><span class="prompt">$</span> Rscript scripts\run_workflow.R --upload-only
+<span class="comment"># or double-click upload_only.bat</span></code></pre>
+        </div>
+        <div class="cmd">
+          <div class="cmd-bar"><span class="cmd-shell">Clean step failed earlier — push the stale file anyway</span><button class="copy-btn" data-copy="Rscript scripts\run_workflow.R --skip-fetch --force-upload">Copy</button></div>
+          <pre><code><span class="prompt">$</span> Rscript scripts\run_workflow.R --skip-fetch --force-upload</code></pre>
+        </div>
+      </section>
+
+      <hr class="div">
+
+      <section id="dashboard">
+        <div class="section-head"><h2>Dashboard</h2></div>
+        <div class="cmd">
+          <div class="cmd-bar"><span class="cmd-shell">R console / Rscript -e</span><button class="copy-btn" data-copy="Rscript -e &quot;shiny::runApp('C:/Users/TOURE/Documents/im_workflow/shiny_app', launch.browser=TRUE)&quot;">Copy</button></div>
+          <pre><code><span class="prompt">$</span> Rscript -e "shiny::runApp('C:/Users/TOURE/Documents/im_workflow/shiny_app', launch.browser=TRUE)"</code></pre>
+        </div>
+        <p class="muted">Or double-click <code>run_dashboard.bat</code>, which checks <code>Rscript</code> is on <code>PATH</code> first and prints a clear error if R isn't installed. Leave the window open — closing it stops the dashboard.</p>
+      </section>
+
+      <hr class="div">
+
+      <section id="nightly">
+        <div class="section-head">
+          <h2>Nightly Run &amp; Failure Alerts</h2>
+          <span class="section-path">Mon–Fri, 23:00</span>
+        </div>
+        <p class="section-intro">This is the one project of the three set up for a fully unattended run — every weeknight it runs the entire pipeline above with no flags, and emails you if something breaks badly enough to matter.</p>
+
+        <h3 class="subhead" id="nightly-setup"><span class="num">01</span>One-time setup</h3>
+        <div class="cmd">
+          <div class="cmd-bar"><span class="cmd-shell">cmd.exe — run once</span><button class="copy-btn" data-copy="setup_nightly_schedule.bat">Copy</button></div>
+          <pre><code><span class="prompt">&gt;</span> setup_nightly_schedule.bat
+<span class="comment"># registers Task Scheduler job "IM Workflow Nightly": 23:00, Mon-Tue-Wed-Thu-Fri</span></code></pre>
+        </div>
+        <p class="muted">You don't need to run this again unless you're changing the schedule or moving the project. It registers the task to run <b style="color:var(--ink)">as you, while logged in</b> — a locked screen is fine, but a sleeping or shut-down laptop at 11 PM means it silently doesn't run. Turn on "Wake the computer to run this task" under the task's Conditions tab in Task Scheduler (<code>taskschd.msc</code>) if you need it to survive that.</p>
+        <div class="io-wrap">
+        <table class="io">
+          <tr><th>What runs at 23:00</th><th>Detail</th></tr>
+          <tr><td class="f">run_workflow_nightly.bat</td><td>Runs the full <code>run_workflow.R</code> (no flags — every step). Logs to <code>logs\nightly_run.log</code> in addition to <code>run_workflow.R</code>'s own <code>logs\workflow_&lt;date&gt;.log</code>.</td></tr>
+        </table>
+        </div>
+        <p class="muted">To test the schedule works without waiting for 11 PM: open Task Scheduler, find <b style="color:var(--ink)">IM Workflow Nightly</b>, right-click → Run, then check <code>logs\nightly_run.log</code>.</p>
+
+        <h3 class="subhead" id="nightly-alerts"><span class="num">02</span>Failure alerts</h3>
+        <p class="muted">Alerts fire only on a <b style="color:var(--ink)">genuine hard failure</b> — Step 2 (Repository Builder) failing, or an <code>--upload-only</code> run failing — never on a soft/partial failure elsewhere in the chain, since those show up in <code>run_history.csv</code> and the dashboard instead without needing to page anyone.</p>
+        <div class="flags">
+          <div class="flag-row"><div class="flag">ALERT_EMAIL_FROM</div><div class="desc">Sending Gmail address, set in <code>config\secrets.env</code>.</div></div>
+          <div class="flag-row"><div class="flag">ALERT_EMAIL_TO</div><div class="desc">Where the alert lands.</div></div>
+          <div class="flag-row"><div class="flag">ALERT_EMAIL_APP_PASSWORD</div><div class="desc">A Gmail App Password (not your normal password) — see <code>config\secrets.env.example</code> for how to generate one.</div></div>
+        </div>
+        <p class="muted">Leave any of the three blank and the pipeline itself is unaffected — you just won't be emailed about a failure until you next open the dashboard yourself.</p>
+        <div class="cmd">
+          <div class="cmd-bar"><span class="cmd-shell">Send a test alert by hand</span><button class="copy-btn" data-copy='python scripts\send_failure_alert.py --base-dir "C:\Users\TOURE\Documents\im_workflow" --subject "Test alert" --body "Just checking the email path works."'>Copy</button></div>
+          <pre><code><span class="prompt">$</span> python scripts\send_failure_alert.py --base-dir "C:\Users\TOURE\Documents\im_workflow" --subject "Test alert" --body "Just checking the email path works."</code></pre>
+        </div>
+        <div class="callout">
+          <div>
+            <div class="ctitle">Two layers of alerting, so a crash can't go silent</div>
+            <p><code>run_workflow.R</code> sends its own alert at the moment Step 2 (or <code>--upload-only</code>) fails. <code>run_workflow_nightly.bat</code> checks a marker file afterward (<code>logs\last_alert_sent.flag</code>) and only sends its own generic fallback alert if Rscript exited non-zero <b>and</b> that marker is missing — catching a crash severe enough that <code>run_workflow.R</code> never reached its own alert code at all (a missing R package, or Rscript failing to launch).</p>
+          </div>
+        </div>
+      </section>
+
+      <hr class="div">
+
+      <section id="credentials">
+        <div class="section-head"><h2>Credentials &amp; logs</h2></div>
+        <div class="io-wrap">
+        <table class="io">
+          <tr><th>Variable</th><th>Used by</th></tr>
+          <tr><td class="f">ONA_API_TOKEN</td><td>Fetch_im_data.py — pulling raw IM survey data from ONA</td></tr>
+          <tr><td class="f">GPEI_API_TOKEN</td><td>refresh_preparedness_lookup.py — the campaign-calendar lookup (see the note below)</td></tr>
+          <tr><td class="f">SHAREPOINT_TENANT_ID / CLIENT_ID / CLIENT_SECRET</td><td>upload_to_sharepoint.py</td></tr>
+          <tr><td class="f">ALERT_EMAIL_FROM / TO / APP_PASSWORD</td><td>send_failure_alert.py</td></tr>
+        </table>
+        </div>
+        <p class="muted">All copied once from <code>config\secrets.env.example</code> into <code>config\secrets.env</code>, never printed or committed. Moving the whole project to a new folder or drive? Set <code>IM_WORKFLOW_HOME</code> once — <code>setx IM_WORKFLOW_HOME "D:\new\path"</code> — and every script picks it up; nothing else needs editing.</p>
+        <div class="io-wrap">
+        <table class="io">
+          <tr><th>Log file</th><th>What's in it</th></tr>
+          <tr><td class="f">logs\workflow_&lt;date&gt;.log</td><td>Prose log for one run of <code>run_workflow.R</code></td></tr>
+          <tr><td class="f">logs\run_history.csv</td><td>Append-only, one row per full-pipeline or upload-only run — query this instead of opening old logs one at a time</td></tr>
+          <tr><td class="f">logs\nightly_run.log</td><td>The nightly wrapper's own log, on top of the per-run log above</td></tr>
+          <tr><td class="f">logs\last_alert_sent.flag</td><td>Marker used to avoid double-alerting on the same failure — deleted at the start of every run</td></tr>
+        </table>
+        </div>
+      </section>
+
+      <section id="drift">
+        <div class="section-head"><h2>Known drift</h2></div>
+        <div class="callout warn">
+          <div>
+            <div class="ctitle">Two older files in the project root are out of date</div>
+            <p><code>IM_Workflow_Command_Reference.md</code> and <code>IM_Workflow_Bash_Commands.txt</code> both predate Step 0 (lookup refresh), the nightly scheduler, failure alerts, and <code>Fetch_im_data.py</code>'s <code>--full-refresh-days</code> flag — none of that is in either file. This page reflects what the scripts actually do today; treat those two as retired.</p>
+          </div>
+        </div>
+        <div class="callout warn">
+          <div>
+            <div class="ctitle">A comment inside run_workflow.R is stale</div>
+            <p>Its Step 0 header still describes the lookup refresh as downloading from "the WHO AFRO Power BI dashboard." That's no longer true — <code>refresh_preparedness_lookup.py</code> was rewritten to pull the same data from the GPEI API instead (the old dashboard's login broke permanently when it switched to WHO SSO). Nothing changed for you functionally — same command, same output file — the comment just never got updated to say so.</p>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <footer>
+    Reflects the scripts as they exist on disk, read directly rather than assumed. run_workflow.R, refresh_preparedness_lookup.py, Fetch_im_data.py and the nightly-scheduling files were all checked individually rather than trusted from the project's own (older) notes. Re-check after any further script changes; this page doesn't run anything itself.
+  </footer>
+</div>
+
+<script>
+(function(){
+  document.querySelectorAll('.copy-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var text = btn.getAttribute('data-copy') || '';
+      var done = function(){
+        var original = btn.textContent;
+        btn.textContent = 'Copied';
+        setTimeout(function(){ btn.textContent = original; }, 1200);
+      };
+      try{
+        if(navigator.clipboard && navigator.clipboard.writeText){
+          navigator.clipboard.writeText(text).then(done).catch(function(){
+            fallbackCopy(text); done();
+          });
+        } else {
+          fallbackCopy(text); done();
+        }
+      }catch(e){
+        try{ fallbackCopy(text); done(); }catch(e2){}
+      }
+    });
+  });
+  function fallbackCopy(text){
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    try{ document.execCommand('copy'); }catch(e){}
+    document.body.removeChild(ta);
+  }
+})();
+</script>

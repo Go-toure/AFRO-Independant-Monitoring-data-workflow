@@ -1,0 +1,106 @@
+============================================================
+IM WORKFLOW - BASH (GIT BASH) COMMAND REFERENCE
+============================================================
+All commands verified against the actual scripts' argument-parsing
+code, not old notes. Use Git Bash (right-click the im_workflow folder
+in File Explorer -> "Git Bash Here", or open Git Bash and cd manually).
+
+------------------------------------------------------------
+0. GO TO THE PROJECT FOLDER
+------------------------------------------------------------
+cd /c/Users/TOURE/Documents/im_workflow/scripts
+
+------------------------------------------------------------
+1. FULL PIPELINE - run_workflow.R
+------------------------------------------------------------
+# Full run (all 5 steps: Fetch, Build, Clean, Upload, Reports)
+Rscript run_workflow.R
+
+# Reuse today's raw data, skip re-fetching
+Rscript run_workflow.R --skip-fetch
+Rscript run_workflow.R --skip-lookup-refresh --skip-build --skip-clean --skip-upload --skip-reports
+
+# Fast data refresh, no reports
+Rscript run_workflow.R --skip-fetch --skip-reports
+
+# Regenerate reports only - data untouched
+Rscript run_workflow.R --skip-fetch --skip-build --skip-clean --skip-upload
+
+# Push existing final files to SharePoint, nothing else
+Rscript run_workflow.R --upload-only
+
+# Force a full re-fetch from source
+Rscript run_workflow.R --force-fetch
+
+# Clean step failed earlier - push the stale file anyway
+Rscript run_workflow.R --skip-fetch --force-upload
+
+# Skip only the build step
+Rscript run_workflow.R --skip-build
+
+# Skip only the clean step
+Rscript run_workflow.R --skip-clean
+
+# Skip only the upload step
+Rscript run_workflow.R --skip-upload
+
+------------------------------------------------------------
+2. INDIVIDUAL R SCRIPTS (no flags of their own - always
+   process whatever is currently in data/)
+------------------------------------------------------------
+Rscript regional_im_repository_builder.R
+Rscript clean_geonames.R
+Rscript afro_im_intilligence_analysis_engine.R
+Rscript AFRO_Advocacy_Intelligence_Report.R
+Rscript afro_region_im_deck_generation.R
+
+Note: afro_im_intilligence_analysis_engine.R must run BEFORE
+AFRO_Advocacy_Intelligence_Report.R (it reads the engine's output
+tables). run_workflow.R already handles this order for you.
+
+------------------------------------------------------------
+3. Fetch_im_data.py
+------------------------------------------------------------
+python Fetch_im_data.py
+python Fetch_im_data.py --force-full
+python Fetch_im_data.py --test
+python Fetch_im_data.py --form-ids 8587,7178
+python Fetch_im_data.py --page-size 5000
+python Fetch_im_data.py --config path/to/config.yaml
+
+------------------------------------------------------------
+4. upload_to_sharepoint.py
+------------------------------------------------------------
+python upload_to_sharepoint.py --test
+python upload_to_sharepoint.py --check
+python upload_to_sharepoint.py --all
+python upload_to_sharepoint.py --folder "Some/Other/Folder"
+
+------------------------------------------------------------
+5. DASHBOARD
+------------------------------------------------------------
+Rscript -e "shiny::runApp('/c/Users/TOURE/Documents/im_workflow/shiny_app', launch.browser=TRUE)"
+
+------------------------------------------------------------
+6. GIT (once you're ready to commit/push)
+------------------------------------------------------------
+cd /c/Users/TOURE/Documents/im_workflow
+git status
+git add .
+git commit -m "your message here"
+git push -u origin main
+
+------------------------------------------------------------
+NOTES
+------------------------------------------------------------
+- Credentials (ONA_API_TOKEN, SHAREPOINT_TENANT_ID, SHAREPOINT_CLIENT_ID,
+  SHAREPOINT_CLIENT_SECRET) load automatically from config/secrets.env -
+  nothing extra to pass on the command line.
+- Rscript and python command syntax is identical in Git Bash, PowerShell,
+  and Command Prompt. Only the "cd" line differs (forward-slash /c/...
+  paths in Git Bash vs C:\... in cmd/PowerShell).
+- If a command seems to hang with no output, check your taskbar - it may
+  be waiting on a Windows dialog that opened behind the Git Bash window.
+
+
+

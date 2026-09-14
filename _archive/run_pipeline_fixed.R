@@ -1,0 +1,727 @@
+#!/usr/bin/env Rscript
+
+# ============================================================================
+# IM Workflow - Complete Pipeline with SharePoint Upload (FIXED VERSION)
+# ============================================================================
+# Purpose: Orchestrate the entire IM workflow from data fetching to SharePoint
+# Author: IM Team
+# Date: 2026-01-19
+# FIXED: Removed pattern parameters from list.files() to prevent segfault
+# ============================================================================
+
+# Load required libraries
+library(dplyr)
+library(tidyr)
+library(readr)
+library(jsonlite)
+library(arrow)  # for parquet files
+library(openxlsx)
+library(lubridate)
+library(logger)
+
+# Initialize logging
+log_threshold(INFO)
+log_appender(appender_file(file.path("logs", "pipeline_master.log")))
+
+# ============================================================================
+# SAFE FILE LISTING FUNCTIONS (FIX FOR SEGFAULT)
+# ============================================================================
+
+safe_list_files <- function(path, pattern = NULL, full.names = TRUE) {
+  # Get all files
+  all_files <- list.files(path, full.names = full.names)
+  
+  # If no pattern, return all
+  if (is.null(pattern)) {
+    return(all_files)
+  }
+  
+  # Handle pattern as extension or regex
+  if (pattern == "\\.parquet$" || grepl("parquet", pattern)) {
+    return(all_files[endsWith(all_files, ".parquet")])
+  } else if (pattern == "\\.csv$" || grepl("csv", pattern)) {
+    return(all_files[endsWith(all_files, ".csv")])
+  } else {
+    # For other patterns, use fixed matching to avoid regex issues
+    return(all_files[grepl(pattern, all_files, fixed = TRUE)])
+  }
+}
+
+safe_list_parquet <- function(path, full.names = TRUE) {
+  all_files <- list.files(path, full.names = full.names)
+  return(all_files[endsWith(all_files, ".parquet")])
+}
+
+safe_list_csv <- function(path, full.names = TRUE) {
+  all_files <- list.files(path, full.names = full.names)
+  return(all_files[endsWith(all_files, ".csv")])
+}
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+CONFIG <- list(
+  dirs = list(
+    root = "C:/Users/TOURE/Documents/im_workflow",
+    data = "data",
+    raw = "data/raw",
+    processed = "data/processed",
+    final = "data/final",
+    lookup = "data/lookup",
+    logs = "logs",
+    outputs = "outputs",
+    reports = "outputs/reports",
+    qc = "data/processed/qc",
+    scripts = "scripts"
+  ),
+  files = list(
+    lookup = "data/lookup/lookup.xlsx",
+    fetch_summary = "data/raw/fetch_summary.json"
+  ),
+  sharepoint = list(
+    upload_script = "scripts/upload_to_sharepoint.py"
+  ),
+  processing = list(
+    country_columns = c("country", "country_code", "admin1", "admin2", "location"),
+    date_columns = c("date", "report_date", "incident_date"),
+    qc_thresholds = list(
+      missing_rate_max = 0.3,
+      duplicate_threshold = 0
+    )
+  )
+)
+
+# Create directories if they don't exist
+create_directories <- function() {
+  log_info("Creating directory structure...")
+  for (dir in CONFIG$dirs) {
+    if (!dir.exists(dir)) {
+      dir.create(dir, recursive = TRUE)
+      log_info("Created directory: {dir}")
+    }
+  }
+}
+
+# ============================================================================
+# SharePoint Upload Function
+# ============================================================================
+
+upload_to_sharepoint <- function(upload_args = "--all") {
+  log_info("\n" %>% paste(rep(50), collapse = ""))
+  log_info("UPLOADING TO SHAREPOINT")
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  
+  upload_script <- file.path(CONFIG$dirs$root, CONFIG$sharepoint$upload_script)
+  
+  if (!file.exists(upload_script)) {
+    log_warn("SharePoint upload script not found: {upload_script}")
+    log_info("Skipping SharePoint upload")
+    return(FALSE)
+  }
+  
+  # Run the Python upload script
+  cmd <- sprintf("python \"%s\" %s", upload_script, upload_args)
+  log_info("Running: {cmd}")
+  
+  result <- system(cmd, intern = TRUE, ignore.stderr = FALSE)
+  
+  # Check if upload was successful
+  if (any(grepl("SUCCESS|ALL FILES UPLOADED", result, ignore.case = TRUE))) {
+    log_info("SharePoint upload completed successfully")
+    # Print the SharePoint URL from output
+    sharepoint_url <- grep("https://.*sharepoint.*", result, value = TRUE)
+    if (length(sharepoint_url) > 0) {
+      log_info("Files available at: {sharepoint_url[1]}")
+      cat("\n")
+      cat("=" %>% paste(rep(60), collapse = ""), "\n")
+      cat("SHAREPOINT LOCATION:\n")
+      cat(sharepoint_url[1], "\n")
+      cat("=" %>% paste(rep(60), collapse = ""), "\n")
+    }
+    return(TRUE)
+  } else {
+    log_warn("SharePoint upload may have had issues")
+    return(FALSE)
+  }
+}
+
+# ============================================================================
+# Step 1: Data Fetching (Python integration)
+# ============================================================================
+
+run_data_fetch <- function() {
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  log_info("STEP 1: Fetching IM Data")
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  
+  # Check if Python script exists
+  python_script <- file.path(CONFIG$dirs$root, "scripts", "Fetch_im_data_LIVE_UPDATED.py")
+  
+  if (!file.exists(python_script)) {
+    log_warn("Python fetch script not found: {python_script}")
+    log_info("Attempting to use alternative script...")
+    python_script <- file.path(CONFIG$dirs$root, "scripts", "Fetch_im_data.py")
+    
+    if (!file.exists(python_script)) {
+      log_error("No fetch script found. Please ensure fetch scripts are in place.")
+      return(FALSE)
+    }
+  }
+  
+  # Run Python fetch script
+  log_info("Running Python fetch script...")
+  result <- system2("python", python_script, stdout = TRUE, stderr = TRUE)
+  
+  # Check fetch summary
+  fetch_summary <- file.path(CONFIG$dirs$raw, "fetch_summary.json")
+  if (file.exists(fetch_summary)) {
+    summary_data <- fromJSON(fetch_summary)
+    log_info("Fetch completed: {summary_data$total_files} files downloaded")
+    return(TRUE)
+  } else {
+    log_warn("Fetch summary not found. Checking for parquet files...")
+    parquet_files <- safe_list_parquet(CONFIG$dirs$raw)
+    if (length(parquet_files) > 0) {
+      log_info("Found {length(parquet_files)} parquet files")
+      return(TRUE)
+    } else {
+      log_error("No data files found after fetch attempt")
+      return(FALSE)
+    }
+  }
+}
+
+# ============================================================================
+# Step 2: Load and Combine Raw Data
+# ============================================================================
+
+load_raw_data <- function() {
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  log_info("STEP 2: Loading Raw Data")
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  
+  # Use safe listing function
+  parquet_files <- safe_list_parquet(CONFIG$dirs$raw, full.names = TRUE)
+  
+  if (length(parquet_files) == 0) {
+    log_error("No parquet files found in {CONFIG$dirs$raw}")
+    return(NULL)
+  }
+  
+  log_info("Found {length(parquet_files)} parquet files")
+  
+  # Load and combine all parquet files
+  all_data <- list()
+  
+  for (file in parquet_files) {
+    log_info("Loading: {basename(file)}")
+    tryCatch({
+      df <- read_parquet(file)
+      
+      # Extract ID from filename
+      file_id <- gsub("\\.parquet$", "", basename(file))
+      
+      # Add source metadata
+      df$source_file <- file_id
+      df$source_id <- as.numeric(file_id)
+      
+      all_data[[file_id]] <- df
+      log_info("  - Loaded {nrow(df)} rows, {ncol(df)} columns")
+    }, error = function(e) {
+      log_error("Failed to load {file}: {e$message}")
+    })
+  }
+  
+  if (length(all_data) == 0) {
+    log_error("No data successfully loaded")
+    return(NULL)
+  }
+  
+  # Combine all data
+  combined_data <- bind_rows(all_data)
+  log_info("Total combined data: {nrow(combined_data)} rows, {ncol(combined_data)} columns")
+  
+  # Save combined raw data
+  save_path <- file.path(CONFIG$dirs$processed, "combined_raw_data.rds")
+  saveRDS(combined_data, save_path)
+  log_info("Saved combined data to: {save_path}")
+  
+  return(combined_data)
+}
+
+# ============================================================================
+# Step 3: Data Cleaning and Validation
+# ============================================================================
+
+clean_data <- function(df) {
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  log_info("STEP 3: Data Cleaning")
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  
+  if (is.null(df) || nrow(df) == 0) {
+    log_error("No data to clean")
+    return(NULL)
+  }
+  
+  initial_rows <- nrow(df)
+  
+  # Remove duplicate rows
+  df <- df %>% distinct()
+  dup_removed <- initial_rows - nrow(df)
+  log_info("Removed {dup_removed} duplicate rows")
+  
+  # Standardize column names
+  names(df) <- tolower(names(df))
+  names(df) <- gsub(" ", "_", names(df))
+  names(df) <- gsub("[^a-zA-Z0-9_]", "", names(df))
+  log_info("Standardized column names")
+  
+  # Handle date columns
+  date_cols <- intersect(CONFIG$processing$date_columns, names(df))
+  for (col in date_cols) {
+    if (col %in% names(df)) {
+      df[[col]] <- tryCatch({
+        as.Date(df[[col]])
+      }, error = function(e) {
+        log_warn("Could not convert {col} to Date format")
+        df[[col]]
+      })
+    }
+  }
+  
+  # Standardize text columns (trim whitespace, convert to title case where appropriate)
+  char_cols <- names(df)[sapply(df, is.character)]
+  for (col in char_cols) {
+    df[[col]] <- trimws(df[[col]])
+    # Convert empty strings to NA
+    df[[col]][df[[col]] == ""] <- NA
+  }
+  
+  log_info("Cleaning complete. {nrow(df)} rows remaining")
+  
+  # Save cleaned data
+  save_path <- file.path(CONFIG$dirs$processed, "cleaned_data.rds")
+  saveRDS(df, save_path)
+  log_info("Saved cleaned data to: {save_path}")
+  
+  return(df)
+}
+
+# ============================================================================
+# Step 4: Apply Lookup Tables
+# ============================================================================
+
+apply_lookups <- function(df) {
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  log_info("STEP 4: Applying Lookup Tables")
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  
+  lookup_file <- file.path(CONFIG$dirs$lookup, "lookup.xlsx")
+  
+  if (!file.exists(lookup_file)) {
+    log_warn("Lookup file not found: {lookup_file}")
+    log_info("Continuing without lookup enrichment")
+    return(df)
+  }
+  
+  # Load lookup sheets
+  lookup_sheets <- getSheetNames(lookup_file)
+  log_info("Found lookup sheets: {paste(lookup_sheets, collapse = ', ')}")
+  
+  for (sheet in lookup_sheets) {
+    tryCatch({
+      lookup_df <- read.xlsx(lookup_file, sheet = sheet)
+      log_info("Processing lookup sheet: {sheet} ({nrow(lookup_df)} entries)")
+      
+      # Try to join based on common columns
+      common_cols <- intersect(names(df), names(lookup_df))
+      
+      if (length(common_cols) > 0) {
+        join_col <- common_cols[1]
+        log_info("  Joining on column: {join_col}")
+        
+        # Add lookup suffix to avoid column name conflicts
+        lookup_suffix <- paste0("_", tolower(gsub(" ", "_", sheet)))
+        names(lookup_df)[!names(lookup_df) %in% join_col] <- 
+          paste0(names(lookup_df)[!names(lookup_df) %in% join_col], lookup_suffix)
+        
+        df <- df %>%
+          left_join(lookup_df, by = setNames(join_col, join_col))
+        
+        log_info("  Successfully applied {sheet} lookup")
+      } else {
+        log_warn("  No common columns found for joining with {sheet}")
+      }
+    }, error = function(e) {
+      log_error("Failed to apply lookup sheet {sheet}: {e$message}")
+    })
+  }
+  
+  log_info("Lookup application complete. Data has {ncol(df)} columns")
+  
+  # Save enriched data
+  save_path <- file.path(CONFIG$dirs$processed, "enriched_data.rds")
+  saveRDS(df, save_path)
+  log_info("Saved enriched data to: {save_path}")
+  
+  return(df)
+}
+
+# ============================================================================
+# Step 5: Quality Control Checks (FIXED - Memory safe)
+# ============================================================================
+
+run_qc_checks <- function(df) {
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  log_info("STEP 5: Quality Control Checks")
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  
+  qc_report <- list()
+  
+  # 1. Missing data check - using colMeans for better memory efficiency
+  missing_rates <- colMeans(is.na(df)) * 100
+  high_missing <- names(missing_rates[missing_rates > CONFIG$processing$qc_thresholds$missing_rate_max * 100])
+  
+  qc_report$missing_data <- data.frame(
+    column = names(missing_rates),
+    missing_percent = round(missing_rates, 2),
+    status = ifelse(names(missing_rates) %in% high_missing, "WARNING", "OK"),
+    stringsAsFactors = FALSE
+  )
+  
+  log_info("Missing data check completed")
+  log_info("  Columns with >30% missing: {length(high_missing)}")
+  
+  # 2. Duplicate check
+  duplicate_rows <- sum(duplicated(df))
+  qc_report$duplicates <- data.frame(
+    metric = "duplicate_rows",
+    count = duplicate_rows,
+    status = ifelse(duplicate_rows > CONFIG$processing$qc_thresholds$duplicate_threshold, "WARNING", "OK"),
+    stringsAsFactors = FALSE
+  )
+  
+  log_info("Duplicate rows found: {duplicate_rows}")
+  
+  # 3. Data type validation - sample for large datasets
+  column_types <- data.frame(
+    column = names(df),
+    type = sapply(df, function(x) class(x)[1]),
+    unique_values = sapply(df, function(x) min(length(unique(x)), 1000)),  # Cap at 1000
+    stringsAsFactors = FALSE
+  )
+  qc_report$column_types <- column_types
+  
+  # 4. Check for critical columns
+  critical_columns <- c("source_id", "source_file")
+  missing_critical <- critical_columns[!critical_columns %in% names(df)]
+  
+  if (length(missing_critical) > 0) {
+    log_warn("Missing critical columns: {paste(missing_critical, collapse = ', ')}")
+    qc_report$critical_columns_missing <- missing_critical
+  }
+  
+  # 5. Date range check (if date columns exist)
+  date_columns <- intersect(CONFIG$processing$date_columns, names(df))
+  if (length(date_columns) > 0) {
+    date_ranges <- list()
+    for (col in date_columns) {
+      if (inherits(df[[col]], "Date")) {
+        date_ranges[[col]] <- c(min(df[[col]], na.rm = TRUE), max(df[[col]], na.rm = TRUE))
+      }
+    }
+    qc_report$date_ranges <- date_ranges
+    log_info("Date ranges calculated for {length(date_ranges)} columns")
+  }
+  
+  # Save QC report
+  qc_json <- file.path(CONFIG$dirs$qc, paste0("qc_report_", Sys.Date(), ".json"))
+  write_json(qc_report, qc_json, pretty = TRUE, auto_unbox = TRUE)
+  log_info("QC report saved to: {qc_json}")
+  
+  # Save CSV version for easy viewing
+  qc_csv <- file.path(CONFIG$dirs$qc, paste0("missing_data_", Sys.Date(), ".csv"))
+  write.csv(qc_report$missing_data, qc_csv, row.names = FALSE)
+  log_info("Missing data summary saved to: {qc_csv}")
+  
+  return(qc_report)
+}
+
+# ============================================================================
+# Step 6: Generate Final Dataset by Country
+# ============================================================================
+
+generate_country_datasets <- function(df) {
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  log_info("STEP 6: Generating Country-Specific Datasets")
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  
+  # Identify potential country columns
+  country_cols <- intersect(CONFIG$processing$country_columns, names(df))
+  
+  if (length(country_cols) == 0) {
+    log_warn("No country columns found. Skipping country splits.")
+    return(FALSE)
+  }
+  
+  country_col <- country_cols[1]
+  log_info("Using country column: {country_col}")
+  
+  # Get unique countries
+  countries <- unique(df[[country_col]])
+  countries <- countries[!is.na(countries)]
+  
+  log_info("Found {length(countries)} unique countries")
+  
+  # Create country-specific datasets
+  country_dir <- file.path(CONFIG$dirs$processed, "country")
+  if (!dir.exists(country_dir)) dir.create(country_dir, recursive = TRUE)
+  
+  for (country in countries) {
+    # Clean country name for filename
+    country_clean <- gsub("[^a-zA-Z0-9]", "_", country)
+    country_data <- df %>% filter(.data[[country_col]] == country)
+    
+    # Save as RDS
+    save_path <- file.path(country_dir, paste0(country_clean, ".rds"))
+    saveRDS(country_data, save_path)
+    
+    # Save as CSV for easy access
+    csv_path <- file.path(CONFIG$dirs$final, paste0(country_clean, ".csv"))
+    write.csv(country_data, csv_path, row.names = FALSE)
+    
+    log_info("  - {country}: {nrow(country_data)} rows saved")
+  }
+  
+  # Save master dataset
+  master_path <- file.path(CONFIG$dirs$final, "master_dataset.rds")
+  saveRDS(df, master_path)
+  
+  master_csv <- file.path(CONFIG$dirs$final, "master_dataset.csv")
+  write.csv(df, master_csv, row.names = FALSE)
+  
+  log_info("Master dataset saved with {nrow(df)} rows")
+  
+  return(TRUE)
+}
+
+# ============================================================================
+# Step 7: Generate Reports
+# ============================================================================
+
+generate_reports <- function(df, qc_report) {
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  log_info("STEP 7: Generating Reports")
+  log_info("=" %>% paste(rep(50), collapse = ""))
+  
+  # Create summary statistics
+  summary_stats <- list(
+    processing_date = Sys.time(),
+    total_rows = nrow(df),
+    total_columns = ncol(df),
+    column_names = names(df),
+    missing_data_summary = qc_report$missing_data,
+    file_info = list(
+      source_files = unique(df$source_file),
+      date_range = if("date" %in% names(df)) range(df$date, na.rm = TRUE) else NULL
+    )
+  )
+  
+  # Save summary as JSON
+  summary_json <- file.path(CONFIG$dirs$reports, paste0("summary_", Sys.Date(), ".json"))
+  write_json(summary_stats, summary_json, pretty = TRUE, auto_unbox = TRUE)
+  log_info("Summary report saved to: {summary_json}")
+  
+  # Create Excel report
+  report_excel <- file.path(CONFIG$dirs$reports, paste0("im_workflow_report_", Sys.Date(), ".xlsx"))
+  
+  # Prepare sheets
+  sheets <- list(
+    "Summary" = data.frame(
+      Metric = c("Processing Date", "Total Rows", "Total Columns", "Source Files"),
+      Value = c(
+        as.character(Sys.time()),
+        nrow(df),
+        ncol(df),
+        paste(unique(df$source_file), collapse = ", ")
+      )
+    ),
+    "Missing Data" = qc_report$missing_data,
+    "Column Info" = qc_report$column_types,
+    "Data Sample" = head(df, 100)
+  )
+  
+  # Write Excel file
+  write.xlsx(sheets, report_excel)
+  log_info("Excel report saved to: {report_excel}")
+  
+  # Generate markdown report
+  md_report <- file.path(CONFIG$dirs$reports, paste0("README_", Sys.Date(), ".md"))
+  
+  md_content <- sprintf(
+    "# IM Workflow Report - %s
+
+## Execution Summary
+
+- **Processing Date**: %s
+- **Total Rows Processed**: %s
+- **Total Columns**: %s
+- **Source Files**: %s
+
+## Data Quality Summary
+
+### Missing Data Overview
+
+| Column | Missing %% | Status |
+|--------|------------|--------|
+%s
+
+## Next Steps
+
+1. Review QC report in `data/processed/qc/`
+2. Validate country-specific datasets in `data/final/`
+3. Run analysis dashboards from `outputs/dashboards/`
+
+## File Locations
+
+- Master Dataset: `data/final/master_dataset.csv`
+- Country Datasets: `data/final/`
+- QC Reports: `data/processed/qc/`
+- Logs: `logs/`
+
+---
+*Report generated automatically by IM Workflow Pipeline*",
+    Sys.Date(),
+    Sys.time(),
+    format(nrow(df), big.mark = ","),
+    ncol(df),
+    paste(unique(df$source_file), collapse = ", "),
+    paste(
+      sprintf("| %s | %.2f | %s |", 
+              qc_report$missing_data$column,
+              qc_report$missing_data$missing_percent,
+              qc_report$missing_data$status),
+      collapse = "\n"
+    )
+  )
+  
+  writeLines(md_content, md_report)
+  log_info("Markdown report saved to: {md_report}")
+  
+  return(TRUE)
+}
+
+# ============================================================================
+# Main Pipeline Execution
+# ============================================================================
+
+run_pipeline <- function(skip_fetch = FALSE, skip_upload = FALSE) {
+  log_info("=" %>% paste(rep(60), collapse = ""))
+  log_info("IM WORKFLOW PIPELINE STARTING")
+  log_info("=" %>% paste(rep(60), collapse = ""))
+  log_info("Start time: {Sys.time()}")
+  
+  start_time <- Sys.time()
+  
+  # Create directory structure
+  create_directories()
+  
+  # Step 1: Fetch data
+  if (!skip_fetch) {
+    fetch_success <- run_data_fetch()
+    if (!fetch_success) {
+      log_warn("Data fetch had issues. Continuing with existing data if available...")
+    }
+  } else {
+    log_info("Skipping data fetch step as requested")
+  }
+  
+  # Step 2: Load raw data
+  raw_data <- load_raw_data()
+  if (is.null(raw_data)) {
+    log_error("No data available. Pipeline terminated.")
+    return(FALSE)
+  }
+  
+  # Step 3: Clean data
+  cleaned_data <- clean_data(raw_data)
+  if (is.null(cleaned_data)) {
+    log_error("Data cleaning failed. Pipeline terminated.")
+    return(FALSE)
+  }
+  
+  # Step 4: Apply lookups
+  enriched_data <- apply_lookups(cleaned_data)
+  
+  # Step 5: Run QC checks
+  qc_results <- run_qc_checks(enriched_data)
+  
+  # Step 6: Generate country datasets
+  country_success <- generate_country_datasets(enriched_data)
+  
+  # Step 7: Generate reports
+  report_success <- generate_reports(enriched_data, qc_results)
+  
+  # Step 8: Upload to SharePoint
+  if (!skip_upload) {
+    log_info("\n" %>% paste(rep(50), collapse = ""))
+    log_info("STEP 8: Uploading to SharePoint")
+    log_info("=" %>% paste(rep(50), collapse = ""))
+    upload_to_sharepoint("--all")
+  } else {
+    log_info("Skipping SharePoint upload as requested")
+  }
+  
+  # Calculate execution time
+  end_time <- Sys.time()
+  execution_time <- difftime(end_time, start_time, units = "mins")
+  
+  log_info("=" %>% paste(rep(60), collapse = ""))
+  log_info("PIPELINE COMPLETED SUCCESSFULLY")
+  log_info("Total execution time: {round(execution_time, 2)} minutes")
+  log_info("End time: {end_time}")
+  log_info("=" %>% paste(rep(60), collapse = ""))
+  
+  # Print summary to console
+  cat("\n")
+  cat("=" %>% paste(rep(60), collapse = ""), "\n")
+  cat("IM WORKFLOW PIPELINE SUMMARY\n")
+  cat("=" %>% paste(rep(60), collapse = ""), "\n")
+  cat(sprintf("Total rows processed: %s\n", format(nrow(enriched_data), big.mark = ",")))
+  cat(sprintf("Total columns: %d\n", ncol(enriched_data)))
+  cat(sprintf("Execution time: %.2f minutes\n", execution_time))
+  cat(sprintf("Output location: %s\n", CONFIG$dirs$root))
+  cat("\nKey outputs:\n")
+  cat("  - Master dataset: data/final/master_dataset.csv\n")
+  cat("  - Excel report: outputs/reports/im_workflow_report_*.xlsx\n")
+  cat("  - QC report: data/processed/qc/qc_report_*.json\n")
+  cat("=" %>% paste(rep(60), collapse = ""), "\n")
+  
+  return(TRUE)
+}
+
+# ============================================================================
+# Command Line Execution
+# ============================================================================
+
+# Parse command line arguments
+args <- commandArgs(trailingOnly = TRUE)
+skip_fetch_flag <- "--skip-fetch" %in% args
+skip_upload_flag <- "--skip-upload" %in% args
+upload_only_flag <- "--upload-only" %in% args
+
+# Run the pipeline or upload only
+if (interactive()) {
+  cat("Running IM Workflow Pipeline interactively...\n")
+  cat("To skip data fetch, run: run_pipeline(skip_fetch = TRUE)\n")
+  cat("To skip upload, run: run_pipeline(skip_upload = TRUE)\n\n")
+  run_pipeline(skip_fetch = FALSE, skip_upload = FALSE)
+} else if (upload_only_flag) {
+  # Upload only mode
+  cat("Upload only mode - sending files to SharePoint\n")
+  upload_to_sharepoint("--all")
+} else {
+  # Run full pipeline
+  run_pipeline(skip_fetch = skip_fetch_flag, skip_upload = skip_upload_flag)
+}

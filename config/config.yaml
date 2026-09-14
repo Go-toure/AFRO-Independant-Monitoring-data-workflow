@@ -1,0 +1,38 @@
+# IM Workflow Configuration
+# saved as: config/workflow_config.yml
+
+pipeline:
+  name: "IM Data Pipeline"
+  version: "2.0.0"
+  
+data_sources:
+  api_endpoints:
+    - name: "primary_im_source"
+      url: "https://api.example.com/im-data"
+      timeout_seconds: 300
+  file_patterns:
+    raw_data: "*.parquet"
+    metadata: "*_metadata.json"
+
+processing:
+  batch_size: 10000
+  memory_limit_mb: 4096
+  parallel_cores: 4
+  
+quality_checks:
+  missing_threshold: 0.3
+  duplicate_check: true
+  outlier_detection: false
+  
+outputs:
+  formats:
+    - "csv"
+    - "rds"
+    - "parquet"
+  compression: true
+  retention_days: 90
+  
+notifications:
+  email_on_completion: false
+  email_address: "im-team@example.com"
+  slack_webhook: null

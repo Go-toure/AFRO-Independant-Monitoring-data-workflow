@@ -1,0 +1,54 @@
+============================================================
+REGIONAL IM REPOSITORY BUILDER - User Guide
+============================================================
+
+PURPOSE:
+  Processes raw IM data files and creates a harmonized regional repository.
+
+REQUIREMENTS:
+  - R software (version 4.0 or higher)
+  - Internet connection (for installing packages)
+
+SETUP:
+  1. Install R from: https://cran.r-project.org/
+  2. Place this script in your working folder
+  3. Create the following folder structure:
+     
+     your_working_folder/
+     ├── data/
+     │   ├── raw/        (place your .parquet/.csv/.rds files here)
+     │   ├── final/      (outputs will be saved here)
+     │   ├── processed/  (temporary files)
+     │   └── lookup/     (optional: place lookup.xlsx here)
+     └── regional_im_repository_builder.R
+
+USAGE:
+  Option 1 - Run in R/RStudio:
+    source("regional_im_repository_builder.R")
+  
+  Option 2 - Run from command line:
+    Rscript regional_im_repository_builder.R
+
+CONFIGURATION:
+  Edit the paths at the top of the script (lines 45-65):
+    BASE_DIR      <- "your_working_folder"
+    INPUT_FOLDER  <- file.path(BASE_DIR, "data/raw")
+    OUTPUT_FOLDER <- file.path(BASE_DIR, "data/final")
+
+SUPPORTED INPUT FORMATS:
+  .parquet, .rds, .qs, .csv, .xlsx, .feather
+
+OUTPUT FILES:
+  - Regional_IM_repository.csv / .rds / .parquet (main data)
+  - Regional_IM_repository_QC.csv / .rds / .parquet (quality control)
+  - IM_processing_summary.csv (processing log)
+  - Regional_IM_repository_METADATA.xlsx (documentation)
+
+TROUBLESHOOTING:
+  If packages fail to install, run in R:
+    install.packages(c("tidyverse", "arrow", "openxlsx", "data.table"))
+
+CONTACT:
+  For questions, contact: TOURE Gorgui Ba
+
+============================================================

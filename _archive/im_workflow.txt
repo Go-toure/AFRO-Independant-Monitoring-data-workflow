@@ -1,0 +1,15 @@
+run_workflow.R (or run_pipeline.R)
+    │
+    ├── STEP 1: Fetch_im_data.py (downloads parquet files)
+    │
+    ├── STEP 2: regional_im_repository_builder.R (processes data)
+    │       │
+    │       └── Outputs: CSV, RDS, Parquet files
+    │
+    ├── STEP 3: clean_geonames.R (standardizes names)
+    │       │
+    │       └── Outputs: Cleaned CSV, RDS, Parquet
+    │
+    └── STEP 4: upload_to_sharepoint.py (pushes to SharePoint)
+            │
+            └── Files uploaded to: /Documents/7. SIA_Data/Data Repository/
