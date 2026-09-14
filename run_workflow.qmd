@@ -22,6 +22,15 @@ printed inside this rendered report so a scheduled run leaves behind a
 human-readable record every time (in addition to logs/run_history.csv,
 which run_workflow.R already writes on every run).
 
+The actual R code for both chunks below lives in scripts/connect_cloud_*.R,
+not inline here -- Connect Cloud has a known bug where an oversized inline
+R code chunk in a Quarto document produces a misleading, unrelated error
+(a spurious "missing dependency" complaint, in our case "shiny", even
+though this pipeline never uses it) instead of the real one. See
+https://forum.posit.co/t/interactive-quarto-document-r-server-shiny-is-published-as-quarto-static-then-fails-asking-for-a-python-requirements-txt/217155
+Keeping each chunk to a single source() call sidesteps that regardless of
+the exact size threshold that triggers it.
+
 One-time setup needed in Connect Cloud's content settings for this
 deployment (Environment Variables panel) -- none of these are committed to
 git (config/secrets.env is git-ignored), so they only exist as real values
@@ -48,111 +57,11 @@ minute) pipeline run.
 
 ```{r diagnostics}
 #| error: true
-
-# Connect Cloud's dependency detection flagged "shiny" as a missing
-# dependency for this content (most likely because this repo also
-# contains shiny_app/app.R, a separate, unrelated Shiny dashboard
-# deployment) even though this pipeline never uses Shiny itself. Adding
-# this call is a harmless way to satisfy that check -- library() just
-# attaches the package; it does not start a Shiny server (that only
-# happens with an explicit "server: shiny" in the YAML front matter
-# above, which this document does not have).
-library(shiny)
-
-cat("R version:      ", R.version.string, "\n")
-cat("Platform:        ", R.version$platform, "\n")
-cat("Working directory:", getwd(), "\n\n")
-
-rscript_path <- Sys.which("Rscript")
-cat("Rscript found at:", if (nzchar(rscript_path)) rscript_path else "NOT FOUND", "\n")
-
-python_path <- Sys.which("python3")
-if (!nzchar(python_path)) python_path <- Sys.which("python")
-cat("python found at: ", if (nzchar(python_path)) python_path else "NOT FOUND", "\n")
-
-if (nzchar(python_path)) {
-  py_version <- tryCatch(
-    system2(python_path, "--version", stdout = TRUE, stderr = TRUE),
-    error = function(e) paste("ERROR:", conditionMessage(e))
-  )
-  cat("python version:  ", paste(py_version, collapse = " "), "\n")
-
-  # The pipeline's Python scripts need these specific packages -- worth
-  # knowing up front whether they're already on the image or still need
-  # a requirements.txt declared for this Connect Cloud deployment.
-  pkg_check <- tryCatch(
-    system2(python_path, c("-c",
-      shQuote("import importlib,sys; mods=['pandas','requests','pyarrow','openpyxl']; [print(m, '->', 'OK' if importlib.util.find_spec(m) else 'MISSING') for m in mods]")
-    ), stdout = TRUE, stderr = TRUE),
-    error = function(e) paste("ERROR:", conditionMessage(e))
-  )
-  cat(paste(pkg_check, collapse = "\n"), "\n")
-}
-
-cat("\nIM_WORKFLOW_HOME (as inherited, before this document sets it):",
-    Sys.getenv("IM_WORKFLOW_HOME", unset = "(not set)"), "\n")
-
-for (v in c("SHAREPOINT_TENANT_ID", "SHAREPOINT_CLIENT_ID", "SHAREPOINT_CLIENT_SECRET",
-            "GPEI_API_TOKEN", "ONA_API_TOKEN")) {
-  cat(sprintf("%-24s %s\n", v, if (nzchar(Sys.getenv(v))) "set" else "NOT SET"))
-}
+source("scripts/connect_cloud_diagnostics.R")
 ```
 
 ## Run the pipeline
 
 ```{r run-pipeline}
-# ------------------------------------------------------------------
-# This deployed document's own directory IS the workflow's BASE_DIR on
-# Connect Cloud -- data/, config/, scripts/, outputs/, logs/ all deploy
-# alongside it from the same git repo (data/outputs/logs start out empty
-# here since they're git-ignored; the pipeline's own SharePoint recovery
-# steps -- Fetch_im_data.py's raw_state sync, refresh_preparedness_lookup's
-# lookup_state sync, run_workflow.R's sp_recover_baseline_file() -- are
-# exactly what repopulate them on a from-scratch container like this one).
-# run_workflow.R reads its BASE_DIR from the IM_WORKFLOW_HOME env var,
-# defaulting to a Windows-only laptop path -- set it here so the exact
-# same, unmodified script works on both.
-# ------------------------------------------------------------------
-base_dir <- getwd()
-if (!nzchar(Sys.getenv("IM_WORKFLOW_HOME"))) {
-  Sys.setenv(IM_WORKFLOW_HOME = base_dir)
-}
-
-workflow_script <- file.path(base_dir, "scripts", "run_workflow.R")
-stopifnot(file.exists(workflow_script))
-
-# run_workflow.R calls quit() at several points, including on a clean
-# success -- sourcing it directly into this chunk would kill this
-# Quarto render's own R session before it could finish producing this
-# report. Running it as its own Rscript subprocess (the same trick
-# run_workflow.R itself already uses internally for the R sub-steps that
-# call quit() -- see run_r_script()) keeps it isolated: quit() only ends
-# the child process, and this chunk gets the child's captured output and
-# exit code back cleanly.
-#
-# Args: start with "--skip-fetch" for the first few scheduled runs on
-# Connect Cloud (cheaper, and doesn't need ONA_API_TOKEN yet) -- once
-# those are confirmed working end-to-end, drop it for the real full
-# production run (fetch + build + clean + reports + upload).
-workflow_args <- c("--skip-fetch")
-
-result <- system2(
-  "Rscript",
-  args = c(shQuote(workflow_script), workflow_args),
-  stdout = TRUE, stderr = TRUE
-)
-
-cat(result, sep = "\n")
-
-exit_status <- attr(result, "status")
-if (is.null(exit_status)) exit_status <- 0L
-
-if (exit_status != 0L) {
-  stop(sprintf(
-    "run_workflow.R exited with non-zero status %s -- see the captured output above for the real error.",
-    exit_status
-  ))
-}
-
-cat("\nrun_workflow.R completed successfully (exit status 0).\n")
+source("scripts/connect_cloud_run_pipeline.R")
 ```
