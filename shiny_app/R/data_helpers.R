@@ -11,6 +11,14 @@
 
 # ── DATA LOADING ──────────────────────────────────────────────────────────────
 load_im_data <- function() {
+  # On Posit Connect Cloud the local pipeline has never run, so none of
+  # these files exist on first load -- pull the pipeline's last output
+  # from SharePoint instead (see R/data_source_sharepoint.R). On the
+  # user's own machine, the local files from the nightly pipeline already
+  # exist, so this check is skipped and nothing changes there.
+  if (!any(file.exists(c(CLEANED_RDS, CLEANED_PARQUET, CLEANED_CSV, RAW_RDS)))) {
+    download_cleaned_data_from_sharepoint()
+  }
   for (f in c(CLEANED_RDS, CLEANED_PARQUET, CLEANED_CSV, RAW_RDS)) {
     if (!file.exists(f)) next
     df <- tryCatch(switch(tools::file_ext(f),
