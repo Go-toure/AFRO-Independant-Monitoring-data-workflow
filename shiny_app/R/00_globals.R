@@ -29,10 +29,39 @@ suppressPackageStartupMessages({
 })
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-# Set once via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows) if this
-# project ever moves off this laptop/drive -- every script in the pipeline
-# reads the same variable, so nothing else needs editing.
-BASE_DIR     <- Sys.getenv("IM_WORKFLOW_HOME", unset = "C:/Users/TOURE/Documents/im_workflow")
+# BASE_DIR resolution, in order:
+#   1. IM_WORKFLOW_HOME, but only if it actually contains scripts/run_workflow.R --
+#      this guards against a stale/wrong value (e.g. a leftover container path
+#      from a previous Connect Cloud deployment) silently pointing at nothing.
+#   2. Search upward from the current working directory for a folder that
+#      contains scripts/run_workflow.R. Shiny's runApp() sets the working
+#      directory to the app's own folder (shiny_app/), so on Connect Cloud --
+#      where the whole repo is checked out fresh into a new, unpredictable
+#      path on every deploy -- this finds the real repo root with no manually
+#      set variable needed at all.
+#   3. This laptop's known local path, as a last-resort fallback so nothing
+#      breaks if both of the above somehow fail.
+# Set IM_WORKFLOW_HOME via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows)
+# only if you want to force a specific location; it is optional everywhere
+# else now.
+find_workflow_home <- function() {
+  env_val <- Sys.getenv("IM_WORKFLOW_HOME", unset = "")
+  if (nzchar(env_val) && file.exists(file.path(env_val, "scripts", "run_workflow.R")))
+    return(normalizePath(env_val, mustWork = FALSE))
+
+  dir <- getwd()
+  for (i in 1:6) {
+    if (file.exists(file.path(dir, "scripts", "run_workflow.R")))
+      return(normalizePath(dir, mustWork = FALSE))
+    parent <- dirname(dir)
+    if (identical(parent, dir)) break  # reached filesystem root
+    dir <- parent
+  }
+
+  "C:/Users/TOURE/Documents/im_workflow"
+}
+
+BASE_DIR     <- find_workflow_home()
 WORKFLOW_DIR <- BASE_DIR
 SCRIPTS_DIR <- file.path(BASE_DIR, "scripts")
 FINAL_DIR   <- file.path(BASE_DIR, "data/final")
