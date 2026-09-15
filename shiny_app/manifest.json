@@ -2,6 +2,14 @@
   "version": 1,
   "locale": "fr_FR",
   "platform": "4.4.1",
+  "python": {
+    "version": "3.13.5",
+    "package_manager": {
+      "name": "pip",
+      "version": "26.0.1",
+      "package_file": "requirements.txt"
+    }
+  },
   "metadata": {
     "appmode": "shiny",
     "primary_rmd": null,
