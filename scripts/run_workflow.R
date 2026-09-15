@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 # ============================================================
 # UNIFIED IM WORKFLOW LAUNCHER
-# Orchestrates: Fetch -> Build Repository -> Clean Geonames -> Upload to SharePoint -> Reports (Optional)
+# Orchestrates: Fetch -> Build Repository -> Clean Geonames -> Reports (Optional) -> Upload to SharePoint
 # ============================================================
 
 suppressPackageStartupMessages(suppressWarnings({
@@ -10,12 +10,51 @@ suppressPackageStartupMessages(suppressWarnings({
 }))
 
 # Configuration
-# Set once via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows) if this
-# project ever moves off this laptop/drive -- every script in the pipeline
-# reads the same variable, so nothing else needs editing.
-BASE_DIR <- Sys.getenv("IM_WORKFLOW_HOME", unset = "C:/Users/TOURE/Documents/im_workflow")
+# BASE_DIR is resolved by find_workflow_home(), defined once in the shared
+# scripts/find_workflow_home.R (also sourced by shiny_app/R/00_globals.R) --
+# kept in exactly one file so a path-resolution fix, like the one that
+# created that file, never needs to be applied twice again. Source it via
+# THIS SCRIPT'S OWN FILE PATH (not the working directory), so it resolves
+# correctly no matter how run_workflow.R is launched: directly via Rscript
+# from the repo root, from a Windows batch file, or spawned as a subprocess
+# by the Shiny dashboard (whatever working directory that leaves us in).
+.rw_this_file <- normalizePath(sub("^--file=", "",
+  grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)))
+source(file.path(dirname(.rw_this_file), "find_workflow_home.R"))
+rm(.rw_this_file)
+
+BASE_DIR <- find_workflow_home()
 LOGS_DIR <- file.path(BASE_DIR, "logs")
 SCRIPTS_DIR <- file.path(BASE_DIR, "scripts")
+
+# Load config/secrets.env into THIS R process (mirrors scripts/_env_loader.py's
+# Python behaviour) -- needed so sp_recover_baseline_file() further down
+# (SharePoint credentials) can read SHAREPOINT_TENANT_ID/CLIENT_ID/CLIENT_SECRET.
+# The Python steps already load the same file independently in their own
+# process; this just gives the main run_workflow.R process the same
+# credentials for its own SharePoint calls. A real environment variable
+# (set via `setx` locally, or Posit Connect Cloud's Variables) always wins
+# over the file -- Sys.setenv() below only fills in values not already set,
+# matching the Python loader's setdefault() semantics.
+load_secrets_env <- function(base_dir) {
+  secrets_file <- file.path(base_dir, "config", "secrets.env")
+  if (!file.exists(secrets_file)) return(invisible(NULL))
+
+  lines <- readLines(secrets_file, warn = FALSE)
+  for (line in lines) {
+    line <- trimws(line)
+    if (nchar(line) == 0 || startsWith(line, "#") || !grepl("=", line, fixed = TRUE)) next
+    parts <- strsplit(line, "=", fixed = TRUE)[[1]]
+    key <- trimws(parts[1])
+    value <- trimws(paste(parts[-1], collapse = "="))
+    if (nzchar(key) && !nzchar(Sys.getenv(key))) {
+      do.call(Sys.setenv, setNames(list(value), key))
+    }
+  }
+  invisible(NULL)
+}
+
+load_secrets_env(BASE_DIR)
 
 # Create directories
 dir.create(LOGS_DIR, showWarnings = FALSE, recursive = TRUE)
@@ -198,7 +237,7 @@ run_live <- function(cmd) {
 # ============================================================
 
 upload_to_sharepoint <- function(upload_args = "--all") {
-  log_info("\n[STEP 4] Uploading files to SharePoint...")
+  log_info("\n[STEP 5] Uploading files to SharePoint...")
   
   upload_script <- file.path(SCRIPTS_DIR, "upload_to_sharepoint.py")
   
@@ -235,6 +274,96 @@ upload_to_sharepoint <- function(upload_args = "--all") {
     }
     return(FALSE)
   }
+}
+
+# ============================================================
+# SHAREPOINT BASELINE-FILE RECOVERY (Posit Connect Cloud decoupling)
+# ============================================================
+# regional_im_repository_builder.R (Step 2) and clean_geonames.R (Step 3)
+# each read one small file left over from the PREVIOUS run as a "did this
+# run's row count collapse" safety baseline, before overwriting that same
+# file with this run's own numbers -- export_manifest.txt and
+# IM_geonames_cleaning_summary.csv respectively. On this laptop that file
+# is always sitting there from last night's run; on a fresh Posit Connect
+# Cloud container there is no previous run's disk at all, so on every
+# single cloud run that safety check would silently have nothing to
+# compare against.
+#
+# Both files are ALREADY uploaded to SharePoint by Step 4 below (see
+# upload_to_sharepoint.py's FILE_MAPPINGS -- AFRO_Inside_HH_M_manifest.txt
+# and AFRO_Inside_HH_M_geonames_summary.csv, same "Data Repository"
+# folder). So the fix is just: if the local file is missing right before
+# the step that reads it runs, pull down the last-uploaded copy first.
+# Uses the same Graph app-only credentials as everything else in this
+# workflow. Soft-fails throughout (including when the httr2 package isn't
+# installed) -- a miss here just means that one validation baseline is
+# unavailable for this run, exactly as it always was before this existed.
+
+sp_get_graph_token <- function() {
+  tenant_id <- Sys.getenv("SHAREPOINT_TENANT_ID")
+  client_id <- Sys.getenv("SHAREPOINT_CLIENT_ID")
+  client_secret <- Sys.getenv("SHAREPOINT_CLIENT_SECRET")
+  if (!nzchar(tenant_id) || !nzchar(client_id) || !nzchar(client_secret)) return(NULL)
+
+  tryCatch({
+    resp <- httr2::request(sprintf(
+        "https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenant_id
+      )) |>
+      httr2::req_body_form(
+        client_id = client_id, client_secret = client_secret,
+        scope = "https://graph.microsoft.com/.default",
+        grant_type = "client_credentials"
+      ) |>
+      httr2::req_perform()
+    httr2::resp_body_json(resp)$access_token
+  }, error = function(e) NULL)
+}
+
+sp_get_drive_id <- function(token) {
+  tryCatch({
+    site <- httr2::request(
+        "https://graph.microsoft.com/v1.0/sites/worldhealthorg.sharepoint.com:/sites/AF-pep/GISWORKSPACE"
+      ) |>
+      httr2::req_auth_bearer_token(token) |>
+      httr2::req_perform() |>
+      httr2::resp_body_json()
+    drives <- httr2::request(sprintf("https://graph.microsoft.com/v1.0/sites/%s/drives", site$id)) |>
+      httr2::req_auth_bearer_token(token) |>
+      httr2::req_perform() |>
+      httr2::resp_body_json()
+    match <- Filter(function(d) tolower(d$name) == "documents", drives$value)
+    if (!length(match)) return(NULL)
+    match[[1]]$id
+  }, error = function(e) NULL)
+}
+
+sp_recover_baseline_file <- function(local_path, remote_filename) {
+  if (file.exists(local_path)) return(invisible(NULL))
+  if (!requireNamespace("httr2", quietly = TRUE)) return(invisible(NULL))
+
+  token <- sp_get_graph_token()
+  if (is.null(token)) return(invisible(NULL))
+  drive_id <- sp_get_drive_id(token)
+  if (is.null(drive_id)) return(invisible(NULL))
+
+  remote_path <- paste0("7. SIA_Data/Data Repository/", remote_filename)
+  content_url <- sprintf(
+    "https://graph.microsoft.com/v1.0/drives/%s/root:/%s:/content",
+    drive_id, utils::URLencode(remote_path)
+  )
+
+  tryCatch({
+    resp <- httr2::request(content_url) |>
+      httr2::req_auth_bearer_token(token) |>
+      httr2::req_perform()
+    dir.create(dirname(local_path), recursive = TRUE, showWarnings = FALSE)
+    writeBin(httr2::resp_body_raw(resp), local_path)
+    log_info("Recovered {basename(local_path)} from SharePoint (no local copy existed yet).")
+  }, error = function(e) {
+    log_warn("Could not recover {basename(local_path)} from SharePoint: {e$message}")
+  })
+
+  invisible(NULL)
 }
 
 # ============================================================
@@ -298,7 +427,7 @@ source_safely <- function(script_path, step_name) {
 # ============================================================
 
 run_optional_reports <- function() {
-  log_info("\n[STEP 5] Generating optional reports...")
+  log_info("\n[STEP 4] Generating optional reports...")
 
   # Report 0: Phase 1 IM Intelligence Analysis Engine
   # Creates the root-cause, SM effectiveness, operational failure and district
@@ -471,7 +600,12 @@ if (!skip_fetch) {
 
 if (!skip_build) {
   log_info("\n[STEP 2] Building regional IM repository...")
-  
+
+  sp_recover_baseline_file(
+    file.path(BASE_DIR, "data", "final", "export_manifest.txt"),
+    "AFRO_Inside_HH_M_manifest.txt"
+  )
+
   builder_script <- file.path(SCRIPTS_DIR, "regional_im_repository_builder.R")
   
   if (file.exists(builder_script)) {
@@ -524,6 +658,11 @@ clean_ok <- TRUE
 if (!skip_clean) {
   log_info("\n[STEP 3] Cleaning geonames...")
 
+  sp_recover_baseline_file(
+    file.path(BASE_DIR, "data", "final", "IM_geonames_cleaning_summary.csv"),
+    "AFRO_Inside_HH_M_geonames_summary.csv"
+  )
+
   clean_script <- file.path(SCRIPTS_DIR, "clean_geonames.R")
   # Use run_r_script (separate process) instead of source_safely:
   # clean_geonames.R calls quit() at the end, which would kill this
@@ -543,31 +682,7 @@ if (!skip_clean) {
 }
 
 # ============================================================
-# STEP 4: Upload to SharePoint
-# ============================================================
-
-if (!skip_upload) {
-  if (!clean_ok && !force_upload) {
-    log_warn("Skipping SharePoint upload: Clean Geonames failed this run, so data/final still holds the previous file.")
-    cat("\n[WARN] [STEP 4] Skipping SharePoint upload - Clean Geonames failed, so data/final still holds the PREVIOUS run's file.\n")
-    cat("    Fix the lock issue and re-run, or pass --force-upload to push the stale file anyway.\n")
-    step_status$upload <- "skipped_clean_failed"
-  } else {
-    if (!clean_ok && force_upload) {
-      cat("\n[WARN] [STEP 4] Clean Geonames failed, but --force-upload was set - uploading the PREVIOUS (stale) file anyway.\n")
-    }
-    upload_result <- upload_to_sharepoint("--all")
-    step_status$upload <- if (upload_result) "ok" else "failed_soft"
-    if (!upload_result) {
-      log_warn("SharePoint upload had issues, but workflow continues")
-    }
-  }
-} else {
-  log_info("\n[STEP 4] Skipping SharePoint upload (--skip-upload)")
-}
-
-# ============================================================
-# STEP 5: Optional Reports (Non-blocking)
+# STEP 4: Optional Reports (Non-blocking)
 # ============================================================
 
 if (!skip_reports) {
@@ -581,7 +696,31 @@ if (!skip_reports) {
     "failed_soft"
   }
 } else {
-  log_info("\n[STEP 5] Skipping optional reports (--skip-reports)")
+  log_info("\n[STEP 4] Skipping optional reports (--skip-reports)")
+}
+
+# ============================================================
+# STEP 5: Upload to SharePoint
+# ============================================================
+
+if (!skip_upload) {
+  if (!clean_ok && !force_upload) {
+    log_warn("Skipping SharePoint upload: Clean Geonames failed this run, so data/final still holds the previous file.")
+    cat("\n[WARN] [STEP 5] Skipping SharePoint upload - Clean Geonames failed, so data/final still holds the PREVIOUS run's file.\n")
+    cat("    Fix the lock issue and re-run, or pass --force-upload to push the stale file anyway.\n")
+    step_status$upload <- "skipped_clean_failed"
+  } else {
+    if (!clean_ok && force_upload) {
+      cat("\n[WARN] [STEP 5] Clean Geonames failed, but --force-upload was set - uploading the PREVIOUS (stale) file anyway.\n")
+    }
+    upload_result <- upload_to_sharepoint("--all")
+    step_status$upload <- if (upload_result) "ok" else "failed_soft"
+    if (!upload_result) {
+      log_warn("SharePoint upload had issues, but workflow continues")
+    }
+  }
+} else {
+  log_info("\n[STEP 5] Skipping SharePoint upload (--skip-upload)")
 }
 
 # ============================================================

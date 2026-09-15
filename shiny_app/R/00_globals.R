@@ -29,37 +29,26 @@ suppressPackageStartupMessages({
 })
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-# BASE_DIR resolution, in order:
-#   1. IM_WORKFLOW_HOME, but only if it actually contains scripts/run_workflow.R --
-#      this guards against a stale/wrong value (e.g. a leftover container path
-#      from a previous Connect Cloud deployment) silently pointing at nothing.
-#   2. Search upward from the current working directory for a folder that
-#      contains scripts/run_workflow.R. Shiny's runApp() sets the working
-#      directory to the app's own folder (shiny_app/), so on Connect Cloud --
-#      where the whole repo is checked out fresh into a new, unpredictable
-#      path on every deploy -- this finds the real repo root with no manually
-#      set variable needed at all.
-#   3. This laptop's known local path, as a last-resort fallback so nothing
-#      breaks if both of the above somehow fail.
+# BASE_DIR is resolved by find_workflow_home(), defined once in the shared
+# scripts/find_workflow_home.R (also sourced by scripts/run_workflow.R
+# itself) -- kept in exactly one file so a path-resolution fix, like the
+# one that created that file, never needs to be applied twice again and
+# can never silently drift out of sync between the dashboard and the
+# pipeline script it launches.
 # Set IM_WORKFLOW_HOME via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows)
 # only if you want to force a specific location; it is optional everywhere
-# else now.
-find_workflow_home <- function() {
-  env_val <- Sys.getenv("IM_WORKFLOW_HOME", unset = "")
-  if (nzchar(env_val) && file.exists(file.path(env_val, "scripts", "run_workflow.R")))
-    return(normalizePath(env_val, mustWork = FALSE))
-
-  dir <- getwd()
-  for (i in 1:6) {
-    if (file.exists(file.path(dir, "scripts", "run_workflow.R")))
-      return(normalizePath(dir, mustWork = FALSE))
-    parent <- dirname(dir)
-    if (identical(parent, dir)) break  # reached filesystem root
-    dir <- parent
-  }
-
-  "C:/Users/TOURE/Documents/im_workflow"
+# else now -- see find_workflow_home.R's own header comment for the full
+# resolution order.
+.globals_candidate_paths <- c(
+  file.path("..", "scripts", "find_workflow_home.R"),  # cwd = shiny_app/  (normal: Shiny's runApp())
+  file.path("scripts", "find_workflow_home.R")         # cwd = repo root   (fallback)
+)
+.globals_shared_file <- .globals_candidate_paths[file.exists(.globals_candidate_paths)][1]
+if (is.na(.globals_shared_file)) {
+  stop("Could not find scripts/find_workflow_home.R from working directory: ", getwd())
 }
+source(.globals_shared_file)
+rm(.globals_candidate_paths, .globals_shared_file)
 
 BASE_DIR     <- find_workflow_home()
 WORKFLOW_DIR <- BASE_DIR
