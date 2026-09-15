@@ -88,16 +88,50 @@ for (f in pipeline_files) {
 old_wd <- setwd(stage_dir)
 on.exit(setwd(old_wd), add = TRUE)
 
+# This Shiny (R) app shells out to Python scripts (Fetch_im_data.py,
+# upload_to_sharepoint.py, ...) that need real packages (requests, pandas,
+# pyarrow, openpyxl, PyYAML -- see requirements.txt). Without passing
+# `python` here, writeManifest() only ever writes an R "packages" section,
+# so Connect Cloud never provisions ANY Python environment for this piece
+# of content at all -- which is exactly why those subprocess calls have
+# been failing with "No module named requests" even after the base-dir
+# fix. Passing `python` here makes writeManifest() also add a top-level
+# "python" section (version + package_manager.package_file =
+# "requirements.txt"), which is what actually triggers Connect Cloud to
+# run `pip install -r requirements.txt` for this content on top of the
+# R environment -- see docs.posit.co/connect/admin/python/package-management/.
+python_bin <- Sys.which("python")
+if (!nzchar(python_bin)) {
+  stop("Could not find 'python' on PATH -- needed so writeManifest() can ",
+       "detect a Python environment and add the manifest's \"python\" ",
+       "section. Run this from a shell where the same `python` used by ",
+       "run_workflow.R's subprocess calls is on PATH.")
+}
+cat("\nUsing python binary for dependency detection:", python_bin, "\n")
+
 cat("\nGenerating manifest.json from the isolated staging folder...\n")
 rsconnect::writeManifest(
   appDir = ".",
-  appPrimaryDoc = "app.R"
+  appPrimaryDoc = "app.R",
+  python = python_bin
 )
 
 manifest_path <- file.path(stage_dir, "manifest.json")
 stopifnot(file.exists(manifest_path))
 
-pkgs <- names(jsonlite::fromJSON(manifest_path)$packages)
+manifest_obj <- jsonlite::fromJSON(manifest_path)
+
+if (is.null(manifest_obj$python)) {
+  cat("\nWARNING: manifest.json still has NO \"python\" section -- Connect\n")
+  cat("Cloud will NOT provision Python for this content. Tell Claude before\n")
+  cat("committing this manifest.\n")
+} else {
+  cat("\nGood -- manifest.json now has a \"python\" section:\n")
+  cat("  version:", manifest_obj$python$version, "\n")
+  cat("  package_file:", manifest_obj$python$package_manager$package_file, "\n")
+}
+
+pkgs <- names(manifest_obj$packages)
 cat("\nCaptured", length(pkgs), "R package dependencies:\n")
 cat(paste(" -", sort(pkgs)), sep = "\n")
 
@@ -111,4 +145,4 @@ if ("logger" %in% pkgs) {
 dest_manifest <- file.path(repo_root, "shiny_app", "manifest.json")
 file.copy(manifest_path, dest_manifest, overwrite = TRUE)
 cat("\nCopied manifest.json into:", dest_manifest, "\n")
-cat("Next: git add shiny_app/manifest.json generate_shiny_manifest.R, commit, push, and retry the pipeline button on Connect Cloud.\n"
+cat("Next: git add shiny_app/manifest.json generate_shiny_manifest.R, commit, push, and retry the pipeline button on Connect Cloud.\n")
