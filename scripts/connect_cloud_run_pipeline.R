@@ -36,7 +36,7 @@ stopifnot(file.exists(workflow_script))
 # Connect Cloud (cheaper, and doesn't need ONA_API_TOKEN yet) -- once
 # those are confirmed working end-to-end, drop it for the real full
 # production run (fetch + build + clean + reports + upload).
-workflow_args <- c("--skip-fetch")
+workflow_args <- c()  # full run now that ONA_API_TOKEN is configured -- --skip-fetch left data/raw/ empty on this fresh container
 
 result <- system2(
   "Rscript",
