@@ -41,3 +41,29 @@ find_workflow_home <- function() {
 
   "C:/Users/TOURE/Documents/im_workflow"
 }
+
+
+# ============================================================
+# SHARED: find a working `python` command on whatever machine/container
+# this code is running on.
+# ============================================================
+# Posit Connect Cloud's provisioned Python environments only put `python3`
+# on PATH -- there is no plain `python` symlink -- while this laptop (and
+# most local Windows setups) only has `python` on PATH, not `python3`.
+# Every script in this pipeline that shells out to a .py file
+# (Fetch_im_data.py, upload_to_sharepoint.py, refresh_preparedness_lookup.py,
+# send_failure_alert.py) used to hardcode "python", which is exactly why
+# those calls started failing with "sh: 1: python: not found" (exit code
+# 127) as soon as Connect Cloud actually provisioned a Python environment
+# for this content (see the manifest.json "python" section fix) -- that
+# fixed the *presence* of the packages, but not the command name used to
+# invoke them. This tries both, in the order most likely to be right for
+# a fresh container, and fails loudly (a clear stop(), not a silent
+# fallback) if truly neither is on PATH.
+find_python_cmd <- function() {
+  for (cmd in c("python3", "python")) {
+    if (nzchar(Sys.which(cmd))) return(cmd)
+  }
+  stop("Could not find 'python3' or 'python' on PATH -- every pipeline ",
+       "step that shells out to a Python script needs one of these to exist.")
+}

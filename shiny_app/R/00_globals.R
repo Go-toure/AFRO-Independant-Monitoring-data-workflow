@@ -52,6 +52,7 @@ rm(.globals_candidate_paths, .globals_shared_file)
 
 BASE_DIR     <- find_workflow_home()
 WORKFLOW_DIR <- BASE_DIR
+PYTHON_CMD   <- find_python_cmd()
 SCRIPTS_DIR <- file.path(BASE_DIR, "scripts")
 FINAL_DIR   <- file.path(BASE_DIR, "data/final")
 LOGS_DIR    <- file.path(BASE_DIR, "logs")

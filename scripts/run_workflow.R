@@ -24,6 +24,7 @@ source(file.path(dirname(.rw_this_file), "find_workflow_home.R"))
 rm(.rw_this_file)
 
 BASE_DIR <- find_workflow_home()
+PYTHON_CMD <- find_python_cmd()
 LOGS_DIR <- file.path(BASE_DIR, "logs")
 SCRIPTS_DIR <- file.path(BASE_DIR, "scripts")
 
@@ -196,8 +197,8 @@ send_failure_alert <- function(subject, body) {
 
     safe_subject <- gsub("\"", "'", subject)
     cmd <- sprintf(
-      "python \"%s\" --base-dir \"%s\" --subject \"%s\" --body-file \"%s\"",
-      alert_script, BASE_DIR, safe_subject, body_file
+      "%s \"%s\" --base-dir \"%s\" --subject \"%s\" --body-file \"%s\"",
+      PYTHON_CMD, alert_script, BASE_DIR, safe_subject, body_file
     )
     exit_status <- system(cmd)
 
@@ -248,7 +249,7 @@ upload_to_sharepoint <- function(upload_args = "--all") {
   }
   
   # Run the Python upload script
-  cmd <- sprintf("python \"%s\" --base-dir \"%s\" %s", upload_script, BASE_DIR, upload_args)
+  cmd <- sprintf("%s \"%s\" --base-dir \"%s\" %s", PYTHON_CMD, upload_script, BASE_DIR, upload_args)
   log_info("Running: {cmd}")
   
   result <- system(cmd, intern = TRUE, ignore.stderr = FALSE)
@@ -519,7 +520,7 @@ if (!skip_lookup_refresh) {
   lookup_refresh_script <- file.path(SCRIPTS_DIR, "refresh_preparedness_lookup.py")
 
   if (file.exists(lookup_refresh_script)) {
-    cmd <- sprintf("python \"%s\" --base-dir \"%s\"", lookup_refresh_script, BASE_DIR)
+    cmd <- sprintf("%s \"%s\" --base-dir \"%s\"", PYTHON_CMD, lookup_refresh_script, BASE_DIR)
     log_info("Running: {cmd}")
     cat(sprintf("\n[STEP 0] Refreshing preparedness lookup -- live output below:\n%s\n", strrep("-", 60)))
 
@@ -559,7 +560,7 @@ if (!skip_fetch) {
   fetch_script <- fetch_scripts[file.exists(fetch_scripts)][1]
   
   if (!is.na(fetch_script)) {
-    cmd <- sprintf("python \"%s\" --base-dir \"%s\"", fetch_script, BASE_DIR)
+    cmd <- sprintf("%s \"%s\" --base-dir \"%s\"", PYTHON_CMD, fetch_script, BASE_DIR)
     if (force_fetch) cmd <- paste(cmd, "--force-full")
     
     log_info("Running: {cmd}")

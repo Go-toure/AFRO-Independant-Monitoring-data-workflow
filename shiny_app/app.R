@@ -2693,7 +2693,7 @@ server <- function(input, output, session) {
          args=c(file.path(WORKFLOW_DIR,"scripts","run_workflow.R"),
                 "--skip-fetch","--skip-build","--skip-upload","--skip-reports")),
     list(n=4L, label="Upload SharePoint", icon="cloud-arrow-up-fill",
-         cmd="python",
+         cmd=PYTHON_CMD,
          args=c(file.path(WORKFLOW_DIR,"scripts","upload_to_sharepoint.py"),
                 "--base-dir", WORKFLOW_DIR, "--all")),
     list(n=5L, label="Intelligence Engine", icon="cpu-fill",
