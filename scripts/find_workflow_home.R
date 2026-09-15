@@ -99,6 +99,40 @@ ensure_python_packages <- function(python_cmd, base_dir) {
     return(invisible(FALSE))
   }
 
+  # Discovered on Connect Cloud 2026.09: this venv's python3 doesn't even
+  # have `pip` as an importable module ("No module named pip") -- the venv
+  # was created without it. Bootstrap pip first, trying two methods before
+  # giving up: (1) the standard library's own ensurepip module, which is
+  # the normal way to put pip into a pip-less venv; (2) if ensurepip itself
+  # was stripped from this Python build too, fetch get-pip.py and run it
+  # in-process with the same interpreter -- that script only needs urllib,
+  # which is always present, to install pip from scratch.
+  pip_check_code <- suppressWarnings(system2(
+    python_cmd, c("-m", "pip", "--version"), stdout = FALSE, stderr = FALSE
+  ))
+  if (!identical(pip_check_code, 0L)) {
+    cat("[SETUP]", python_cmd, "has no pip -- bootstrapping via ensurepip...\n")
+    ensurepip_code <- suppressWarnings(system2(
+      python_cmd, c("-m", "ensurepip", "--upgrade"), stdout = FALSE, stderr = FALSE
+    ))
+    if (!identical(ensurepip_code, 0L)) {
+      cat("[SETUP] ensurepip unavailable too -- falling back to get-pip.py...\n")
+      get_pip_code <- system2(
+        python_cmd,
+        c("-c", shQuote(paste(
+          "import urllib.request;",
+          "exec(urllib.request.urlopen('https://bootstrap.pypa.io/get-pip.py').read())"
+        )))
+      )
+      if (!identical(get_pip_code, 0L)) {
+        cat("[SETUP] WARNING: could not bootstrap pip by any method --",
+            "Python-dependent steps may still fail this run.\n")
+        return(invisible(FALSE))
+      }
+    }
+    cat("[SETUP] pip bootstrapped successfully.\n")
+  }
+
   cat("[SETUP] Python packages missing from", python_cmd,
       "-- installing from", req_file, "(one-time, persists for this container)...\n")
   install_code <- system2(
