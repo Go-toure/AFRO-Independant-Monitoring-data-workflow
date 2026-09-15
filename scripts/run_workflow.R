@@ -248,7 +248,7 @@ upload_to_sharepoint <- function(upload_args = "--all") {
   }
   
   # Run the Python upload script
-  cmd <- sprintf("python \"%s\" %s", upload_script, upload_args)
+  cmd <- sprintf("python \"%s\" --base-dir \"%s\" %s", upload_script, BASE_DIR, upload_args)
   log_info("Running: {cmd}")
   
   result <- system(cmd, intern = TRUE, ignore.stderr = FALSE)
@@ -559,7 +559,7 @@ if (!skip_fetch) {
   fetch_script <- fetch_scripts[file.exists(fetch_scripts)][1]
   
   if (!is.na(fetch_script)) {
-    cmd <- sprintf("python \"%s\"", fetch_script)
+    cmd <- sprintf("python \"%s\" --base-dir \"%s\"", fetch_script, BASE_DIR)
     if (force_fetch) cmd <- paste(cmd, "--force-full")
     
     log_info("Running: {cmd}")

@@ -14,11 +14,23 @@ from datetime import datetime
 # CONFIGURATION
 # ============================================================
 
-# Base directory for IM workflow
-# Set once via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows) if this
-# project ever moves off this laptop/drive -- every script in the pipeline
-# reads the same variable, so nothing else needs editing.
-BASE_DIR = os.environ.get("IM_WORKFLOW_HOME", r"C:/Users/TOURE/Documents/im_workflow")
+# Base directory for IM workflow. Resolved from --base-dir if the caller
+# passed one (run_workflow.R and shiny_app/app.R both do now, using their
+# own already-validated BASE_DIR/WORKFLOW_DIR -- see find_workflow_home()
+# in scripts/find_workflow_home.R), falling back to IM_WORKFLOW_HOME for
+# anyone running this script standalone without the flag. Read manually,
+# ahead of the argparse block in __main__ below, because these path
+# constants are needed immediately at import time.
+def _cli_base_dir():
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == "--base-dir" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--base-dir="):
+            return a.split("=", 1)[1]
+    return None
+
+BASE_DIR = _cli_base_dir() or os.environ.get("IM_WORKFLOW_HOME", r"C:/Users/TOURE/Documents/im_workflow")
 FINAL_DIR = os.path.join(BASE_DIR, "data/final")
 
 # Authentication credentials — loaded from environment variables, never
@@ -49,7 +61,19 @@ LIBRARY_NAME = "Documents"
 # Format: use forward slashes, no leading slash
 TARGET_FOLDER = "7. SIA_Data/Data Repository"  # <- UPDATE THIS AS NEEDED
 
-# File mappings: (local_filename, remote_filename, required)
+# Report deliverables (Step 5) don't live under data/final -- each report
+# script writes to its own outputs/ subfolder. These constants let the
+# FILE_MAPPINGS entries below point at those subfolders directly, and
+# route the uploaded copies into a dedicated "reports" subfolder on
+# SharePoint so they don't get mixed in with the flat CSV/METADATA
+# outputs above.
+PHASE1_INTELLIGENCE_DIR = os.path.join(BASE_DIR, "outputs/phase1_intelligence")
+INTELLIGENCE_REPORT_DIR = os.path.join(BASE_DIR, "outputs/reports/IM_Intelligence_Report")
+REPORTS_TARGET_FOLDER = f"{TARGET_FOLDER}/reports"
+
+# File mappings: each entry uploads one local file to SharePoint.
+# - "source_dir" is optional; defaults to FINAL_DIR (data/final) when absent.
+# - "remote_folder" is optional; defaults to TARGET_FOLDER when absent.
 FILE_MAPPINGS = [
     {
         "local": "Regional_IM_repository_cleaned.csv",
@@ -86,6 +110,38 @@ FILE_MAPPINGS = [
         "remote": "AFRO_Inside_HH_M_geonames_summary.csv",
         "required": False,
         "description": "Geonames cleaning summary"
+    },
+    {
+        "local": "AFRO_IM_Phase1_Intelligence_Analysis.xlsx",
+        "remote": "AFRO_IM_Phase1_Intelligence_Analysis.xlsx",
+        "required": False,
+        "description": "Phase 1 intelligence analysis workbook",
+        "source_dir": PHASE1_INTELLIGENCE_DIR,
+        "remote_folder": REPORTS_TARGET_FOLDER
+    },
+    {
+        "local": "AFRO_Regional_IM_Intelligence_Report.xlsx",
+        "remote": "AFRO_Regional_IM_Intelligence_Report.xlsx",
+        "required": False,
+        "description": "Regional advocacy intelligence report workbook",
+        "source_dir": INTELLIGENCE_REPORT_DIR,
+        "remote_folder": REPORTS_TARGET_FOLDER
+    },
+    {
+        "local": "AFRO_Regional_IM_Intelligence_Brief.docx",
+        "remote": "AFRO_Regional_IM_Intelligence_Brief.docx",
+        "required": False,
+        "description": "Regional advocacy intelligence brief (Word)",
+        "source_dir": INTELLIGENCE_REPORT_DIR,
+        "remote_folder": REPORTS_TARGET_FOLDER
+    },
+    {
+        "local": "AFRO_Regional_IM_Intelligence_Deck.pptx",
+        "remote": "AFRO_Regional_IM_Intelligence_Deck.pptx",
+        "required": False,
+        "description": "Regional advocacy intelligence deck (PowerPoint)",
+        "source_dir": INTELLIGENCE_REPORT_DIR,
+        "remote_folder": REPORTS_TARGET_FOLDER
     }
 ]
 
@@ -294,12 +350,15 @@ def upload_to_sharepoint():
     print("\n[2/5] Connecting to SharePoint...")
     site_id, drive_id = get_site_and_drive(token)
     
-    # Create target folder if it doesn't exist
+    # Create target folder(s) if they don't exist
     print("\n[3/5] Ensuring target folder exists...")
     if TARGET_FOLDER:
         folder_path = create_folder_if_not_exists(token, drive_id, TARGET_FOLDER)
     else:
         folder_path = None
+    # Report deliverables go in a "reports" subfolder -- ensure it exists too
+    # (harmless / cheap even on a run with no report files present yet).
+    reports_folder_path = create_folder_if_not_exists(token, drive_id, REPORTS_TARGET_FOLDER)
     
     # Upload files
     print("\n[4/5] Uploading files...")
@@ -309,7 +368,9 @@ def upload_to_sharepoint():
     failed_files = []
     
     for file_info in FILE_MAPPINGS:
-        local_path = os.path.join(FINAL_DIR, file_info["local"])
+        source_dir = file_info.get("source_dir", FINAL_DIR)
+        local_path = os.path.join(source_dir, file_info["local"])
+        remote_folder = file_info.get("remote_folder", folder_path)
         
         # Skip if not required and file doesn't exist
         if not os.path.exists(local_path):
@@ -322,7 +383,7 @@ def upload_to_sharepoint():
         
         # Upload the file
         try:
-            result = upload_file(token, drive_id, local_path, file_info["remote"], folder_path)
+            result = upload_file(token, drive_id, local_path, file_info["remote"], remote_folder)
             uploaded_files.append({
                 "local": file_info["local"],
                 "remote": file_info["remote"],
@@ -398,7 +459,8 @@ def check_local_files():
     missing = []
     
     for file_info in FILE_MAPPINGS:
-        local_path = os.path.join(FINAL_DIR, file_info["local"])
+        source_dir = file_info.get("source_dir", FINAL_DIR)
+        local_path = os.path.join(source_dir, file_info["local"])
         if os.path.exists(local_path):
             size_mb = Path(local_path).stat().st_size / 1024 / 1024
             print(f"  [OK] {file_info['local']} ({size_mb:.2f} MB)")
@@ -422,6 +484,11 @@ if __name__ == "__main__":
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     
     parser = argparse.ArgumentParser(description="Upload IM workflow outputs to SharePoint")
+    parser.add_argument("--base-dir", default=BASE_DIR,
+                         help="im_workflow base directory. Already resolved from this flag "
+                              "(if passed) before this parser even runs -- see the "
+                              "module-level comment above BASE_DIR -- so this entry exists "
+                              "only so --help documents it. (default: %(default)s)")
     parser.add_argument("--test", action="store_true", help="Test connection only")
     parser.add_argument("--check", action="store_true", help="Check local files only")
     parser.add_argument("--file", type=str, help="Upload only specific file (local name)")

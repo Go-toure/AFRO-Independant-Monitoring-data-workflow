@@ -87,6 +87,74 @@ ALLOWED_STATUSES = {"Finished", "In Progress"}
 MIN_ROW_FRACTION_OF_PREVIOUS = 0.5
 MIN_ABSOLUTE_ROWS = 20
 
+# Same SharePoint "Data Repository" library used elsewhere in this
+# workflow (see upload_to_sharepoint.py / Fetch_im_data.py's raw_state
+# folder) -- a dedicated subfolder just for this one file, so a fresh
+# Posit Connect Cloud container has a last-known-good lookup.xlsx to
+# both fall back on and compare row counts against (the "collapsed to a
+# small fraction of the previous file" check below otherwise never has
+# a previous file to compare to on a from-scratch container). Soft-fail
+# throughout, same as the rest of this script: missing credentials or an
+# unreachable SharePoint just skips the sync, never blocks the refresh.
+SP_LOOKUP_FOLDER = "7. SIA_Data/Data Repository/lookup_state"
+
+
+def _try_download_lookup_from_sharepoint(base_dir, lookup_path):
+    """If lookup.xlsx doesn't exist locally yet, try to recover the
+    last-known-good copy from SharePoint before this run's fresh GPEI
+    fetch. Never raises -- a miss here just means validate_and_install()'s
+    row-count sanity check has nothing to compare against for this one
+    run, exactly like it always has on a brand-new local checkout."""
+    import sys
+    sys.path.insert(0, str(base_dir / "scripts"))
+    try:
+        import _sharepoint_client as sp
+    except ImportError:
+        return
+
+    if not sp.credentials_available():
+        return
+
+    token = sp.get_token()
+    if not token:
+        return
+
+    drive_id = sp.get_drive_id(token)
+    if not drive_id:
+        return
+
+    if sp.download_file(token, drive_id, f"{SP_LOOKUP_FOLDER}/lookup.xlsx", lookup_path):
+        log("Recovered previous lookup.xlsx from SharePoint (no local copy existed yet).")
+
+
+def _try_upload_lookup_to_sharepoint(base_dir, lookup_path):
+    """Push the freshly validated lookup.xlsx to SharePoint so the next
+    run -- on this machine or a fresh cloud container -- has a
+    last-known-good copy to fall back on. Never raises."""
+    import sys
+    sys.path.insert(0, str(base_dir / "scripts"))
+    try:
+        import _sharepoint_client as sp
+    except ImportError:
+        return
+
+    if not sp.credentials_available():
+        return
+
+    token = sp.get_token()
+    if not token:
+        return
+
+    drive_id = sp.get_drive_id(token)
+    if not drive_id:
+        return
+
+    sp.ensure_folder(token, drive_id, SP_LOOKUP_FOLDER)
+    if sp.upload_file(token, drive_id, lookup_path, f"{SP_LOOKUP_FOLDER}/lookup.xlsx"):
+        log("lookup.xlsx synced to SharePoint.")
+    else:
+        log("WARNING: could not sync lookup.xlsx to SharePoint (kept local copy only).")
+
 
 def log(msg):
     print(f"[refresh_preparedness_lookup] {msg}", flush=True)
@@ -221,6 +289,9 @@ def run(base_dir: Path, debug: bool) -> bool:
     debug_dir = (lookup_dir / "refresh_debug") if debug else None
     lookup_dir.mkdir(parents=True, exist_ok=True)
 
+    if not lookup_path.exists():
+        _try_download_lookup_from_sharepoint(base_dir, lookup_path)
+
     try:
         rows = fetch_lookup_rows(headers)
     except Exception as e:
@@ -251,7 +322,10 @@ def run(base_dir: Path, debug: bool) -> bool:
         log(f"FAILED: could not write a temp download file ({e}). Keeping the existing lookup.xlsx.")
         return False
 
-    return validate_and_install(tmp_path, lookup_path, backup_dir)
+    ok = validate_and_install(tmp_path, lookup_path, backup_dir)
+    if ok:
+        _try_upload_lookup_to_sharepoint(base_dir, lookup_path)
+    return ok
 
 
 def validate_and_install(new_path: Path, lookup_path: Path, backup_dir: Path) -> bool:

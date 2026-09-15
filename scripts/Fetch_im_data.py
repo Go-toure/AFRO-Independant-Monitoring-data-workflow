@@ -61,10 +61,23 @@ if sys.platform == "win32":
 # CENTRALIZED IM WORKFLOW PATHS
 # ============================================================
 
-# Set once via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows) if this
-# project ever moves off this laptop/drive -- every script in the pipeline
-# reads the same variable, so nothing else needs editing.
-BASE_DIR = Path(os.environ.get("IM_WORKFLOW_HOME", r"C:/Users/TOURE/Documents/im_workflow"))
+# Resolved from --base-dir if the caller passed one (run_workflow.R always
+# does, using its own already-validated BASE_DIR -- see find_workflow_home()
+# in scripts/find_workflow_home.R), falling back to IM_WORKFLOW_HOME for
+# anyone running this script standalone without the flag. Read manually,
+# ahead of the argparse block in main() below, because these path constants
+# are needed immediately at import time -- long before argparse would
+# normally run.
+def _cli_base_dir():
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == "--base-dir" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--base-dir="):
+            return a.split("=", 1)[1]
+    return None
+
+BASE_DIR = Path(_cli_base_dir() or os.environ.get("IM_WORKFLOW_HOME", r"C:/Users/TOURE/Documents/im_workflow"))
 
 DATA_DIR = BASE_DIR / "data"
 RAW_DIR = DATA_DIR / "raw"
@@ -136,6 +149,147 @@ if not ONA_API_TOKEN:
 
 BASE_URL = "https://api.whonghub.org/api/v1/data"
 USER_URL = "https://api.whonghub.org/api/v1/user.json"
+
+
+# ============================================================
+# SHAREPOINT RAW-STATE SYNC (Posit Connect Cloud decoupling)
+# ============================================================
+# Posit Connect Cloud runs this script in a fresh, throwaway container
+# every time -- there is no local disk history like there is on this
+# laptop. Without help, every cloud run would look like "no local copy
+# yet" for all ~35 forms and do a full re-fetch of everything, every run.
+#
+# To avoid that, SharePoint doubles as the shared state store for
+# data/raw (in addition to being the final-output destination that
+# upload_to_sharepoint.py already pushes to): before deciding fetch modes,
+# sync_missing_raw_from_sharepoint() pulls down whatever {form_id}.parquet
+# + {form_id}_metadata.json this machine doesn't already have locally, and
+# after a successful write, write_parquet_and_metadata() pushes that form's
+# updated files back up via upload_raw_to_sharepoint(). This keeps a local
+# PC run and a Connect Cloud run both reading/writing the same underlying
+# state instead of silently diverging.
+#
+# Uses the same Graph app-only credentials as upload_to_sharepoint.py
+# (SHAREPOINT_TENANT_ID / SHAREPOINT_CLIENT_ID / SHAREPOINT_CLIENT_SECRET),
+# already loaded above via _env_loader. Soft-fails throughout: if
+# credentials are missing or SharePoint is unreachable, sync is skipped
+# and the script behaves exactly as it always has (local-disk-only).
+import _sharepoint_client as sp
+
+SP_RAW_FOLDER = "7. SIA_Data/Data Repository/raw_state"
+
+_sp_session = {"tried": False, "token": None, "drive_id": None, "folder_ready": False}
+
+
+def _get_sp_session():
+    """Resolve and cache (token, drive_id) for the SharePoint raw-state
+    sync, once per run. Returns (None, None) if credentials are missing or
+    the site/drive can't be resolved -- callers just skip the sync then."""
+    if _sp_session["tried"]:
+        return _sp_session["token"], _sp_session["drive_id"]
+
+    _sp_session["tried"] = True
+
+    if not sp.credentials_available():
+        detail("[sharepoint] Credentials not set -- skipping raw-state sync.")
+        return None, None
+
+    token = sp.get_token()
+    if not token:
+        detail("[sharepoint] Could not acquire Graph token -- skipping raw-state sync.")
+        return None, None
+
+    drive_id = sp.get_drive_id(token)
+    if not drive_id:
+        detail("[sharepoint] Could not resolve SharePoint drive -- skipping raw-state sync.")
+        return None, None
+
+    _sp_session["token"] = token
+    _sp_session["drive_id"] = drive_id
+    return token, drive_id
+
+
+def sync_missing_raw_from_sharepoint(form_ids) -> None:
+    """Before deciding fetch modes, pull down any {form_id}.parquet /
+    {form_id}_metadata.json this machine doesn't have locally yet, from the
+    shared SharePoint raw-state folder. This is what lets a fresh Posit
+    Connect Cloud container resume from the last INCREMENTAL cursor
+    instead of doing a full re-fetch of every form on every single run --
+    and, symmetrically, lets a local run pick up whatever the cloud
+    fetched since the last local run.
+
+    Only fills in files that are missing locally -- never overwrites a
+    local file that's already there, so this can never clobber
+    still-in-progress local data with an older SharePoint copy.
+    """
+    token, drive_id = _get_sp_session()
+    if not token:
+        return
+
+    missing_forms = [
+        fid for fid in form_ids if not (RAW_DIR / f"{fid}.parquet").exists()
+    ]
+
+    if not missing_forms:
+        return
+
+    console(f"   Checking SharePoint for {len(missing_forms)} form(s) with no local copy...")
+    remote_items = sp.list_folder(token, drive_id, SP_RAW_FOLDER)
+    remote_names = {item["name"] for item in remote_items}
+
+    recovered = 0
+    for fid in missing_forms:
+        parquet_name = f"{fid}.parquet"
+        meta_name = f"{fid}_metadata.json"
+
+        if parquet_name not in remote_names:
+            continue
+
+        parquet_ok = sp.download_file(
+            token, drive_id, f"{SP_RAW_FOLDER}/{parquet_name}", RAW_DIR / parquet_name
+        )
+        if parquet_ok and meta_name in remote_names:
+            sp.download_file(
+                token, drive_id, f"{SP_RAW_FOLDER}/{meta_name}", RAW_DIR / meta_name
+            )
+
+        if parquet_ok:
+            recovered += 1
+            detail(f"[sharepoint] Recovered {parquet_name} from SharePoint raw-state folder.")
+
+    if recovered:
+        console(f"   Recovered {recovered} form(s) from SharePoint (no full re-fetch needed).")
+    detail(f"[sharepoint] Raw-state sync: recovered {recovered}/{len(missing_forms)} missing form(s).")
+
+
+def upload_raw_to_sharepoint(form_id: int) -> None:
+    """Push this form's freshly written Parquet + metadata to the shared
+    SharePoint raw-state folder, right after a successful full or
+    incremental save. Never raises -- a SharePoint hiccup here must not
+    fail an otherwise-successful fetch; the next run's sync step will
+    just catch it up from local disk (if this machine still has it) or
+    retry the upload next time this form changes."""
+    token, drive_id = _get_sp_session()
+    if not token:
+        return
+
+    if not _sp_session["folder_ready"]:
+        sp.ensure_folder(token, drive_id, SP_RAW_FOLDER)
+        _sp_session["folder_ready"] = True
+
+    parquet_path = RAW_DIR / f"{form_id}.parquet"
+    meta_path = RAW_DIR / f"{form_id}_metadata.json"
+
+    ok = True
+    if parquet_path.exists():
+        ok = sp.upload_file(token, drive_id, parquet_path, f"{SP_RAW_FOLDER}/{parquet_path.name}") and ok
+    if meta_path.exists():
+        ok = sp.upload_file(token, drive_id, meta_path, f"{SP_RAW_FOLDER}/{meta_path.name}") and ok
+
+    if ok:
+        detail(f"[sharepoint] Form {form_id} | raw state synced to SharePoint.")
+    else:
+        detail(f"[sharepoint] Form {form_id} | WARNING: raw state sync to SharePoint failed (kept local copy only).")
 
 
 # ============================================================
@@ -751,6 +905,8 @@ def write_parquet_and_metadata(
             f"mode={metadata.get('fetch_mode', 'full')}"
         )
 
+        upload_raw_to_sharepoint(form_id)
+
         return metadata
 
     except Exception as e:
@@ -1315,6 +1471,17 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--base-dir",
+        default=str(BASE_DIR),
+        help=(
+            "im_workflow base directory. Already resolved from this flag (if "
+            "passed) before this parser even runs -- see the module-level "
+            "comment above BASE_DIR -- so this entry exists only so --help "
+            "documents it. (default: %(default)s)"
+        )
+    )
+
+    parser.add_argument(
         "--config",
         help="Optional YAML/JSON config file path containing IM form IDs"
     )
@@ -1384,6 +1551,8 @@ def main() -> None:
     if not test_api_connection():
         console("❌ Cannot proceed because API connection failed.")
         sys.exit(1)
+
+    sync_missing_raw_from_sharepoint(form_ids)
 
     results = []
     total_records = 0
