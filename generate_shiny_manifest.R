@@ -110,6 +110,14 @@ if (!nzchar(python_bin)) {
 cat("\nUsing python binary for dependency detection:", python_bin, "\n")
 
 cat("\nGenerating manifest.json from the isolated staging folder...\n")
+# NOTE: writeManifest()'s own `python` argument only populates a "python"
+# section in manifest.json when it detects the app's R code actually calls
+# reticulate (see github.com/rstudio/rsconnect issue #330, "reticulate is
+# in use, but python was not specified"). This app has no reticulate usage
+# at all -- it shells out to Python via processx, not reticulate -- so
+# passing `python` here has no effect and no section gets written. Kept
+# anyway (harmless) in case a future rsconnect version changes this; the
+# manual injection below is what actually does the work regardless.
 rsconnect::writeManifest(
   appDir = ".",
   appPrimaryDoc = "app.R",
@@ -120,6 +128,51 @@ manifest_path <- file.path(stage_dir, "manifest.json")
 stopifnot(file.exists(manifest_path))
 
 manifest_obj <- jsonlite::fromJSON(manifest_path)
+
+if (is.null(manifest_obj$python)) {
+  # Build the "python" section ourselves and splice it into the raw JSON
+  # text (NOT by re-serializing the parsed object with jsonlite::write_json
+  # -- round-tripping the full manifest through fromJSON()/toJSON() risks
+  # subtly reshaping the "packages"/"files" sections, e.g. unboxing
+  # single-element lists differently than rsconnect's own serializer did).
+  # Connect only needs version + package_manager.package_file to know to
+  # run `pip install -r requirements.txt` for this content -- see
+  # docs.posit.co/connect/admin/python/package-management/.
+  py_version_raw <- system2(python_bin, "--version", stdout = TRUE, stderr = TRUE)
+  py_version <- trimws(sub("(?i)^python\\s+", "", py_version_raw[1], perl = TRUE))
+
+  pip_version_raw <- tryCatch(
+    system2(python_bin, c("-m", "pip", "--version"), stdout = TRUE, stderr = TRUE),
+    error = function(e) ""
+  )
+  pip_version <- sub("^pip\\s+([0-9][0-9.]*).*", "\\1", pip_version_raw[1])
+  if (!grepl("^[0-9]", pip_version)) pip_version <- "24.0"  # harmless fallback -- Connect provisions its own pip regardless
+
+  cat("\nDetected Python", py_version, "/ pip", pip_version,
+      "-- injecting a \"python\" section into manifest.json\n")
+
+  manifest_text <- paste(readLines(manifest_path, warn = FALSE), collapse = "\n")
+
+  python_block <- sprintf(
+    paste0('"python": {\n    "version": "%s",\n    "package_manager": {\n',
+           '      "name": "pip",\n      "version": "%s",\n',
+           '      "package_file": "requirements.txt"\n    }\n  },\n  '),
+    py_version, pip_version
+  )
+
+  anchor <- '"metadata":'
+  if (!grepl(anchor, manifest_text, fixed = TRUE)) {
+    stop("Could not find the \"metadata\" anchor in manifest.json to inject ",
+         "the python section -- tell Claude, manifest format may have changed.")
+  }
+  manifest_text <- sub(anchor, paste0(python_block, anchor), manifest_text, fixed = TRUE)
+  writeLines(manifest_text, manifest_path)
+
+  # Sanity check only -- re-parse to confirm the injected text is still
+  # valid JSON and now has what we just added. Never re-written from this
+  # parsed copy (see note above).
+  manifest_obj <- jsonlite::fromJSON(manifest_path)
+}
 
 if (is.null(manifest_obj$python)) {
   cat("\nWARNING: manifest.json still has NO \"python\" section -- Connect\n")
