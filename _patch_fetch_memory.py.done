@@ -1,0 +1,91 @@
+import sys
+
+def apply(path, old, new, label):
+    with open(path, "r", newline="") as f:
+        text = f.read()
+    if old not in text:
+        print(f"ERROR: anchor not found verbatim in {path} ({label}) -- aborting, no changes made to this file.")
+        sys.exit(1)
+    if text.count(old) > 1:
+        print(f"ERROR: anchor found {text.count(old)} times in {path} ({label}) -- not unique, aborting.")
+        sys.exit(1)
+    text = text.replace(old, new)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+    print(f"Patched {path} ({label})")
+
+
+path = "scripts/Fetch_im_data.py"
+
+# 1) import gc
+apply(
+    path,
+    "import argparse\nimport requests\nimport pandas as pd\n",
+    "import argparse\nimport requests\nimport pandas as pd\nimport gc\n",
+    "add import gc",
+)
+
+# 2) free existing_df as soon as it's no longer needed, before the
+#    (expensive) whole-dataframe fillna/astype(str) step -- this is the
+#    peak-memory fix for the OOM (exit 137) that killed the whole Fetch
+#    step on form 4498's incremental merge. A caught Python MemoryError
+#    was already handled (see the per-form try/except in main()), but a
+#    hard OOM-kill from the container's cgroup limit can't be caught by
+#    any try/except -- the only real fix is to not need that much memory
+#    at once in the first place.
+apply(
+    path,
+    '''    try:
+        combined = pd.concat([existing_df, new_df], ignore_index=True, sort=False)
+        combined = combined.fillna("").astype(str)
+        combined = combined.drop_duplicates(subset=["_id"], keep="last").reset_index(drop=True)
+    except Exception as e:
+        detail(f"[WARNING] Form {form_id} | Merge/de-duplication failed: {e}")
+        return None
+''',
+    '''    try:
+        combined = pd.concat([existing_df, new_df], ignore_index=True, sort=False)
+        # existing_df can be tens of MB on disk and several times that once
+        # loaded as a DataFrame -- free it now rather than holding it (plus
+        # new_df, plus combined) all alive at once through the string-cast
+        # below, which is the single biggest memory spike in this function.
+        del existing_df
+        combined = combined.fillna("").astype(str)
+        combined = combined.drop_duplicates(subset=["_id"], keep="last").reset_index(drop=True)
+    except Exception as e:
+        detail(f"[WARNING] Form {form_id} | Merge/de-duplication failed: {e}")
+        return None
+''',
+    "free existing_df early in save_incremental",
+)
+
+# 3) reclaim memory between forms in the main fetch loop -- without this,
+#    large DataFrames from earlier forms in the same 35-form run can leave
+#    memory fragmented/retained even after Python's own refcounting frees
+#    the objects, so the process's actual memory footprint creeps upward
+#    over the run instead of resetting per form.
+apply(
+    path,
+    '''            results.append({
+                "form_id": form_id, "status": "failed_exception",
+                "records": 0, "new_records": 0, "size_mb": 0,
+                "path": str(RAW_DIR / f"{form_id}.parquet")
+            })
+
+    full_count = sum(1 for r in results if r["status"] == "full")''',
+    '''            results.append({
+                "form_id": form_id, "status": "failed_exception",
+                "records": 0, "new_records": 0, "size_mb": 0,
+                "path": str(RAW_DIR / f"{form_id}.parquet")
+            })
+
+        # Reclaim memory before the next form, win or lose -- see the
+        # save_incremental() comment on form 4498's OOM-kill for why this
+        # matters over a long sequential run of many large forms.
+        gc.collect()
+
+    full_count = sum(1 for r in results if r["status"] == "full")''',
+    "gc.collect() per form in main() loop",
+)
+
+print("All 3 patches applied successfully.")

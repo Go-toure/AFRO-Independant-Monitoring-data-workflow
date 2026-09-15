@@ -42,6 +42,7 @@ import time
 import argparse
 import requests
 import pandas as pd
+import gc
 
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -975,6 +976,11 @@ def save_incremental(
 
     try:
         combined = pd.concat([existing_df, new_df], ignore_index=True, sort=False)
+        # existing_df can be tens of MB on disk and several times that once
+        # loaded as a DataFrame -- free it now rather than holding it (plus
+        # new_df, plus combined) all alive at once through the string-cast
+        # below, which is the single biggest memory spike in this function.
+        del existing_df
         combined = combined.fillna("").astype(str)
         combined = combined.drop_duplicates(subset=["_id"], keep="last").reset_index(drop=True)
     except Exception as e:
@@ -1586,6 +1592,11 @@ def main() -> None:
                 "records": 0, "new_records": 0, "size_mb": 0,
                 "path": str(RAW_DIR / f"{form_id}.parquet")
             })
+
+        # Reclaim memory before the next form, win or lose -- see the
+        # save_incremental() comment on form 4498's OOM-kill for why this
+        # matters over a long sequential run of many large forms.
+        gc.collect()
 
     full_count = sum(1 for r in results if r["status"] == "full")
     incremental_count = sum(1 for r in results if r["status"] == "incremental")
