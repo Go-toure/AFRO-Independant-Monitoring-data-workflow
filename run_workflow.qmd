@@ -62,6 +62,16 @@ source("scripts/connect_cloud_diagnostics.R")
 
 ## Run the pipeline
 
+This chunk also uses `error: true` -- not because failure here is expected
+long-term, but so that when run_workflow.R does fail, Quarto still finishes
+rendering the report instead of aborting with no output at all. Without
+this, a failed pipeline run leaves nothing to read: Connect Cloud's own
+build log only captures R's startup/warning/error stream, not the
+cat()/print() output a chunk sends to the document body, so the real
+captured stdout+stderr from run_workflow.R (everything connect_cloud_run_pipeline.R
+prints) would otherwise be lost entirely on failure.
+
 ```{r run-pipeline}
+#| error: true
 source("scripts/connect_cloud_run_pipeline.R")
 ```
