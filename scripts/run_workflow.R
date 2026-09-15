@@ -28,23 +28,13 @@ PYTHON_CMD <- find_python_cmd()
 LOGS_DIR <- file.path(BASE_DIR, "logs")
 SCRIPTS_DIR <- file.path(BASE_DIR, "scripts")
 
-# ---- TEMPORARY DIAGNOSTIC -- remove once the Connect Cloud "python has
-# no packages" mystery is root-caused. Prints to the same live log panel
-# every pipeline step already streams into, so no new UI/step is needed.
-cat("\n[DIAG] Sys.which('python3'):", Sys.which("python3"), "\n")
-cat("[DIAG] Sys.which('python'): ", Sys.which("python"), "\n")
-cat("[DIAG] PYTHON_CMD resolved to:", PYTHON_CMD, "\n")
-cat("[DIAG] RETICULATE_PYTHON env:", Sys.getenv("RETICULATE_PYTHON", unset = "(not set)"), "\n")
-cat("[DIAG] PATH env:", Sys.getenv("PATH"), "\n")
-.diag_pkg_check <- tryCatch(
-  system2(PYTHON_CMD, c("-c", shQuote(
-    "import sys, importlib.util as u; print('python executable:', sys.executable); [print(m, '->', 'OK' if u.find_spec(m) else 'MISSING') for m in ['requests','pandas','pyarrow','openpyxl','yaml']]"
-  )), stdout = TRUE, stderr = TRUE),
-  error = function(e) paste("ERROR:", conditionMessage(e))
-)
-cat("[DIAG] package check via", PYTHON_CMD, ":\n", paste(.diag_pkg_check, collapse = "\n"), "\n\n")
-rm(.diag_pkg_check)
-# ---- END TEMPORARY DIAGNOSTIC
+# The diagnostic run confirmed Connect Cloud creates the venv (correctly
+# on PATH, correctly wired via RETICULATE_PYTHON) but never actually
+# installs anything into it for this content type -- see
+# ensure_python_packages()'s own comment in find_workflow_home.R for the
+# full story. Self-install once here rather than depending on that ever
+# changing.
+ensure_python_packages(PYTHON_CMD, BASE_DIR)
 
 # Load config/secrets.env into THIS R process (mirrors scripts/_env_loader.py's
 # Python behaviour) -- needed so sp_recover_baseline_file() further down

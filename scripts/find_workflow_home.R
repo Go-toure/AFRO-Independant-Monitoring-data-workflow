@@ -67,3 +67,49 @@ find_python_cmd <- function() {
   stop("Could not find 'python3' or 'python' on PATH -- every pipeline ",
        "step that shells out to a Python script needs one of these to exist.")
 }
+
+
+# ============================================================
+# SHARED: make sure the resolved python has this project's Python package
+# dependencies installed, installing them on first use if not.
+# ============================================================
+# Posit Connect Cloud creates a real, writable Python venv for content that
+# declares one in manifest.json (see generate_shiny_manifest.R) and wires
+# it up via RETICULATE_PYTHON -- but as of Connect Cloud 2026.08.1, that
+# venv comes up EMPTY for a Shiny (R) app: the requirements.txt-driven pip
+# install that self-hosted Posit Connect's own docs describe simply never
+# runs for this content type (confirmed via a build log showing an R
+# package list but no Python/pip section at all). Rather than depend on
+# Connect Cloud ever fixing that, install the packages ourselves, once, the
+# first time anything needs them -- the venv persists for the life of the
+# container, so every pipeline step after the first one in a given session
+# just finds them already there and skips straight through.
+ensure_python_packages <- function(python_cmd, base_dir) {
+  check_code <- suppressWarnings(system2(
+    python_cmd,
+    c("-c", shQuote("import requests, pandas, pyarrow, openpyxl, yaml")),
+    stdout = FALSE, stderr = FALSE
+  ))
+  if (identical(check_code, 0L)) return(invisible(TRUE))
+
+  req_file <- file.path(base_dir, "requirements.txt")
+  if (!file.exists(req_file)) {
+    cat("[SETUP] Python packages missing and no requirements.txt found at",
+        req_file, "-- cannot self-install.\n")
+    return(invisible(FALSE))
+  }
+
+  cat("[SETUP] Python packages missing from", python_cmd,
+      "-- installing from", req_file, "(one-time, persists for this container)...\n")
+  install_code <- system2(
+    python_cmd, c("-m", "pip", "install", "--quiet", "-r", shQuote(req_file))
+  )
+  if (!identical(install_code, 0L)) {
+    cat("[SETUP] WARNING: pip install exited with status", install_code,
+        "-- Python-dependent steps may still fail this run.\n")
+    return(invisible(FALSE))
+  }
+
+  cat("[SETUP] Python packages installed successfully.\n")
+  invisible(TRUE)
+}

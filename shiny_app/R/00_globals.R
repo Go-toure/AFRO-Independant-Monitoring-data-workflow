@@ -53,6 +53,12 @@ rm(.globals_candidate_paths, .globals_shared_file)
 BASE_DIR     <- find_workflow_home()
 WORKFLOW_DIR <- BASE_DIR
 PYTHON_CMD   <- find_python_cmd()
+# Installs this project's Python packages into PYTHON_CMD's venv on first
+# app startup in a fresh container, if Connect Cloud hasn't already done
+# it -- see ensure_python_packages()'s own comment in find_workflow_home.R.
+# Runs once per container lifetime: after this, every subprocess call
+# (Fetch Data, Upload SharePoint, ...) just finds the packages already there.
+ensure_python_packages(PYTHON_CMD, BASE_DIR)
 SCRIPTS_DIR <- file.path(BASE_DIR, "scripts")
 FINAL_DIR   <- file.path(BASE_DIR, "data/final")
 LOGS_DIR    <- file.path(BASE_DIR, "logs")
