@@ -44,6 +44,18 @@ import requests
 import pandas as pd
 import gc
 
+try:
+    import resource
+
+    def _peak_rss_mb():
+        """Peak resident-set size for this process so far, in MB. Linux/
+        macOS only (POSIX rusage) -- returns None on Windows so this is
+        always safe to call unconditionally."""
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+except ImportError:
+    def _peak_rss_mb():
+        return None
+
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
@@ -1435,6 +1447,10 @@ def process_one_form(form_id, i, total_forms, args, results, total_records, tota
 
         return total_records, total_size_mb
 
+    peak_mb = _peak_rss_mb()
+    if peak_mb is not None:
+        console(f"   [MEM] Peak RSS before merging form {form_id}: {peak_mb:,.0f} MB")
+
     metadata = save_incremental(form_id, new_data, previous_metadata)
 
     if metadata is None:
@@ -1597,6 +1613,10 @@ def main() -> None:
         # save_incremental() comment on form 4498's OOM-kill for why this
         # matters over a long sequential run of many large forms.
         gc.collect()
+
+        peak_mb = _peak_rss_mb()
+        if peak_mb is not None:
+            console(f"   [MEM] Peak RSS after form {form_id}: {peak_mb:,.0f} MB")
 
     full_count = sum(1 for r in results if r["status"] == "full")
     incremental_count = sum(1 for r in results if r["status"] == "incremental")

@@ -1,0 +1,70 @@
+import sys
+
+def apply(path, old, new, label):
+    with open(path, "r", newline="") as f:
+        text = f.read()
+    if old not in text:
+        print(f"ERROR: anchor not found verbatim in {path} ({label}) -- aborting, no changes made to this file.")
+        sys.exit(1)
+    if text.count(old) > 1:
+        print(f"ERROR: anchor found {text.count(old)} times in {path} ({label}) -- not unique, aborting.")
+        sys.exit(1)
+    text = text.replace(old, new)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+    print(f"Patched {path} ({label})")
+
+
+path = "scripts/Fetch_im_data.py"
+
+# 1) Peak-RSS reporter -- the del existing_df / gc.collect() fix from the
+#    last commit did NOT stop form 4498 from crashing at the exact same
+#    spot with the exact same exit 137, so the next run needs to actually
+#    MEASURE memory instead of guessing again. resource is POSIX-only
+#    (Connect Cloud is Linux) but this script may also get run on a
+#    Windows laptop, so fall back to a no-op there rather than crashing
+#    on import.
+apply(
+    path,
+    "import gc\n",
+    '''import gc
+
+try:
+    import resource
+
+    def _peak_rss_mb():
+        """Peak resident-set size for this process so far, in MB. Linux/
+        macOS only (POSIX rusage) -- returns None on Windows so this is
+        always safe to call unconditionally."""
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+except ImportError:
+    def _peak_rss_mb():
+        return None
+''',
+    "add peak-RSS reporter",
+)
+
+# 2) Print it after every form in the main loop, right alongside the
+#    gc.collect() added last commit -- this is diagnostic-only (adds a
+#    console line, changes no behavior) so the NEXT crash tells us the
+#    actual memory trajectory instead of us guessing a third time.
+apply(
+    path,
+    '''        # Reclaim memory before the next form, win or lose -- see the
+        # save_incremental() comment on form 4498's OOM-kill for why this
+        # matters over a long sequential run of many large forms.
+        gc.collect()
+''',
+    '''        # Reclaim memory before the next form, win or lose -- see the
+        # save_incremental() comment on form 4498's OOM-kill for why this
+        # matters over a long sequential run of many large forms.
+        gc.collect()
+
+        peak_mb = _peak_rss_mb()
+        if peak_mb is not None:
+            console(f"   [MEM] Peak RSS after form {form_id}: {peak_mb:,.0f} MB")
+''',
+    "print peak RSS per form",
+)
+
+print("All 2 patches applied successfully.")
