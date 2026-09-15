@@ -392,7 +392,14 @@ run_r_script <- function(script_path, step_name) {
   # 1M+ rows) show real-time progress instead of going silent until done --
   # full detail is still in the script's own log file (see the FAILED
   # message below), so we don't need to also replay it line-by-line here.
-  cmd <- sprintf("Rscript \"%s\"", script_path)
+  # Explicitly merge stderr into stdout (2>&1) rather than relying on
+  # fd inheritance alone -- when Repository Builder failed with exit 1
+  # and produced zero visible output, its real "Error: ... Execution
+  # halted" text never showed up anywhere the dashboard's live-output
+  # panel captures. This guarantees stderr always lands in the same
+  # stream the panel reads, so a script's own real error is never
+  # silently lost again.
+  cmd <- sprintf("Rscript \"%s\" 2>&1", script_path)
   log_info("Executing: {cmd}")
   cat(sprintf("\n[%s] live output below:\n%s\n", step_name, strrep("-", 60)))
 

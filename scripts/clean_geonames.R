@@ -38,10 +38,22 @@ suppressPackageStartupMessages({
 # CENTRALIZED IM WORKFLOW PATHS
 # ============================================================
 
-# Set once via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows) if this
-# project ever moves off this laptop/drive -- every script in the pipeline
-# reads the same variable, so nothing else needs editing.
-BASE_DIR <- Sys.getenv("IM_WORKFLOW_HOME", unset = "C:/Users/TOURE/Documents/im_workflow")
+# BASE_DIR is resolved by the shared find_workflow_home() (see
+# scripts/find_workflow_home.R's own header comment) instead of a
+# hardcoded fallback. This script always runs as its own Rscript
+# process (run_workflow.R's run_r_script()), so resolve
+# find_workflow_home.R via THIS SCRIPT'S OWN FILE PATH -- exactly like
+# run_workflow.R does -- so it works no matter what working directory
+# the caller leaves us in. This replaces a stale hardcoded
+# Windows-laptop fallback that was silently pointing Connect Cloud at
+# a nonexistent path whenever IM_WORKFLOW_HOME wasn't set in the
+# environment -- which it never is when this is spawned by the Shiny
+# dashboard.
+.cg_this_file <- normalizePath(sub("^--file=", "",
+  grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)))
+source(file.path(dirname(.cg_this_file), "find_workflow_home.R"))
+rm(.cg_this_file)
+BASE_DIR <- find_workflow_home()
 
 CONFIG_DIR <- file.path(BASE_DIR, "config")
 DATA_DIR <- file.path(BASE_DIR, "data")

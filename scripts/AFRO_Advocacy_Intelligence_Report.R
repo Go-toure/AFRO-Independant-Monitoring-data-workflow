@@ -20,10 +20,31 @@ pacman::p_load(
 # script in run_workflow.R). output_dir matches the existing
 # outputs/reports/IM_Intelligence_Report folder that
 # afro_region_im_deck_generation.R reads from afterwards.
-# BASE_DIR: set once via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows) if
-# this project ever moves off this laptop/drive -- every script in the
-# pipeline reads the same variable, so nothing else needs editing.
-BASE_DIR <- Sys.getenv("IM_WORKFLOW_HOME", unset = "C:/Users/TOURE/Documents/im_workflow")
+# BASE_DIR: when this script runs the normal way -- source_safely()
+# from inside run_workflow.R, for Step 4's optional reports --
+# run_workflow.R's own BASE_DIR (already resolved via the shared
+# find_workflow_home()) is sitting right there in this same R
+# session, so just reuse it. Only resolve it fresh (searching upward
+# from the working directory, same logic find_workflow_home() itself
+# uses) for a standalone run. This replaces a hardcoded Windows-laptop
+# fallback path that was silently wrong on Connect Cloud otherwise.
+if (!exists("BASE_DIR", inherits = TRUE)) {
+  .aair_dir <- getwd()
+  .aair_fwh <- NULL
+  for (.aair_i in 1:6) {
+    .aair_candidate <- file.path(.aair_dir, "scripts", "find_workflow_home.R")
+    if (file.exists(.aair_candidate)) { .aair_fwh <- .aair_candidate; break }
+    .aair_parent <- dirname(.aair_dir)
+    if (identical(.aair_parent, .aair_dir)) break
+    .aair_dir <- .aair_parent
+  }
+  if (is.null(.aair_fwh))
+    stop("Could not locate scripts/find_workflow_home.R by searching upward from: ", getwd())
+  source(.aair_fwh)
+  BASE_DIR <- find_workflow_home()
+  rm(.aair_dir, .aair_fwh, .aair_i, .aair_candidate)
+  if (exists(".aair_parent")) rm(.aair_parent)
+}
 phase1_dir <- file.path(BASE_DIR, "outputs/phase1_intelligence")
 tables_dir <- file.path(phase1_dir, "tables")
 

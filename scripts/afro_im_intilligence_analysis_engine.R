@@ -19,10 +19,31 @@ pacman::p_load(
 # by clean_geonames.R / regional_im_repository_builder.R (data/final), and
 # writes its Phase 1 tables to an intermediate folder that
 # AFRO_Advocacy_Intelligence_Report.R reads from next.
-# BASE_DIR: set once via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows) if
-# this project ever moves off this laptop/drive -- every script in the
-# pipeline reads the same variable, so nothing else needs editing.
-BASE_DIR <- Sys.getenv("IM_WORKFLOW_HOME", unset = "C:/Users/TOURE/Documents/im_workflow")
+# BASE_DIR: when this script runs the normal way -- source_safely()
+# from inside run_workflow.R, for Step 4's optional reports --
+# run_workflow.R's own BASE_DIR (already resolved via the shared
+# find_workflow_home()) is sitting right there in this same R
+# session, so just reuse it. Only resolve it fresh (searching upward
+# from the working directory, same logic find_workflow_home() itself
+# uses) for a standalone run. This replaces a hardcoded Windows-laptop
+# fallback path that was silently wrong on Connect Cloud otherwise.
+if (!exists("BASE_DIR", inherits = TRUE)) {
+  .aiaee_dir <- getwd()
+  .aiaee_fwh <- NULL
+  for (.aiaee_i in 1:6) {
+    .aiaee_candidate <- file.path(.aiaee_dir, "scripts", "find_workflow_home.R")
+    if (file.exists(.aiaee_candidate)) { .aiaee_fwh <- .aiaee_candidate; break }
+    .aiaee_parent <- dirname(.aiaee_dir)
+    if (identical(.aiaee_parent, .aiaee_dir)) break
+    .aiaee_dir <- .aiaee_parent
+  }
+  if (is.null(.aiaee_fwh))
+    stop("Could not locate scripts/find_workflow_home.R by searching upward from: ", getwd())
+  source(.aiaee_fwh)
+  BASE_DIR <- find_workflow_home()
+  rm(.aiaee_dir, .aiaee_fwh, .aiaee_i, .aiaee_candidate)
+  if (exists(".aiaee_parent")) rm(.aiaee_parent)
+}
 input_file <- file.path(BASE_DIR, "data/final/Regional_IM_repository_cleaned.csv")
 
 output_dir <- file.path(BASE_DIR, "outputs/phase1_intelligence")

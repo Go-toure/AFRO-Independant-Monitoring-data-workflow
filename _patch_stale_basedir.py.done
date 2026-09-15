@@ -1,0 +1,222 @@
+import sys
+
+def apply(path, old, new, label):
+    with open(path, "r", newline="") as f:
+        text = f.read()
+    if old not in text:
+        print(f"ERROR: anchor not found verbatim in {path} ({label}) -- aborting, no changes made to this file.")
+        sys.exit(1)
+    if text.count(old) > 1:
+        print(f"ERROR: anchor found {text.count(old)} times in {path} ({label}) -- not unique, aborting.")
+        sys.exit(1)
+    text = text.replace(old, new)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+    print(f"Patched {path} ({label})")
+
+
+# ------------------------------------------------------------------
+# 1) scripts/run_workflow.R -- make run_r_script() merge stderr into
+#    stdout explicitly, so a failed Rscript child's real error text can
+#    never again vanish from the dashboard's live-output panel the way
+#    it just did for Repository Builder (zero output, just exit code 1).
+# ------------------------------------------------------------------
+apply(
+    "scripts/run_workflow.R",
+    '  cmd <- sprintf("Rscript \\"%s\\"", script_path)\n',
+    '  # Explicitly merge stderr into stdout (2>&1) rather than relying on\n'
+    '  # fd inheritance alone -- when Repository Builder failed with exit 1\n'
+    '  # and produced zero visible output, its real "Error: ... Execution\n'
+    '  # halted" text never showed up anywhere the dashboard\'s live-output\n'
+    '  # panel captures. This guarantees stderr always lands in the same\n'
+    '  # stream the panel reads, so a script\'s own real error is never\n'
+    '  # silently lost again.\n'
+    '  cmd <- sprintf("Rscript \\"%s\\" 2>&1", script_path)\n',
+    "run_r_script() 2>&1",
+)
+
+# ------------------------------------------------------------------
+# 2) scripts/regional_im_repository_builder.R (Step 2, run via its own
+#    Rscript process) -- was still using the stale hardcoded fallback
+#    instead of the shared find_workflow_home(), so on Connect Cloud
+#    (where IM_WORKFLOW_HOME is never set) base_dir silently resolved to
+#    the literal string "C:/Users/TOURE/Documents/im_workflow" -- a
+#    Windows path that doesn't exist on that Linux container. This is
+#    almost certainly why Step 2 failed.
+# ------------------------------------------------------------------
+apply(
+    "scripts/regional_im_repository_builder.R",
+    '# Set once via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows) if this\n'
+    '# project ever moves off this laptop/drive -- every script in the pipeline\n'
+    '# reads the same variable, so nothing else needs editing.\n'
+    'base_dir <- Sys.getenv("IM_WORKFLOW_HOME", unset = "C:/Users/TOURE/Documents/im_workflow")\n',
+    '# base_dir is resolved by the shared find_workflow_home() (see\n'
+    '# scripts/find_workflow_home.R\'s own header comment) instead of a\n'
+    '# hardcoded fallback. This script always runs as its own Rscript\n'
+    '# process (run_workflow.R\'s run_r_script()), so resolve\n'
+    '# find_workflow_home.R via THIS SCRIPT\'S OWN FILE PATH -- exactly like\n'
+    '# run_workflow.R does -- so it works no matter what working directory\n'
+    '# the caller leaves us in. This replaces a stale hardcoded\n'
+    '# Windows-laptop fallback that was silently pointing Connect Cloud at\n'
+    '# a nonexistent path whenever IM_WORKFLOW_HOME wasn\'t set in the\n'
+    '# environment -- which it never is when this is spawned by the Shiny\n'
+    '# dashboard.\n'
+    '.ribr_this_file <- normalizePath(sub("^--file=", "",\n'
+    '  grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)))\n'
+    'source(file.path(dirname(.ribr_this_file), "find_workflow_home.R"))\n'
+    'rm(.ribr_this_file)\n'
+    'base_dir <- find_workflow_home()\n',
+    "regional_im_repository_builder.R base_dir",
+)
+
+# ------------------------------------------------------------------
+# 3) scripts/clean_geonames.R (Step 3, run via its own Rscript process)
+#    -- same bug, same fix.
+# ------------------------------------------------------------------
+apply(
+    "scripts/clean_geonames.R",
+    '# Set once via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows) if this\n'
+    '# project ever moves off this laptop/drive -- every script in the pipeline\n'
+    '# reads the same variable, so nothing else needs editing.\n'
+    'BASE_DIR <- Sys.getenv("IM_WORKFLOW_HOME", unset = "C:/Users/TOURE/Documents/im_workflow")\n',
+    '# BASE_DIR is resolved by the shared find_workflow_home() (see\n'
+    '# scripts/find_workflow_home.R\'s own header comment) instead of a\n'
+    '# hardcoded fallback. This script always runs as its own Rscript\n'
+    '# process (run_workflow.R\'s run_r_script()), so resolve\n'
+    '# find_workflow_home.R via THIS SCRIPT\'S OWN FILE PATH -- exactly like\n'
+    '# run_workflow.R does -- so it works no matter what working directory\n'
+    '# the caller leaves us in. This replaces a stale hardcoded\n'
+    '# Windows-laptop fallback that was silently pointing Connect Cloud at\n'
+    '# a nonexistent path whenever IM_WORKFLOW_HOME wasn\'t set in the\n'
+    '# environment -- which it never is when this is spawned by the Shiny\n'
+    '# dashboard.\n'
+    '.cg_this_file <- normalizePath(sub("^--file=", "",\n'
+    '  grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)))\n'
+    'source(file.path(dirname(.cg_this_file), "find_workflow_home.R"))\n'
+    'rm(.cg_this_file)\n'
+    'BASE_DIR <- find_workflow_home()\n',
+    "clean_geonames.R BASE_DIR",
+)
+
+# ------------------------------------------------------------------
+# 4) scripts/afro_im_intilligence_analysis_engine.R (Step 4, run via
+#    source_safely() inside run_workflow.R's own session) -- reuse the
+#    parent's already-correct BASE_DIR when present; only resolve fresh
+#    (searching upward from the working directory, like
+#    find_workflow_home() itself does) for a standalone run.
+# ------------------------------------------------------------------
+apply(
+    "scripts/afro_im_intilligence_analysis_engine.R",
+    '# BASE_DIR: set once via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows) if\n'
+    '# this project ever moves off this laptop/drive -- every script in the\n'
+    '# pipeline reads the same variable, so nothing else needs editing.\n'
+    'BASE_DIR <- Sys.getenv("IM_WORKFLOW_HOME", unset = "C:/Users/TOURE/Documents/im_workflow")\n',
+    '# BASE_DIR: when this script runs the normal way -- source_safely()\n'
+    '# from inside run_workflow.R, for Step 4\'s optional reports --\n'
+    '# run_workflow.R\'s own BASE_DIR (already resolved via the shared\n'
+    '# find_workflow_home()) is sitting right there in this same R\n'
+    '# session, so just reuse it. Only resolve it fresh (searching upward\n'
+    '# from the working directory, same logic find_workflow_home() itself\n'
+    '# uses) for a standalone run. This replaces a hardcoded Windows-laptop\n'
+    '# fallback path that was silently wrong on Connect Cloud otherwise.\n'
+    'if (!exists("BASE_DIR", inherits = TRUE)) {\n'
+    '  .aiaee_dir <- getwd()\n'
+    '  .aiaee_fwh <- NULL\n'
+    '  for (.aiaee_i in 1:6) {\n'
+    '    .aiaee_candidate <- file.path(.aiaee_dir, "scripts", "find_workflow_home.R")\n'
+    '    if (file.exists(.aiaee_candidate)) { .aiaee_fwh <- .aiaee_candidate; break }\n'
+    '    .aiaee_parent <- dirname(.aiaee_dir)\n'
+    '    if (identical(.aiaee_parent, .aiaee_dir)) break\n'
+    '    .aiaee_dir <- .aiaee_parent\n'
+    '  }\n'
+    '  if (is.null(.aiaee_fwh))\n'
+    '    stop("Could not locate scripts/find_workflow_home.R by searching upward from: ", getwd())\n'
+    '  source(.aiaee_fwh)\n'
+    '  BASE_DIR <- find_workflow_home()\n'
+    '  rm(.aiaee_dir, .aiaee_fwh, .aiaee_i, .aiaee_candidate)\n'
+    '  if (exists(".aiaee_parent")) rm(.aiaee_parent)\n'
+    '}\n',
+    "afro_im_intilligence_analysis_engine.R BASE_DIR",
+)
+
+# ------------------------------------------------------------------
+# 5) scripts/AFRO_Advocacy_Intelligence_Report.R (Step 4, source_safely())
+#    -- same fix.
+# ------------------------------------------------------------------
+apply(
+    "scripts/AFRO_Advocacy_Intelligence_Report.R",
+    '# BASE_DIR: set once via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows) if\n'
+    '# this project ever moves off this laptop/drive -- every script in the\n'
+    '# pipeline reads the same variable, so nothing else needs editing.\n'
+    'BASE_DIR <- Sys.getenv("IM_WORKFLOW_HOME", unset = "C:/Users/TOURE/Documents/im_workflow")\n',
+    '# BASE_DIR: when this script runs the normal way -- source_safely()\n'
+    '# from inside run_workflow.R, for Step 4\'s optional reports --\n'
+    '# run_workflow.R\'s own BASE_DIR (already resolved via the shared\n'
+    '# find_workflow_home()) is sitting right there in this same R\n'
+    '# session, so just reuse it. Only resolve it fresh (searching upward\n'
+    '# from the working directory, same logic find_workflow_home() itself\n'
+    '# uses) for a standalone run. This replaces a hardcoded Windows-laptop\n'
+    '# fallback path that was silently wrong on Connect Cloud otherwise.\n'
+    'if (!exists("BASE_DIR", inherits = TRUE)) {\n'
+    '  .aair_dir <- getwd()\n'
+    '  .aair_fwh <- NULL\n'
+    '  for (.aair_i in 1:6) {\n'
+    '    .aair_candidate <- file.path(.aair_dir, "scripts", "find_workflow_home.R")\n'
+    '    if (file.exists(.aair_candidate)) { .aair_fwh <- .aair_candidate; break }\n'
+    '    .aair_parent <- dirname(.aair_dir)\n'
+    '    if (identical(.aair_parent, .aair_dir)) break\n'
+    '    .aair_dir <- .aair_parent\n'
+    '  }\n'
+    '  if (is.null(.aair_fwh))\n'
+    '    stop("Could not locate scripts/find_workflow_home.R by searching upward from: ", getwd())\n'
+    '  source(.aair_fwh)\n'
+    '  BASE_DIR <- find_workflow_home()\n'
+    '  rm(.aair_dir, .aair_fwh, .aair_i, .aair_candidate)\n'
+    '  if (exists(".aair_parent")) rm(.aair_parent)\n'
+    '}\n',
+    "AFRO_Advocacy_Intelligence_Report.R BASE_DIR",
+)
+
+# ------------------------------------------------------------------
+# 6) scripts/afro_region_im_deck_generation.R (Step 4, source_safely())
+#    -- uses its own `workflow_dir` variable name rather than BASE_DIR,
+#    but the fix is the same idea: reuse run_workflow.R's BASE_DIR when
+#    present, else resolve fresh.
+# ------------------------------------------------------------------
+apply(
+    "scripts/afro_region_im_deck_generation.R",
+    '# Main workflow directory\n'
+    '# Set once via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows) if this\n'
+    '# project ever moves off this laptop/drive -- every script in the pipeline\n'
+    '# reads the same variable, so nothing else needs editing.\n'
+    'workflow_dir <- Sys.getenv("IM_WORKFLOW_HOME", unset = "C:/Users/TOURE/Documents/im_workflow")\n',
+    '# Main workflow directory. Reuse run_workflow.R\'s own BASE_DIR when\n'
+    '# this script runs the normal way -- source_safely() from inside\n'
+    '# run_workflow.R, for Step 4\'s optional reports -- it\'s already\n'
+    '# resolved correctly in this same R session via the shared\n'
+    '# find_workflow_home(). Only resolve it fresh for a standalone run.\n'
+    '# This replaces a hardcoded Windows-laptop fallback path that was\n'
+    '# silently wrong on Connect Cloud otherwise.\n'
+    'if (exists("BASE_DIR", inherits = TRUE)) {\n'
+    '  workflow_dir <- BASE_DIR\n'
+    '} else {\n'
+    '  .ardg_dir <- getwd()\n'
+    '  .ardg_fwh <- NULL\n'
+    '  for (.ardg_i in 1:6) {\n'
+    '    .ardg_candidate <- file.path(.ardg_dir, "scripts", "find_workflow_home.R")\n'
+    '    if (file.exists(.ardg_candidate)) { .ardg_fwh <- .ardg_candidate; break }\n'
+    '    .ardg_parent <- dirname(.ardg_dir)\n'
+    '    if (identical(.ardg_parent, .ardg_dir)) break\n'
+    '    .ardg_dir <- .ardg_parent\n'
+    '  }\n'
+    '  if (is.null(.ardg_fwh))\n'
+    '    stop("Could not locate scripts/find_workflow_home.R by searching upward from: ", getwd())\n'
+    '  source(.ardg_fwh)\n'
+    '  workflow_dir <- find_workflow_home()\n'
+    '  rm(.ardg_dir, .ardg_fwh, .ardg_i, .ardg_candidate)\n'
+    '  if (exists(".ardg_parent")) rm(.ardg_parent)\n'
+    '}\n',
+    "afro_region_im_deck_generation.R workflow_dir",
+)
+
+print("\nAll 6 patches applied successfully.")

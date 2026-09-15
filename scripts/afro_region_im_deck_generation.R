@@ -12,11 +12,32 @@ pacman::p_load(
 # PATHS - CONNECTED TO IM WORKFLOW
 # ============================================================
 
-# Main workflow directory
-# Set once via `setx IM_WORKFLOW_HOME "D:/new/path"` (Windows) if this
-# project ever moves off this laptop/drive -- every script in the pipeline
-# reads the same variable, so nothing else needs editing.
-workflow_dir <- Sys.getenv("IM_WORKFLOW_HOME", unset = "C:/Users/TOURE/Documents/im_workflow")
+# Main workflow directory. Reuse run_workflow.R's own BASE_DIR when
+# this script runs the normal way -- source_safely() from inside
+# run_workflow.R, for Step 4's optional reports -- it's already
+# resolved correctly in this same R session via the shared
+# find_workflow_home(). Only resolve it fresh for a standalone run.
+# This replaces a hardcoded Windows-laptop fallback path that was
+# silently wrong on Connect Cloud otherwise.
+if (exists("BASE_DIR", inherits = TRUE)) {
+  workflow_dir <- BASE_DIR
+} else {
+  .ardg_dir <- getwd()
+  .ardg_fwh <- NULL
+  for (.ardg_i in 1:6) {
+    .ardg_candidate <- file.path(.ardg_dir, "scripts", "find_workflow_home.R")
+    if (file.exists(.ardg_candidate)) { .ardg_fwh <- .ardg_candidate; break }
+    .ardg_parent <- dirname(.ardg_dir)
+    if (identical(.ardg_parent, .ardg_dir)) break
+    .ardg_dir <- .ardg_parent
+  }
+  if (is.null(.ardg_fwh))
+    stop("Could not locate scripts/find_workflow_home.R by searching upward from: ", getwd())
+  source(.ardg_fwh)
+  workflow_dir <- find_workflow_home()
+  rm(.ardg_dir, .ardg_fwh, .ardg_i, .ardg_candidate)
+  if (exists(".ardg_parent")) rm(.ardg_parent)
+}
 
 # Input: Intelligence report outputs from AFRO_Advocacy_Intelligence_Report.R
 intelligence_dir <- file.path(workflow_dir, "outputs/reports/IM_Intelligence_Report")
