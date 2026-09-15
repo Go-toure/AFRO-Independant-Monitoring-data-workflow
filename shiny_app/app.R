@@ -2635,7 +2635,7 @@ server <- function(input, output, session) {
 
   rv_log   <- reactiveVal(get_log_lines())
   rv_stat  <- reactiveVal("idle")
-  rv_steps <- reactiveVal(rep("pending", 6L))
+  rv_steps <- reactiveVal(rep("pending", 7L))  # 7 steps: Fetch, Build, Clean, Upload, Intelligence Engine, Advocacy Report, Deck
   rv_proc  <- reactiveVal(NULL)   # list(proc, step_idx, lf, pos)
   rv_queue <- reactiveVal(integer(0))
 
@@ -2701,7 +2701,18 @@ server <- function(input, output, session) {
          args=c(file.path(WORKFLOW_DIR,"scripts","afro_im_intilligence_analysis_engine.R"))),
     list(n=6L, label="Generate Reports",  icon="file-earmark-bar-graph-fill",
          cmd="Rscript",
-         args=c(file.path(WORKFLOW_DIR,"scripts","AFRO_Advocacy_Intelligence_Report.R")))
+         args=c(file.path(WORKFLOW_DIR,"scripts","AFRO_Advocacy_Intelligence_Report.R"))),
+    # Added as its own step: previously afro_region_im_deck_generation.R
+    # (the PowerPoint deck) was only ever wired into run_workflow.R's own
+    # run_optional_reports() chain, which no dashboard button actually
+    # calls -- Steps 5/6 both run their scripts standalone instead. That
+    # meant the deck script never ran from this dashboard at all. Folded
+    # into the same "Generate Reports" button (see run_rpts below) rather
+    # than adding a separate button, matching how that button already
+    # spans two steps (5 and 6).
+    list(n=7L, label="Generate Deck", icon="easel-fill",
+         cmd="Rscript",
+         args=c(file.path(WORKFLOW_DIR,"scripts","afro_region_im_deck_generation.R")))
   )
 
   # Launch one step as a background process --------------------------------
@@ -2835,7 +2846,7 @@ server <- function(input, output, session) {
 
   # Button handlers --------------------------------------------------------
   step_start <- function(clear_log = TRUE, header = NULL) {
-    rv_steps(rep("pending", 6L))
+    rv_steps(rep("pending", 7L))
     rv_queue(integer(0L))
     reset_log_pos()   # start reading workflow log from current EOF
     if (clear_log) {
@@ -2862,15 +2873,15 @@ server <- function(input, output, session) {
     launch_step(4L)
   })
   observeEvent(input$run_rpts, {
-    step_start(header = "[5-6] GENERATE REPORTS (Intelligence Engine + Advocacy Report)\n")
-    rv_queue(6L)
+    step_start(header = "[5-7] GENERATE REPORTS (Intelligence Engine + Advocacy Report + Deck)\n")
+    rv_queue(c(6L, 7L))
     launch_step(5L)
   })
   observeEvent(input$run_all, {
     step_start(header = paste0("▶  FULL PIPELINE STARTED\n── ",
                                format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
                                " ──\n"))
-    rv_queue(2:6)
+    rv_queue(2:7)
     launch_step(1L)
   })
 

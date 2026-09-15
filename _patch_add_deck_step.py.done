@@ -1,0 +1,99 @@
+import sys
+
+def apply(path, old, new, label):
+    with open(path, "r", newline="") as f:
+        text = f.read()
+    if old not in text:
+        print(f"ERROR: anchor not found verbatim in {path} ({label}) -- aborting, no changes made to this file.")
+        sys.exit(1)
+    if text.count(old) > 1:
+        print(f"ERROR: anchor found {text.count(old)} times in {path} ({label}) -- not unique, aborting.")
+        sys.exit(1)
+    text = text.replace(old, new)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+    print(f"Patched {path} ({label})")
+
+
+path = "shiny_app/app.R"
+
+# 1) rv_steps initial size: 6 -> 7
+apply(
+    path,
+    'rv_steps <- reactiveVal(rep("pending", 6L))',
+    'rv_steps <- reactiveVal(rep("pending", 7L))  # 7 steps: Fetch, Build, Clean, Upload, Intelligence Engine, Advocacy Report, Deck',
+    "rv_steps init 6->7",
+)
+
+# 2) STEPS list: add a 7th entry for deck generation, right after Generate Reports
+apply(
+    path,
+    '''    list(n=6L, label="Generate Reports",  icon="file-earmark-bar-graph-fill",
+         cmd="Rscript",
+         args=c(file.path(WORKFLOW_DIR,"scripts","AFRO_Advocacy_Intelligence_Report.R")))
+  )''',
+    '''    list(n=6L, label="Generate Reports",  icon="file-earmark-bar-graph-fill",
+         cmd="Rscript",
+         args=c(file.path(WORKFLOW_DIR,"scripts","AFRO_Advocacy_Intelligence_Report.R"))),
+    # Added as its own step: previously afro_region_im_deck_generation.R
+    # (the PowerPoint deck) was only ever wired into run_workflow.R's own
+    # run_optional_reports() chain, which no dashboard button actually
+    # calls -- Steps 5/6 both run their scripts standalone instead. That
+    # meant the deck script never ran from this dashboard at all. Folded
+    # into the same "Generate Reports" button (see run_rpts below) rather
+    # than adding a separate button, matching how that button already
+    # spans two steps (5 and 6).
+    list(n=7L, label="Generate Deck", icon="easel-fill",
+         cmd="Rscript",
+         args=c(file.path(WORKFLOW_DIR,"scripts","afro_region_im_deck_generation.R")))
+  )''',
+    "STEPS list add n=7L deck",
+)
+
+# 3) step_start() reset size: 6 -> 7
+apply(
+    path,
+    '''  step_start <- function(clear_log = TRUE, header = NULL) {
+    rv_steps(rep("pending", 6L))''',
+    '''  step_start <- function(clear_log = TRUE, header = NULL) {
+    rv_steps(rep("pending", 7L))''',
+    "step_start rv_steps 6->7",
+)
+
+# 4) run_rpts handler: queue step 7 (deck) after 6, update header text
+apply(
+    path,
+    '''  observeEvent(input$run_rpts, {
+    step_start(header = "[5-6] GENERATE REPORTS (Intelligence Engine + Advocacy Report)\\n")
+    rv_queue(6L)
+    launch_step(5L)
+  })''',
+    '''  observeEvent(input$run_rpts, {
+    step_start(header = "[5-7] GENERATE REPORTS (Intelligence Engine + Advocacy Report + Deck)\\n")
+    rv_queue(c(6L, 7L))
+    launch_step(5L)
+  })''',
+    "run_rpts queue 6L -> c(6L,7L)",
+)
+
+# 5) run_all handler: extend full-pipeline queue to include step 7
+apply(
+    path,
+    '''  observeEvent(input$run_all, {
+    step_start(header = paste0("▶  FULL PIPELINE STARTED\\n── ",
+                               format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+                               " ──\\n"))
+    rv_queue(2:6)
+    launch_step(1L)
+  })''',
+    '''  observeEvent(input$run_all, {
+    step_start(header = paste0("▶  FULL PIPELINE STARTED\\n── ",
+                               format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+                               " ──\\n"))
+    rv_queue(2:7)
+    launch_step(1L)
+  })''',
+    "run_all queue 2:6 -> 2:7",
+)
+
+print("\\nAll 5 patches applied successfully.")
