@@ -32,7 +32,7 @@ if (nzchar(python_path)) {
   # requirements.txt declared for this Connect Cloud deployment.
   pkg_check <- tryCatch(
     system2(python_path, c("-c",
-      shQuote("import importlib,sys; mods=['pandas','requests','pyarrow','openpyxl']; [print(m, '->', 'OK' if importlib.util.find_spec(m) else 'MISSING') for m in mods]")
+      shQuote("import importlib, importlib.util, sys; mods=['pandas','requests','pyarrow','openpyxl']; [print(m, '->', 'OK' if importlib.util.find_spec(m) else 'MISSING') for m in mods]")
     ), stdout = TRUE, stderr = TRUE),
     error = function(e) paste("ERROR:", conditionMessage(e))
   )
