@@ -312,7 +312,7 @@ USER_URL = "https://api.whonghub.org/api/v1/user.json"
 # and the script behaves exactly as it always has (local-disk-only).
 import _sharepoint_client as sp
 
-SP_RAW_FOLDER = "7. SIA_Data/Data Repository/raw_state"
+SP_RAW_FOLDER = "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/raw_state"
 
 _sp_session = {"tried": False, "token": None, "drive_id": None, "folder_ready": False}
 

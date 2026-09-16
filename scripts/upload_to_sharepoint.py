@@ -59,7 +59,7 @@ LIBRARY_NAME = "Documents"
 
 # Target folder path (relative to Documents library)
 # Format: use forward slashes, no leading slash
-TARGET_FOLDER = "7. SIA_Data/Data Repository"  # <- UPDATE THIS AS NEEDED
+TARGET_FOLDER = "7. SIA_Data/Data Repository"  # <- stays at root: AFRO_Inside_HH_M* files are shared with other pipelines
 
 # Report deliverables (Step 5) don't live under data/final -- each report
 # script writes to its own outputs/ subfolder. These constants let the
@@ -69,7 +69,7 @@ TARGET_FOLDER = "7. SIA_Data/Data Repository"  # <- UPDATE THIS AS NEEDED
 # outputs above.
 PHASE1_INTELLIGENCE_DIR = os.path.join(BASE_DIR, "outputs/phase1_intelligence")
 INTELLIGENCE_REPORT_DIR = os.path.join(BASE_DIR, "outputs/reports/IM_Intelligence_Report")
-REPORTS_TARGET_FOLDER = f"{TARGET_FOLDER}/reports"
+REPORTS_TARGET_FOLDER = "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/reports"
 
 # File mappings: each entry uploads one local file to SharePoint.
 # - "source_dir" is optional; defaults to FINAL_DIR (data/final) when absent.

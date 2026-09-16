@@ -96,7 +96,7 @@ MIN_ABSOLUTE_ROWS = 20
 # a previous file to compare to on a from-scratch container). Soft-fail
 # throughout, same as the rest of this script: missing credentials or an
 # unreachable SharePoint just skips the sync, never blocks the refresh.
-SP_LOOKUP_FOLDER = "7. SIA_Data/Data Repository/lookup_state"
+SP_LOOKUP_FOLDER = "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/lookup_state"
 
 
 def _try_download_lookup_from_sharepoint(base_dir, lookup_path):
