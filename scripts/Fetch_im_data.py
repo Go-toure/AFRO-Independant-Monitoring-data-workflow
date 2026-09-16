@@ -990,10 +990,26 @@ def save_incremental(
         combined = pd.concat([existing_df, new_df], ignore_index=True, sort=False)
         # existing_df can be tens of MB on disk and several times that once
         # loaded as a DataFrame -- free it now rather than holding it (plus
-        # new_df, plus combined) all alive at once through the string-cast
-        # below, which is the single biggest memory spike in this function.
+        # new_df, plus combined) all alive at once through what comes next.
         del existing_df
-        combined = combined.fillna("").astype(str)
+
+        # Column-by-column, NOT combined.fillna("").astype(str) on the whole
+        # table: that whole-table version is exactly what crashed the
+        # 2026-08-22 run on form 4498 (see build_dataframe_from_records()'s
+        # own comment on this) -- pandas' whole-table fillna makes a
+        # defensive copy of the ENTIRE block before filling anything in it,
+        # which for a wide, long form needs gigabytes on top of what's
+        # already resident. build_dataframe_from_records() was already
+        # fixed to do this column-by-column; this merge step does the same
+        # whole-table operation on `combined` (which, after concatenating
+        # in the existing data, is the form's ENTIRE dataset) and had the
+        # exact same bug, just never actually hit by that form until now.
+        for col in combined.columns:
+            series = combined[col]
+            if series.isna().any():
+                series = series.fillna("")
+            combined[col] = series.astype(str)
+
         combined = combined.drop_duplicates(subset=["_id"], keep="last").reset_index(drop=True)
     except Exception as e:
         detail(f"[WARNING] Form {form_id} | Merge/de-duplication failed: {e}")
