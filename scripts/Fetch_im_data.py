@@ -47,6 +47,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+import pyarrow.csv as pa_csv
 import shutil
 import gc
 
@@ -398,13 +399,73 @@ def sync_missing_raw_from_sharepoint(form_ids) -> None:
     detail(f"[sharepoint] Raw-state sync: recovered {recovered}/{len(missing_forms)} missing form(s).")
 
 
+def _export_csv(form_id: int) -> Optional[Path]:
+    """Write a CSV twin of this form's just-finalized combined Parquet
+    file, for anyone who wants to open a form's raw data directly
+    without a Parquet-aware tool (Excel, a text editor, etc).
+
+    Streams the Parquet file ONE ROW GROUP AT A TIME via
+    pq.ParquetFile.read_row_group() straight into pyarrow's own
+    CSVWriter -- never loads the whole form into a pandas DataFrame --
+    so this is safe to run unconditionally for every form, including
+    form 4498's 800+-column, 1M+-row combined file, without
+    reintroducing the exact memory blowup the rest of this file's
+    history is about (see _merge_and_dedup() / _recombine_year_
+    partitions()'s own docstrings). A combined file written by
+    _recombine_year_partitions() already has many small
+    (_PARTITION_ROW_GROUP_SIZE-sized) row groups for exactly this
+    reason; a plain (non-partitioned) form's file has only one or two
+    larger ones, which is the same size of data this pipeline already
+    safely handles elsewhere for those smaller forms.
+
+    Returns the CSV's path on success, or None on any failure (never
+    raises) -- a CSV export failing must not fail the fetch it happened
+    alongside; the Parquet file (this pipeline's real source of truth)
+    is unaffected either way."""
+    source_path = RAW_DIR / f"{form_id}.parquet"
+    if not source_path.exists():
+        return None
+
+    csv_path = RAW_DIR / f"{form_id}.csv"
+    writer = None
+    try:
+        pf = pq.ParquetFile(source_path)
+        for rg_idx in range(pf.num_row_groups):
+            table = pf.read_row_group(rg_idx)
+            if writer is None:
+                writer = pa_csv.CSVWriter(str(csv_path), table.schema)
+            writer.write_table(table)
+            del table
+
+        if writer is None:
+            # No row groups at all (an empty form) -- still produce a
+            # header-only CSV rather than no file.
+            writer = pa_csv.CSVWriter(str(csv_path), pf.schema_arrow)
+
+        writer.close()
+        writer = None
+        return csv_path
+    except Exception as e:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        detail(f"[WARNING] Form {form_id} | CSV export failed: {e}")
+        return None
+    finally:
+        gc.collect()
+        pa.default_memory_pool().release_unused()
+
+
 def upload_raw_to_sharepoint(form_id: int) -> None:
-    """Push this form's freshly written Parquet + metadata to the shared
-    SharePoint raw-state folder, right after a successful full or
-    incremental save. Never raises -- a SharePoint hiccup here must not
-    fail an otherwise-successful fetch; the next run's sync step will
-    just catch it up from local disk (if this machine still has it) or
-    retry the upload next time this form changes."""
+    """Push this form's freshly written Parquet + metadata (and a CSV
+    twin -- see _export_csv()) to the shared SharePoint raw-state
+    folder, right after a successful full or incremental save. Never
+    raises -- a SharePoint hiccup here must not fail an otherwise-
+    successful fetch; the next run's sync step will just catch it up
+    from local disk (if this machine still has it) or retry the upload
+    next time this form changes."""
     token, drive_id = _get_sp_session()
     if not token:
         return
@@ -426,6 +487,14 @@ def upload_raw_to_sharepoint(form_id: int) -> None:
         detail(f"[sharepoint] Form {form_id} | raw state synced to SharePoint.")
     else:
         detail(f"[sharepoint] Form {form_id} | WARNING: raw state sync to SharePoint failed (kept local copy only).")
+
+    csv_path = _export_csv(form_id)
+    if csv_path is not None:
+        csv_ok = sp.upload_file(token, drive_id, csv_path, f"{SP_RAW_FOLDER}/{csv_path.name}")
+        if csv_ok:
+            detail(f"[sharepoint] Form {form_id} | CSV twin synced to SharePoint.")
+        else:
+            detail(f"[sharepoint] Form {form_id} | WARNING: CSV twin upload to SharePoint failed.")
 
 
 # ============================================================
