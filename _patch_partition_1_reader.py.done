@@ -1,0 +1,92 @@
+import sys
+
+
+def apply(path, old, new, label):
+    with open(path, "r", newline="") as f:
+        text = f.read()
+    if old not in text:
+        print(f"ERROR: anchor not found verbatim in {path} ({label}) -- aborting, no changes made to this file.")
+        sys.exit(1)
+    if text.count(old) > 1:
+        print(f"ERROR: anchor found {text.count(old)} times in {path} ({label}) -- not unique, aborting.")
+        sys.exit(1)
+    text = text.replace(old, new)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+    print(f"Patched {path} ({label})")
+
+
+path = "scripts/Fetch_im_data.py"
+
+# _read_parquet_low_memory() gains an optional `filters` argument (the
+# same pyarrow row-filter format as pq.read_table's `filters=`) so the
+# upcoming year-partitioning code can pull out just one calendar year's
+# rows at a time -- without it, splitting an existing 1M+ row file into
+# year-partitions would need to load the WHOLE file as one DataFrame
+# first, which is exactly the thing this function exists to avoid.
+apply(
+    path,
+    '''def _read_parquet_low_memory(path) -> pd.DataFrame:
+    """Read a form's existing Parquet file column-by-column instead of in
+    one pd.read_parquet() call.
+''',
+    '''def _read_parquet_low_memory(path, filters=None) -> pd.DataFrame:
+    """Read a form's existing Parquet file column-by-column instead of in
+    one pd.read_parquet() call.
+
+    ``filters`` (optional) is the same row-filter format pq.read_table()
+    accepts, e.g. [("_submission_time", ">=", "2024-01-01")] -- when
+    given, every per-column read below is filtered the same way, so the
+    resulting DataFrame only has the matching rows. Used by the
+    year-partitioning code (see _split_into_year_partitions()) to read
+    one calendar year out of a huge existing file without ever loading
+    the other years into memory alongside it.
+''',
+    "add filters parameter to _read_parquet_low_memory docstring",
+)
+
+apply(
+    path,
+    '''    pf = pq.ParquetFile(path)
+    n_rows = pf.metadata.num_rows
+    columns = [f.name for f in pf.schema_arrow]
+
+    df = pd.DataFrame(index=pd.RangeIndex(n_rows))
+
+    for col in columns:
+        low_cardinality = not _is_high_cardinality_field(col)
+        read_dictionary = [col] if low_cardinality else None
+
+        table = pq.read_table(
+            path, columns=[col], read_dictionary=read_dictionary, use_threads=False
+        )
+''',
+    '''    pf = pq.ParquetFile(path)
+    columns = [f.name for f in pf.schema_arrow]
+
+    if filters is None:
+        n_rows = pf.metadata.num_rows
+    else:
+        # pf.metadata.num_rows is the UNFILTERED row count -- when a
+        # filter is given, get the real (filtered) row count from a
+        # cheap single-column read instead of guessing.
+        probe_col = columns[0]
+        n_rows = pq.read_table(
+            path, columns=[probe_col], filters=filters, use_threads=False
+        ).num_rows
+
+    df = pd.DataFrame(index=pd.RangeIndex(n_rows))
+
+    for col in columns:
+        low_cardinality = not _is_high_cardinality_field(col)
+        read_dictionary = [col] if low_cardinality else None
+
+        table = pq.read_table(
+            path, columns=[col], read_dictionary=read_dictionary,
+            filters=filters, use_threads=False
+        )
+''',
+    "thread filters through to each per-column read and compute filtered row count",
+)
+
+print("All 2 patches applied successfully.")
