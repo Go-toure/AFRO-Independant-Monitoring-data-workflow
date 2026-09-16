@@ -426,7 +426,21 @@ def _export_csv(form_id: int) -> Optional[Path]:
     if not source_path.exists():
         return None
 
-    csv_path = RAW_DIR / f"{form_id}.csv"
+    # Written to a SUBFOLDER of RAW_DIR, never RAW_DIR itself. The R
+    # repository builder (regional_im_repository_builder.R) globs every
+    # file directly inside data/raw/ whose extension is on its supported
+    # list -- which includes both "csv" and "parquet" -- and that glob is
+    # NOT recursive. A CSV twin written next to {form_id}.parquet at the
+    # top level therefore got picked up as a *second*, redundant input
+    # file for every form (34 forms -> 68 files processed), doubling that
+    # step's memory churn with no benefit and no dedup logic on the R
+    # side -- this is what caused Build Repository's OOM kill (exit 137)
+    # on 2026-09-16. A subfolder is invisible to that non-recursive scan,
+    # so the CSV twin can no longer collide with it no matter how many
+    # times this fetch step runs before the build step does.
+    csv_export_dir = RAW_DIR / "csv_export"
+    csv_export_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_export_dir / f"{form_id}.csv"
     writer = None
     try:
         pf = pq.ParquetFile(source_path)
