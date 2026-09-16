@@ -1,0 +1,85 @@
+import sys
+
+
+def apply(path, old, new, label):
+    with open(path, "r", newline="") as f:
+        text = f.read()
+    if old not in text:
+        print(f"ERROR: anchor not found verbatim in {path} ({label}) -- aborting, no changes made to this file.")
+        sys.exit(1)
+    if text.count(old) > 1:
+        print(f"ERROR: anchor found {text.count(old)} times in {path} ({label}) -- not unique, aborting.")
+        sys.exit(1)
+    text = text.replace(old, new)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+    print(f"Patched {path} ({label})")
+
+
+path = "scripts/Fetch_im_data.py"
+
+apply(
+    path,
+    '''    df = extract_gps_components(df)
+    return df
+''',
+    '''    df = extract_gps_components(df)
+
+    # Cast every column that isn't a known high-cardinality system field
+    # (see _is_high_cardinality_field) to pandas' 'category' dtype. See
+    # _read_parquet_low_memory()'s docstring for the full rationale and
+    # the measured ~13x memory reduction on form 4498's real data -- the
+    # short version is that most columns here are repetitive survey
+    # answers, and category dtype stores each distinct value once instead
+    # of once per row.
+    for col in df.columns:
+        if not _is_high_cardinality_field(col):
+            df[col] = df[col].astype("category")
+
+    return df
+''',
+    "categorize low-cardinality columns in build_dataframe_from_records",
+)
+
+apply(
+    path,
+    '''    try:
+        existing_df = pd.read_parquet(existing_path)
+    except Exception as e:
+        detail(f"[WARNING] Form {form_id} | Could not read existing Parquet for merge: {e}")
+        return None
+''',
+    '''    try:
+        existing_df = _read_parquet_low_memory(existing_path)
+    except Exception as e:
+        detail(f"[WARNING] Form {form_id} | Could not read existing Parquet for merge: {e}")
+        return None
+''',
+    "use _read_parquet_low_memory in save_incremental",
+)
+
+apply(
+    path,
+    '''        for col in combined.columns:
+            series = combined[col]
+            if series.isna().any():
+                series = series.fillna("")
+            combined[col] = series.astype(str)
+''',
+    '''        for col in combined.columns:
+            series = combined[col]
+            if isinstance(series.dtype, pd.CategoricalDtype):
+                if series.isna().any():
+                    if "" not in series.cat.categories:
+                        series = series.cat.add_categories([""])
+                    series = series.fillna("")
+                combined[col] = series
+            else:
+                if series.isna().any():
+                    series = series.fillna("")
+                combined[col] = series.astype(str)
+''',
+    "skip astype(str) for categorical columns after concat",
+)
+
+print("All 3 patches applied successfully.")

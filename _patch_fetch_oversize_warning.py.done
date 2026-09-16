@@ -1,0 +1,66 @@
+import sys
+
+
+def apply(path, old, new, label):
+    with open(path, "r", newline="") as f:
+        text = f.read()
+    if old not in text:
+        print(f"ERROR: anchor not found verbatim in {path} ({label}) -- aborting, no changes made to this file.")
+        sys.exit(1)
+    if text.count(old) > 1:
+        print(f"ERROR: anchor found {text.count(old)} times in {path} ({label}) -- not unique, aborting.")
+        sys.exit(1)
+    text = text.replace(old, new)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+    print(f"Patched {path} ({label})")
+
+
+path = "scripts/Fetch_im_data.py"
+
+# Surface a clear, visible warning (console(), not detail() -- console()
+# output is what actually shows up in what gets pasted/reviewed after a
+# Connect Cloud run, detail() only goes to the log file) when a form's
+# existing data has grown large enough that the incremental merge below
+# is genuinely at risk of the container's memory ceiling, even after the
+# category/Arrow-dtype optimizations above. This can't PREVENT a hard
+# OOM-kill (SIGKILL/exit 137 is uncatchable, see the module-level notes on
+# this), but a form actually is at risk deserves a clear, actionable
+# console message instead of a silent crash with no explanation.
+apply(
+    path,
+    '''    try:
+        existing_df = _read_parquet_low_memory(existing_path)
+    except Exception as e:
+        detail(f"[WARNING] Form {form_id} | Could not read existing Parquet for merge: {e}")
+        return None
+
+    new_df = build_dataframe_from_records(new_data)
+''',
+    '''    try:
+        existing_df = _read_parquet_low_memory(existing_path)
+    except Exception as e:
+        detail(f"[WARNING] Form {form_id} | Could not read existing Parquet for merge: {e}")
+        return None
+
+    # 500,000 rows is well above every other form seen in this pipeline's
+    # real data except form 4498 (1.12M rows) -- flagging it here means
+    # that if the merge below DOES get OOM-killed, the log clearly points
+    # at "this specific form is huge" instead of leaving the crash to look
+    # unexplained.
+    if len(existing_df) > 500_000:
+        console(
+            f"   [MEM] Form {form_id} | existing data is {len(existing_df):,} rows -- "
+            f"large enough that the incremental merge below may approach the "
+            f"container's memory limit even after the category/Arrow-dtype "
+            f"optimizations. If this run gets killed (exit 137) right after "
+            f"this message, that's what's happening; see the peak-RSS lines "
+            f"around it for how close it got."
+        )
+
+    new_df = build_dataframe_from_records(new_data)
+''',
+    "warn when a form's existing data is large enough to be an OOM risk",
+)
+
+print("Patch applied successfully.")

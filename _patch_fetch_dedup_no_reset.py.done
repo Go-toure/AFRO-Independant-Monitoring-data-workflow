@@ -1,0 +1,46 @@
+import sys
+
+
+def apply(path, old, new, label):
+    with open(path, "r", newline="") as f:
+        text = f.read()
+    if old not in text:
+        print(f"ERROR: anchor not found verbatim in {path} ({label}) -- aborting, no changes made to this file.")
+        sys.exit(1)
+    if text.count(old) > 1:
+        print(f"ERROR: anchor found {text.count(old)} times in {path} ({label}) -- not unique, aborting.")
+        sys.exit(1)
+    text = text.replace(old, new)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+    print(f"Patched {path} ({label})")
+
+
+path = "scripts/Fetch_im_data.py"
+
+apply(
+    path,
+    '''        combined = combined.drop_duplicates(subset=["_id"], keep="last").reset_index(drop=True)
+''',
+    '''        # NOT chained as .drop_duplicates(...).reset_index(...) -- in that
+        # form, Python has to finish evaluating the whole right-hand side
+        # (drop_duplicates' result, THEN reset_index's result) before the
+        # assignment to `combined` takes effect, so the pre-dedup
+        # `combined`, the deduplicated copy, AND the reset-index copy can
+        # all be alive at once (up to 3x a wide form's memory). Assigning
+        # after drop_duplicates alone lets the pre-dedup copy be freed
+        # immediately, before reset_index ever runs.
+        #
+        # reset_index(drop=True) is also just skipped entirely below: the
+        # only place `combined` goes from here is write_parquet_and_metadata()
+        # -> df.to_parquet(..., index=False), which never looks at the
+        # index's values, so paying for a whole extra full-DataFrame copy
+        # just to renumber an index nothing reads was pure waste -- on
+        # form 10267's real 167k-row data this alone accounted for
+        # another ~1.5 GB of peak memory that was never needed.
+        combined = combined.drop_duplicates(subset=["_id"], keep="last")
+''',
+    "split drop_duplicates from reset_index and drop the unneeded reset_index call",
+)
+
+print("Patch applied successfully.")

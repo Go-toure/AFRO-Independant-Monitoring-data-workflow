@@ -1,0 +1,103 @@
+import sys
+
+
+def apply(path, old, new, label):
+    with open(path, "r", newline="") as f:
+        text = f.read()
+    if old not in text:
+        print(f"ERROR: anchor not found verbatim in {path} ({label}) -- aborting, no changes made to this file.")
+        sys.exit(1)
+    if text.count(old) > 1:
+        print(f"ERROR: anchor found {text.count(old)} times in {path} ({label}) -- not unique, aborting.")
+        sys.exit(1)
+    text = text.replace(old, new)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+    print(f"Patched {path} ({label})")
+
+
+path = "scripts/Fetch_im_data.py"
+
+# 1) The ~61 high-cardinality columns (IDs, timestamps, GPS) can't benefit
+#    from category dtype, but they were still being decoded into plain
+#    pandas object dtype -- one boxed Python string per cell. Measured
+#    directly against form 4498's real high-cardinality columns: that's
+#    4,235 MB total; decoding the same columns straight into pandas'
+#    Arrow-backed string dtype (via to_pandas(types_mapper=pd.ArrowDtype),
+#    which keeps Arrow's own compact buffer instead of exploding it into
+#    per-cell Python objects) needs only 758 MB for the same data -- a
+#    5.6x reduction on exactly the columns category dtype can't help.
+apply(
+    path,
+    '''        table = pq.read_table(
+            path, columns=[col], read_dictionary=read_dictionary, use_threads=False
+        )
+        series = table.column(0).to_pandas()
+        series.index = df.index
+
+        if low_cardinality:
+            series = series.astype("category")
+''',
+    '''        table = pq.read_table(
+            path, columns=[col], read_dictionary=read_dictionary, use_threads=False
+        )
+
+        if low_cardinality:
+            series = table.column(0).to_pandas()
+            series = series.astype("category")
+        else:
+            # Arrow-backed dtype instead of plain to_pandas() (which would
+            # box every value as a separate Python string object) -- see
+            # the comment above this function's read_dictionary branch for
+            # the measured 5.6x reduction this gives on form 4498's real
+            # high-cardinality columns.
+            series = table.column(0).to_pandas(types_mapper=pd.ArrowDtype)
+
+        series.index = df.index
+''',
+    "decode high-cardinality columns as Arrow-backed dtype instead of object",
+)
+
+# 2) The post-concat fillna/cast loop must not call .astype(str) on an
+#    Arrow-backed string column either -- exactly like the categorical
+#    case above it, that throws away the compact Arrow buffer and
+#    rebuilds a full one-Python-string-object-per-cell array (confirmed
+#    directly: Series.astype(str) on an ArrowDtype string series produces
+#    plain object dtype). fillna("") is natively supported and stays
+#    Arrow-backed, so that's all this branch needs to do.
+apply(
+    path,
+    '''        for col in combined.columns:
+            series = combined[col]
+            if isinstance(series.dtype, pd.CategoricalDtype):
+                if series.isna().any():
+                    if "" not in series.cat.categories:
+                        series = series.cat.add_categories([""])
+                    series = series.fillna("")
+                combined[col] = series
+            else:
+                if series.isna().any():
+                    series = series.fillna("")
+                combined[col] = series.astype(str)
+''',
+    '''        for col in combined.columns:
+            series = combined[col]
+            if isinstance(series.dtype, pd.CategoricalDtype):
+                if series.isna().any():
+                    if "" not in series.cat.categories:
+                        series = series.cat.add_categories([""])
+                    series = series.fillna("")
+                combined[col] = series
+            elif isinstance(series.dtype, pd.ArrowDtype):
+                if series.isna().any():
+                    series = series.fillna("")
+                combined[col] = series
+            else:
+                if series.isna().any():
+                    series = series.fillna("")
+                combined[col] = series.astype(str)
+''',
+    "skip astype(str) for Arrow-backed columns after concat too",
+)
+
+print("All 2 patches applied successfully.")

@@ -1,0 +1,58 @@
+import sys
+
+
+def apply(path, old, new, label):
+    with open(path, "r", newline="") as f:
+        text = f.read()
+    if old not in text:
+        print(f"ERROR: anchor not found verbatim in {path} ({label}) -- aborting, no changes made to this file.")
+        sys.exit(1)
+    if text.count(old) > 1:
+        print(f"ERROR: anchor found {text.count(old)} times in {path} ({label}) -- not unique, aborting.")
+        sys.exit(1)
+    text = text.replace(old, new)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+    print(f"Patched {path} ({label})")
+
+
+path = "scripts/Fetch_im_data.py"
+
+# 1) import pyarrow (top-level, for pa.string()) alongside the existing
+#    pyarrow.parquet import -- needed so build_dataframe_from_records()
+#    can cast its high-cardinality columns to the exact same Arrow-backed
+#    dtype _read_parquet_low_memory() decodes existing data into. Without
+#    this, new_df's high-cardinality columns stay plain object dtype while
+#    existing_df's are Arrow-backed, and pd.concat() unifies a mismatched
+#    pair by falling back to object dtype for that column -- silently
+#    throwing away the memory savings on exactly the columns that need
+#    them most.
+apply(
+    path,
+    "import pandas as pd\nimport pyarrow.parquet as pq\nimport gc\n",
+    "import pandas as pd\nimport pyarrow as pa\nimport pyarrow.parquet as pq\nimport gc\n",
+    "add import pyarrow as pa",
+)
+
+# 2) Cast build_dataframe_from_records()'s high-cardinality columns to the
+#    same Arrow-backed string dtype for the reason above.
+apply(
+    path,
+    '''    for col in df.columns:
+        if not _is_high_cardinality_field(col):
+            df[col] = df[col].astype("category")
+
+    return df
+''',
+    '''    for col in df.columns:
+        if not _is_high_cardinality_field(col):
+            df[col] = df[col].astype("category")
+        else:
+            df[col] = df[col].astype(pd.ArrowDtype(pa.string()))
+
+    return df
+''',
+    "cast high-cardinality columns to Arrow-backed string dtype in build_dataframe_from_records",
+)
+
+print("All 2 patches applied successfully.")

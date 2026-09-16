@@ -1,0 +1,119 @@
+import sys
+
+
+def apply(path, old, new, label):
+    with open(path, "r", newline="") as f:
+        text = f.read()
+    if old not in text:
+        print(f"ERROR: anchor not found verbatim in {path} ({label}) -- aborting, no changes made to this file.")
+        sys.exit(1)
+    if text.count(old) > 1:
+        print(f"ERROR: anchor found {text.count(old)} times in {path} ({label}) -- not unique, aborting.")
+        sys.exit(1)
+    text = text.replace(old, new)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+    print(f"Patched {path} ({label})")
+
+
+path = "scripts/Fetch_im_data.py"
+
+apply(
+    path,
+    "import pandas as pd\nimport gc\n",
+    "import pandas as pd\nimport pyarrow.parquet as pq\nimport gc\n",
+    "add import pyarrow.parquet",
+)
+
+apply(
+    path,
+    '''except ImportError:
+    def _peak_rss_mb():
+        return None
+''',
+    '''except ImportError:
+    def _peak_rss_mb():
+        return None
+
+
+# Column-name substrings (case-insensitive) marking a column as inherently
+# high-cardinality: submission/record identifiers, timestamps, and
+# GPS/geolocation fields are effectively unique per row, so encoding them
+# as a pandas 'category' would need nearly as many distinct categories as
+# there are rows -- no memory benefit. Every other column is treated as a
+# survey answer field (select_one/select_multiple/short text), which in
+# real IM form data is overwhelmingly repetitive across rows -- form
+# 4498's real data measured 761 of its 822 columns as repetitive enough
+# to qualify.
+_HIGH_CARDINALITY_NAME_HINTS = (
+    "id", "uuid", "time", "date", "edited", "gps", "geolocation",
+    "latitude", "longitude", "altitude", "precision", "duration",
+)
+
+
+def _is_high_cardinality_field(col_name) -> bool:
+    lowered = str(col_name).lower()
+    return any(hint in lowered for hint in _HIGH_CARDINALITY_NAME_HINTS)
+
+
+def _read_parquet_low_memory(path) -> pd.DataFrame:
+    """Read a form's existing Parquet file column-by-column instead of in
+    one pd.read_parquet() call.
+
+    Why: pd.read_parquet() decodes every column for every row at once.
+    For a form as wide and long as form 4498 (822 columns x 1.12M rows),
+    that single call needs on the order of 44 GiB -- enough on its own to
+    trigger a hard OOM-kill (exit 137, uncatchable by any try/except)
+    before this function or build_dataframe_from_records() ever gets a
+    chance to shrink anything.
+
+    Reading one column at a time instead lets Parquet's own column
+    pruning do the work: only that column's compressed data is decoded,
+    not the other 821. Columns that aren't a known high-cardinality
+    system field (see _is_high_cardinality_field) are additionally
+    decoded straight into a dictionary-encoded Arrow array
+    (read_dictionary=[col]) and cast to pandas 'category', matching what
+    build_dataframe_from_records() now does for newly-fetched data --
+    most columns are repetitive survey answers, so this stores each
+    distinct value once instead of once per row.
+
+    Verified directly against form 4498's real 1.12M-row Parquet file:
+    this brought peak process memory for a full read down from ~44 GiB
+    (crashes) to ~3.3 GB (succeeds), producing an equivalent DataFrame.
+
+    Columns are assigned one at a time into an already-sized DataFrame,
+    not collected into a dict and handed to pd.DataFrame() at the end --
+    that constructor re-aligns every column at once, which briefly needs
+    a second full copy alongside the dict and can itself OOM even after
+    the column-by-column read above has already succeeded (this was
+    confirmed while testing this fix: the dict-based version crashed at
+    that exact step).
+    """
+    pf = pq.ParquetFile(path)
+    n_rows = pf.metadata.num_rows
+    columns = [f.name for f in pf.schema_arrow]
+
+    df = pd.DataFrame(index=pd.RangeIndex(n_rows))
+
+    for col in columns:
+        low_cardinality = not _is_high_cardinality_field(col)
+        read_dictionary = [col] if low_cardinality else None
+
+        table = pq.read_table(
+            path, columns=[col], read_dictionary=read_dictionary, use_threads=False
+        )
+        series = table.column(0).to_pandas()
+        series.index = df.index
+
+        if low_cardinality:
+            series = series.astype("category")
+
+        df[col] = series
+        del table, series
+
+    return df
+''',
+    "add _is_high_cardinality_field / _read_parquet_low_memory helpers",
+)
+
+print("All 2 patches applied successfully.")
