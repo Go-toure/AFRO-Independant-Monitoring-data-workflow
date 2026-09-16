@@ -272,3 +272,22 @@ def _upload_large_file(token: str, drive_id: str, local_path: Path, remote_path:
         return False
     except OSError:
         return False
+
+
+def delete_item(token: str, drive_id: str, item_path: str) -> bool:
+    """Delete an item (file, or a folder and everything under it) by its
+    path, relative to the library root. Returns True once it's gone --
+    including when it was already absent, so a caller doesn't need to
+    check existence first -- and False only on a real failure. Never
+    raises. Deleting through Graph goes to SharePoint's own recycle bin
+    the same as deleting it by hand in the browser, so this is
+    recoverable, not a permanent destroy."""
+    try:
+        url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{item_path}"
+        r = requests.delete(url, headers=_auth(token), timeout=60)
+        if r.status_code in (204, 404):
+            return True
+        r.raise_for_status()
+        return True
+    except requests.exceptions.RequestException:
+        return False

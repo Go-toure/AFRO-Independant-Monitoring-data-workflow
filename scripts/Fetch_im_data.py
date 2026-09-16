@@ -1223,9 +1223,9 @@ def _merge_incremental_isolated(
         detail(f"Form {form_id} | Launching isolated merge subprocess: {cmd}")
 
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
         except subprocess.TimeoutExpired:
-            console(f"   \u26a0\ufe0f  Form {form_id} | Isolated merge subprocess timed out after 10 minutes.")
+            console(f"   \u26a0\ufe0f  Form {form_id} | Isolated merge subprocess timed out after 20 minutes.")
             detail(f"Form {form_id} | Isolated merge subprocess timed out.")
             return None
 
@@ -1312,28 +1312,178 @@ def _is_form_partitioned(form_id: int) -> bool:
     return _migration_marker_path(form_id).exists()
 
 
+def _sp_partition_folder(form_id: int) -> str:
+    """SharePoint subfolder holding one form's year-partition files and
+    completion marker -- kept separate from SP_RAW_FOLDER's own root
+    (where only the single combined {form_id}.parquet + metadata live)
+    so a plain listing of the raw-state folder doesn't get cluttered
+    with per-year files for every partitioned form."""
+    return f"{SP_RAW_FOLDER}/partitions/{form_id}"
+
+
+def _upload_partitions_to_sharepoint(form_id: int) -> None:
+    """Push this form's year-partition files and completion marker to
+    SharePoint, right after a successful recombine -- mirrors
+    upload_raw_to_sharepoint()'s existing pattern for the combined file,
+    but for the partition files themselves.
+
+    Without this, a completed migration only ever lived on the one
+    container's local disk that happened to run it. Every other
+    container (which on Connect Cloud means practically every run --
+    see _recover_partitions_from_sharepoint()'s docstring) would see no
+    local partition directory, conclude the form isn't partitioned yet,
+    and redo the full multi-minute local migration from scratch every
+    single time -- which is exactly what caused form 4498's isolated
+    merge subprocess to time out at 10 minutes on a fresh container
+    despite the exact same migration finishing comfortably inside that
+    budget once before. Persisting the partition files here is what
+    makes "migration only really happens once" actually true across
+    container restarts, not just true on one person's laptop.
+
+    Uploads the completion marker LAST, and only once every partition
+    file has already uploaded successfully -- same crash-safety
+    ordering as the local write side (see _is_form_partitioned()'s
+    docstring): a SharePoint listing that shows the marker must be able
+    to trust that every partition file behind it is actually there too.
+    Never raises -- same best-effort contract as the rest of this
+    SharePoint layer; a failure here just means the next fresh
+    container redoes the local migration instead of recovering it,
+    exactly as if this function didn't exist."""
+    token, drive_id = _get_sp_session()
+    if not token:
+        return
+
+    if not _is_form_partitioned(form_id):
+        return
+
+    partition_dir = _partition_dir(form_id)
+    remote_folder = _sp_partition_folder(form_id)
+    sp.ensure_folder(token, drive_id, remote_folder)
+
+    partition_files = sorted(partition_dir.glob(f"{form_id}_*.parquet"))
+    ok = True
+    for p in partition_files:
+        ok = sp.upload_file(token, drive_id, p, f"{remote_folder}/{p.name}") and ok
+
+    marker_path = _migration_marker_path(form_id)
+    if ok and marker_path.exists():
+        ok = sp.upload_file(token, drive_id, marker_path, f"{remote_folder}/{marker_path.name}") and ok
+
+    if ok:
+        detail(f"[sharepoint] Form {form_id} | {len(partition_files)} year partition(s) + completion marker synced to SharePoint.")
+    else:
+        detail(f"[sharepoint] Form {form_id} | WARNING: partition sync to SharePoint failed (kept local copy only; a future run will retry).")
+
+
+def _recover_partitions_from_sharepoint(form_id: int) -> bool:
+    """Best-effort attempt to restore an already-completed year-partition
+    migration from SharePoint instead of redoing the expensive local
+    migration from scratch -- the read-side counterpart to
+    _upload_partitions_to_sharepoint(). See that function's docstring
+    for why this matters: on Connect Cloud, a fresh container's local
+    disk never has this form's partition directory on its own, only
+    whatever sync_missing_forms_from_sharepoint() already recovered (the
+    single combined {form_id}.parquet), so without this, every run pays
+    the full migration cost forever, not just once.
+
+    Returns True only if a complete set (the completion marker AND every
+    partition file behind it) was found on SharePoint and downloaded
+    successfully. Checks for the marker FIRST and bails out immediately
+    if it's missing, without downloading any partition files -- an
+    interrupted upload that never got as far as writing the marker (see
+    _upload_partitions_to_sharepoint()) must never be mistaken for a
+    complete one. Returns False in every other case (nothing there yet,
+    a partial/failed upload from some earlier run, or any download
+    failure here), leaving the caller to redo the full local migration
+    exactly as if this function didn't exist. Never raises."""
+    token, drive_id = _get_sp_session()
+    if not token:
+        return False
+
+    remote_folder = _sp_partition_folder(form_id)
+    remote_items = sp.list_folder(token, drive_id, remote_folder)
+    remote_names = {item["name"] for item in remote_items}
+
+    marker_name = "_MIGRATION_COMPLETE"
+    if marker_name not in remote_names:
+        return False
+
+    partition_names = sorted(
+        n for n in remote_names if n.startswith(f"{form_id}_") and n.endswith(".parquet")
+    )
+    if not partition_names:
+        return False
+
+    partition_dir = _partition_dir(form_id)
+    partition_dir.mkdir(parents=True, exist_ok=True)
+
+    for name in partition_names:
+        ok = sp.download_file(token, drive_id, f"{remote_folder}/{name}", partition_dir / name)
+        if not ok:
+            detail(
+                f"[sharepoint] Form {form_id} | Partition recovery failed downloading "
+                f"{name} -- falling back to full local migration."
+            )
+            return False
+
+    marker_ok = sp.download_file(
+        token, drive_id, f"{remote_folder}/{marker_name}", partition_dir / marker_name
+    )
+    if not marker_ok:
+        detail(
+            f"[sharepoint] Form {form_id} | Partition recovery failed downloading the "
+            f"completion marker -- falling back to full local migration."
+        )
+        return False
+
+    detail(
+        f"[sharepoint] Form {form_id} | Recovered {len(partition_names)} year partition(s) "
+        f"+ completion marker from SharePoint -- skipping local migration."
+    )
+    return True
+
+
 def _clear_stale_partitions(form_id: int) -> None:
     """Remove a form's entire year-partition directory (including the
-    completion marker) after a FULL fetch has just overwritten its
-    combined Parquet file directly (see save_to_parquet()). A full fetch
-    bypasses save_incremental() / _save_incremental_partitioned()
-    entirely, so any partition files left over from before it now
-    describe data that no longer matches the fresh combined file -- if
-    left in place, the next incremental run would see
-    _is_form_partitioned() return True, skip re-migrating, and merge new
-    data into (then recombine from) those now-STALE partitions, silently
-    overwriting the fresh full-fetch data with an outdated
-    reconstruction. Removing the whole directory (not just the marker)
-    means the next incremental run (if the form is still over
+    completion marker), both locally AND on SharePoint, after a FULL
+    fetch has just overwritten its combined Parquet file directly (see
+    save_to_parquet()). A full fetch bypasses save_incremental() /
+    _save_incremental_partitioned() entirely, so any partition files
+    left over from before it now describe data that no longer matches
+    the fresh combined file -- if left in place, the next incremental
+    run would see _is_form_partitioned() return True (locally) or
+    _recover_partitions_from_sharepoint() succeed (from SharePoint), and
+    merge new data into (then recombine from) those now-STALE
+    partitions, silently overwriting the fresh full-fetch data with an
+    outdated reconstruction.
+
+    The SharePoint half of this matters just as much as the local half:
+    a full fetch commonly runs on a container with no local partition
+    directory to begin with (nothing to clean up there), while
+    SharePoint still has the last container's completed migration sitting
+    in _sp_partition_folder(form_id) -- if only the local copy were
+    cleared, the very next incremental run would happily "recover" that
+    stale SharePoint copy right back, defeating the point entirely. Both
+    sides are cleared unconditionally (not gated on the other existing)
+    so either one being stale on its own still gets caught.
+
+    Removing the whole directory/folder (not just the marker) on both
+    sides means the next incremental run (if the form is still over
     _PARTITION_ROW_THRESHOLD) correctly re-migrates from the fresh
     combined file instead."""
     partition_dir = _partition_dir(form_id)
-    if not partition_dir.is_dir():
-        return
-    try:
-        shutil.rmtree(partition_dir)
-    except Exception as e:
-        detail(f"[WARNING] Form {form_id} | Could not remove stale partition directory: {e}")
+    if partition_dir.is_dir():
+        try:
+            shutil.rmtree(partition_dir)
+        except Exception as e:
+            detail(f"[WARNING] Form {form_id} | Could not remove stale local partition directory: {e}")
+
+    token, drive_id = _get_sp_session()
+    if token:
+        if sp.delete_item(token, drive_id, _sp_partition_folder(form_id)):
+            detail(f"[sharepoint] Form {form_id} | Cleared stale partition folder on SharePoint (if any existed).")
+        else:
+            detail(f"[sharepoint] Form {form_id} | WARNING: could not clear stale partition folder on SharePoint.")
 
 
 def _submission_year(value) -> str:
@@ -1707,6 +1857,7 @@ def _recombine_year_partitions(
     )
 
     upload_raw_to_sharepoint(form_id)
+    _upload_partitions_to_sharepoint(form_id)
 
     return metadata
 
@@ -1732,7 +1883,7 @@ def _save_incremental_partitioned(
     """
     existing_path = RAW_DIR / f"{form_id}.parquet"
 
-    if not _is_form_partitioned(form_id):
+    if not _is_form_partitioned(form_id) and not _recover_partitions_from_sharepoint(form_id):
         detail(
             f"Form {form_id} | Existing data has grown past the "
             f"{_PARTITION_ROW_THRESHOLD:,}-row safety threshold -- migrating "
