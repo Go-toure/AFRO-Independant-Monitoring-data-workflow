@@ -1,0 +1,158 @@
+import sys
+
+
+def apply(path, old, new, label):
+    with open(path, "r", newline="") as f:
+        text = f.read()
+    if old not in text:
+        print(f"ERROR: anchor not found verbatim in {path} ({label}) -- aborting, no changes made to this file.")
+        sys.exit(1)
+    if text.count(old) > 1:
+        print(f"ERROR: anchor found {text.count(old)} times in {path} ({label}) -- not unique, aborting.")
+        sys.exit(1)
+    text = text.replace(old, new)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+    print(f"Patched {path} ({label})")
+
+
+path = "scripts/Fetch_im_data.py"
+
+# 1) New imports: subprocess (to spawn the isolated child) and tempfile
+#    (scratch files to hand it its input/output without reusing this
+#    script's own stdout, which is also the live progress log).
+apply(
+    path,
+    "import time\nimport argparse\nimport requests\n",
+    "import time\nimport argparse\nimport subprocess\nimport tempfile\nimport requests\n",
+    "add subprocess/tempfile imports",
+)
+
+# 2) Remove the earlier oversized-form console warning inside
+#    save_incremental() -- process_one_form() now prints an equivalent
+#    (and more actionable) message right before deciding whether to
+#    isolate the merge, so this one would just be a redundant near-copy
+#    sitting one function away.
+apply(
+    path,
+    '''    # 500,000 rows is well above every other form seen in this pipeline's
+    # real data except form 4498 (1.12M rows) -- flagging it here means
+    # that if the merge below DOES get OOM-killed, the log clearly points
+    # at "this specific form is huge" instead of leaving the crash to look
+    # unexplained.
+    if len(existing_df) > 500_000:
+        console(
+            f"   [MEM] Form {form_id} | existing data is {len(existing_df):,} rows -- "
+            f"large enough that the incremental merge below may approach the "
+            f"container's memory limit even after the category/Arrow-dtype "
+            f"optimizations. If this run gets killed (exit 137) right after "
+            f"this message, that's what's happening; see the peak-RSS lines "
+            f"around it for how close it got."
+        )
+
+    new_df = build_dataframe_from_records(new_data)
+''',
+    '''    new_df = build_dataframe_from_records(new_data)
+''',
+    "remove now-redundant oversized-form warning inside save_incremental",
+)
+
+# 3) Isolation helper: run save_incremental() for one form in a fresh
+#    child process. Placed right after save_incremental() itself.
+apply(
+    path,
+    '''    return write_parquet_and_metadata(combined, form_id, meta_extra)
+''',
+    '''    return write_parquet_and_metadata(combined, form_id, meta_extra)
+
+
+# A form whose existing local copy has at least this many rows gets its
+# incremental merge run in an isolated child process instead of in this
+# one (see _merge_incremental_isolated() below). Every memory
+# optimization in save_incremental() / build_dataframe_from_records() /
+# _read_parquet_low_memory() above still applies inside that child --
+# this is a SECOND, independent layer of defense: if a form is so large
+# that even those optimizations aren't enough and the merge gets
+# OOM-killed anyway, isolating it in its own process means only that
+# child dies. Without this, the OS SIGKILL takes down this entire fetch
+# process -- uncatchable by any try/except, see the module-level notes
+# on that -- and every form still queued behind the huge one (form 4498
+# is #12 of 35) never even gets attempted for the rest of that run.
+_ISOLATE_MERGE_ROW_THRESHOLD = 500_000
+
+
+def _merge_incremental_isolated(
+    form_id: int,
+    new_data: List[Dict],
+    previous_metadata: Dict
+) -> Optional[Dict]:
+    """Run save_incremental() for one form in a fresh child process and
+    report a clean failure (returning None) if that child gets
+    OOM-killed, instead of letting the kill take this whole fetch run
+    down with it.
+
+    Talks to the child through three small temp JSON files (new data,
+    previous metadata, result) rather than the child's stdout, since this
+    script's stdout doubles as the live progress log Connect Cloud shows
+    while the run is in progress.
+    """
+    with tempfile.TemporaryDirectory(prefix=f"im_merge_{form_id}_") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        new_data_path = tmp_path / "new_data.json"
+        metadata_path = tmp_path / "previous_metadata.json"
+        result_path = tmp_path / "result.json"
+
+        with open(new_data_path, "w", encoding="utf-8") as f:
+            json.dump(new_data, f, ensure_ascii=False)
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(previous_metadata, f, ensure_ascii=False)
+
+        cmd = [
+            sys.executable, str(Path(__file__).resolve()),
+            "--base-dir", str(BASE_DIR),
+            "--internal-merge-form", str(form_id),
+            "--new-data-file", str(new_data_path),
+            "--previous-metadata-file", str(metadata_path),
+            "--result-file", str(result_path),
+        ]
+
+        detail(f"Form {form_id} | Launching isolated merge subprocess: {cmd}")
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            console(f"   \\u26a0\\ufe0f  Form {form_id} | Isolated merge subprocess timed out after 10 minutes.")
+            detail(f"Form {form_id} | Isolated merge subprocess timed out.")
+            return None
+
+        if proc.returncode != 0:
+            if proc.returncode < 0:
+                console(
+                    f"   \\u26a0\\ufe0f  Form {form_id} | Isolated merge subprocess was killed "
+                    f"(signal {-proc.returncode}, almost certainly an out-of-memory kill) -- "
+                    f"this form's existing data is untouched and the {len(new_data):,} new "
+                    f"record(s) will be retried next run. The rest of this fetch continues normally."
+                )
+            else:
+                console(
+                    f"   \\u26a0\\ufe0f  Form {form_id} | Isolated merge subprocess failed "
+                    f"(exit {proc.returncode}) -- see logs/fetch_log.txt for its output."
+                )
+            detail(
+                f"Form {form_id} | Isolated merge subprocess returncode={proc.returncode}\\n"
+                f"--- child stdout (last 4000 chars) ---\\n{proc.stdout[-4000:]}\\n"
+                f"--- child stderr (last 4000 chars) ---\\n{proc.stderr[-4000:]}"
+            )
+            return None
+
+        if not result_path.exists():
+            detail(f"Form {form_id} | Isolated merge subprocess exited 0 but wrote no result file.")
+            return None
+
+        with open(result_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+''',
+    "add _merge_incremental_isolated helper",
+)
+
+print("All 3 patches applied successfully.")

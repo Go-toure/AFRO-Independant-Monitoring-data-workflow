@@ -1,0 +1,145 @@
+import sys
+
+
+def apply(path, old, new, label):
+    with open(path, "r", newline="") as f:
+        text = f.read()
+    if old not in text:
+        print(f"ERROR: anchor not found verbatim in {path} ({label}) -- aborting, no changes made to this file.")
+        sys.exit(1)
+    if text.count(old) > 1:
+        print(f"ERROR: anchor found {text.count(old)} times in {path} ({label}) -- not unique, aborting.")
+        sys.exit(1)
+    text = text.replace(old, new)
+    with open(path, "w", newline="") as f:
+        f.write(text)
+    print(f"Patched {path} ({label})")
+
+
+path = "scripts/Fetch_im_data.py"
+
+# process_one_form(): route the merge through the isolated subprocess for
+# oversized forms, and treat an isolated-merge failure as "leave existing
+# data alone, retry next run" rather than the generic "fall back to full
+# fetch" -- for a form this large, a full fetch would very likely hit the
+# exact same memory ceiling (or worse, since fetch_all_data() would also
+# have to hold the form's entire raw record list in memory).
+apply(
+    path,
+    '''    peak_mb = _peak_rss_mb()
+    if peak_mb is not None:
+        console(f"   [MEM] Peak RSS before merging form {form_id}: {peak_mb:,.0f} MB")
+
+    metadata = save_incremental(form_id, new_data, previous_metadata)
+
+    if metadata is None:
+        console(
+            f"   \u26a0\ufe0f  Form {form_id} | Could not safely merge "
+            f"{len(new_data):,} new record(s); running full fetch instead."
+        )
+        detail(f"Form {form_id} | Incremental merge failed \u2014 falling back to full.")
+        return run_full_fetch_and_record(
+            form_id, i, total_forms, args.page_size,
+            results, total_records, total_size_mb
+        )
+''',
+    '''    peak_mb = _peak_rss_mb()
+    if peak_mb is not None:
+        console(f"   [MEM] Peak RSS before merging form {form_id}: {peak_mb:,.0f} MB")
+
+    existing_row_count = previous_metadata.get("records", 0)
+    isolate_merge = existing_row_count > _ISOLATE_MERGE_ROW_THRESHOLD
+
+    if isolate_merge:
+        console(
+            f"   [MEM] Form {form_id} | existing data is {existing_row_count:,} rows -- "
+            f"running this merge in an isolated subprocess so an out-of-memory kill "
+            f"here can't take down the rest of this fetch run."
+        )
+        metadata = _merge_incremental_isolated(form_id, new_data, previous_metadata)
+    else:
+        metadata = save_incremental(form_id, new_data, previous_metadata)
+
+    if metadata is None:
+        if isolate_merge:
+            # Already logged above (with the specific reason, e.g. an
+            # OOM-kill) by _merge_incremental_isolated().
+            detail(f"Form {form_id} | Isolated incremental merge failed -- leaving existing data untouched, will retry next run.")
+            results.append({
+                "form_id": form_id, "status": "failed_isolated_merge",
+                "records": existing_row_count, "new_records": 0,
+                "size_mb": round(output_path.stat().st_size / (1024 * 1024), 2)
+                    if output_path.exists() else 0,
+                "path": str(output_path)
+            })
+            return total_records, total_size_mb
+
+        console(
+            f"   \u26a0\ufe0f  Form {form_id} | Could not safely merge "
+            f"{len(new_data):,} new record(s); running full fetch instead."
+        )
+        detail(f"Form {form_id} | Incremental merge failed \u2014 falling back to full.")
+        return run_full_fetch_and_record(
+            form_id, i, total_forms, args.page_size,
+            results, total_records, total_size_mb
+        )
+''',
+    "route oversized-form merges through the isolated subprocess in process_one_form",
+)
+
+# argparse: internal-only flags for the child process invocation.
+apply(
+    path,
+    '''    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=10000,
+        help="Number of records per API page. Default: 10000"
+    )
+
+    args = parser.parse_args()
+
+    create_workflow_folders()
+''',
+    '''    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=10000,
+        help="Number of records per API page. Default: 10000"
+    )
+
+    # Internal-only flags used when this script re-invokes itself as the
+    # isolated merge child spawned by _merge_incremental_isolated() --
+    # not meant to be passed by hand, hence argparse.SUPPRESS.
+    parser.add_argument("--internal-merge-form", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--new-data-file", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--previous-metadata-file", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--result-file", default=None, help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+
+    create_workflow_folders()
+
+    if args.internal_merge_form is not None:
+        # This invocation IS the isolated child process -- do just this
+        # one form's merge and exit, skipping the normal 35-form pipeline
+        # entirely. See _merge_incremental_isolated()'s docstring.
+        with open(args.new_data_file, "r", encoding="utf-8") as f:
+            new_data = json.load(f)
+        with open(args.previous_metadata_file, "r", encoding="utf-8") as f:
+            previous_metadata = json.load(f)
+
+        result = save_incremental(args.internal_merge_form, new_data, previous_metadata)
+
+        if result is None:
+            sys.exit(1)
+
+        with open(args.result_file, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False)
+
+        sys.exit(0)
+''',
+    "add internal-merge-form CLI plumbing to main()",
+)
+
+print("All 2 patches applied successfully.")
