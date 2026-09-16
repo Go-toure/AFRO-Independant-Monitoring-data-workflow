@@ -47,6 +47,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+import shutil
 import gc
 
 try:
@@ -1280,43 +1281,59 @@ def _partition_path(form_id: int, year: str) -> Path:
     return _partition_dir(form_id) / f"{form_id}_{year}.parquet"
 
 
+# Row-group size used when writing partition files -- see
+# _recombine_year_partitions()'s docstring for why keeping this small
+# matters for that function's own memory footprint.
+_PARTITION_ROW_GROUP_SIZE = 20_000
+
+
+def _migration_marker_path(form_id: int) -> Path:
+    return _partition_dir(form_id) / "_MIGRATION_COMPLETE"
+
+
 def _is_form_partitioned(form_id: int) -> bool:
-    """True once a form has been migrated to year-partitioned storage.
-    Detected by the presence of its partition directory with at least
-    one partition file in it (not just an empty/leftover directory), so
-    a form is only ever treated as partitioned once the migration has
-    actually produced real partition files."""
-    partition_dir = _partition_dir(form_id)
-    if not partition_dir.is_dir():
-        return False
-    return any(partition_dir.glob(f"{form_id}_*.parquet"))
+    """True once a form has been FULLY migrated to year-partitioned
+    storage. Detected via an explicit completion marker file
+    (_MIGRATION_COMPLETE) written by _split_into_year_partitions() only
+    as its very last step -- NOT by checking whether any partition file
+    happens to exist. This matters: if a migration attempt gets
+    OOM-killed partway through writing partition files (as happened on
+    Connect Cloud with form 4498), an "any file exists" check could see
+    a PARTIAL set of year files (e.g. 2020-2022 written, 2023-2026
+    missing) and wrongly conclude the form is fully partitioned -- the
+    next run would then merge and recombine from that incomplete set,
+    silently losing every year that never got written. Requiring an
+    explicit marker written only after every year succeeds means a
+    crash at any point during migration is safely treated as "not yet
+    partitioned," and the whole thing retries cleanly from scratch next
+    time (see _split_into_year_partitions(), which also wipes the
+    partition directory before writing anything, for the other half of
+    this safety net)."""
+    return _migration_marker_path(form_id).exists()
 
 
 def _clear_stale_partitions(form_id: int) -> None:
-    """Remove any existing year-partition files for a form after a FULL
-    fetch has just overwritten its combined Parquet file directly (see
-    save_to_parquet()). A full fetch bypasses save_incremental() /
-    _save_incremental_partitioned() entirely, so any partition files left
-    over from before it now describe data that no longer matches the
-    fresh combined file -- if left in place, the next incremental run
-    would see _is_form_partitioned() return True, skip re-migrating, and
-    merge new data into (then recombine from) those now-STALE partitions,
-    silently overwriting the fresh full-fetch data with an outdated
-    reconstruction. Deleting them here means the next incremental run
-    (if the form is still over _PARTITION_ROW_THRESHOLD) correctly
-    re-migrates from the fresh combined file instead."""
+    """Remove a form's entire year-partition directory (including the
+    completion marker) after a FULL fetch has just overwritten its
+    combined Parquet file directly (see save_to_parquet()). A full fetch
+    bypasses save_incremental() / _save_incremental_partitioned()
+    entirely, so any partition files left over from before it now
+    describe data that no longer matches the fresh combined file -- if
+    left in place, the next incremental run would see
+    _is_form_partitioned() return True, skip re-migrating, and merge new
+    data into (then recombine from) those now-STALE partitions, silently
+    overwriting the fresh full-fetch data with an outdated
+    reconstruction. Removing the whole directory (not just the marker)
+    means the next incremental run (if the form is still over
+    _PARTITION_ROW_THRESHOLD) correctly re-migrates from the fresh
+    combined file instead."""
     partition_dir = _partition_dir(form_id)
     if not partition_dir.is_dir():
         return
-    for p in partition_dir.glob(f"{form_id}_*.parquet"):
-        try:
-            p.unlink()
-        except Exception as e:
-            detail(f"[WARNING] Form {form_id} | Could not remove stale partition file {p.name}: {e}")
     try:
-        partition_dir.rmdir()
-    except Exception:
-        pass  # not empty (unexpected leftover file) or already gone -- harmless either way
+        shutil.rmtree(partition_dir)
+    except Exception as e:
+        detail(f"[WARNING] Form {form_id} | Could not remove stale partition directory: {e}")
 
 
 def _submission_year(value) -> str:
@@ -1337,15 +1354,31 @@ def _submission_year(value) -> str:
     return "0000"
 
 
-def _write_partition_file(path: Path, df: pd.DataFrame) -> None:
-    """Write one year-partition's DataFrame straight to Parquet. No
-    metadata JSON and no SharePoint upload here -- those only happen
+def _write_partition_file(
+    path: Path,
+    df: pd.DataFrame,
+    row_group_size: int = _PARTITION_ROW_GROUP_SIZE
+) -> None:
+    """Write one year-partition's DataFrame straight to Parquet, in
+    small row groups (see _PARTITION_ROW_GROUP_SIZE) rather than
+    whatever default row-group size pandas/pyarrow would otherwise
+    pick. This matters for _recombine_year_partitions(), which reads
+    each partition back ONE ROW GROUP AT A TIME to keep its own memory
+    bounded -- Parquet can only skip decoding a row group it doesn't
+    need, never decode PART of one, so a partition written as one giant
+    row group would force recombine to hold the whole partition in
+    memory anyway, defeating the point.
+
+    No metadata JSON and no SharePoint upload here -- those only happen
     once, for the recombined whole-form file (see
     _recombine_year_partitions()); partition files are this pipeline's
     own internal storage detail, never read by the R scripts or anything
     else downstream."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(path, engine="pyarrow", compression="snappy", index=False)
+    df.to_parquet(
+        path, engine="pyarrow", compression="snappy", index=False,
+        row_group_size=row_group_size
+    )
 
 
 def _merge_and_dedup(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
@@ -1414,27 +1447,43 @@ def _merge_and_dedup(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.Data
 
 def _split_into_year_partitions(form_id: int, source_path: Path) -> Dict[str, int]:
     """One-time migration: split an existing single-file form Parquet
-    into per-calendar-year partition files under _partition_dir(form_id),
-    using a SINGLE pass over the file's columns rather than one filtered
-    read per year.
+    into per-calendar-year partition files under _partition_dir(form_id).
 
-    Why not just call _read_parquet_low_memory() once per year with a
-    filters=[("_submission_time", ...)] argument? That was the original
-    plan, and it turned out to be impractically slow -- see the NOTE in
-    _read_parquet_low_memory()'s own docstring for the full explanation
-    (Parquet's predicate pushdown can only skip whole row groups, and
+    Processes ONE YEAR AT A TIME: for each year, reads every column of
+    the SOURCE file fully, keeps only that year's rows, writes them out,
+    then discards everything before moving to the next year. This
+    re-reads the source file once per year (N years x every column,
+    instead of every column once) -- trading extra TIME for a much
+    lower memory ceiling, since the data retained in memory at any
+    moment is bounded to the LARGEST SINGLE YEAR's rows, not the form's
+    entire history.
+
+    That trade matters in practice, not just in theory: an earlier
+    version of this function built ALL years' DataFrames simultaneously
+    in a single pass (bounded time, ~2.2-2.4GB peak on its own) and that
+    peak, stacked on top of an already-busy parent process that had just
+    handled 11 other forms before reaching this one, was enough to get
+    this migration OOM-killed on Connect Cloud even running alone in an
+    isolated subprocess -- the isolated subprocess shares the SAME
+    memory cgroup as its parent, so "isolated" bounds the BLAST RADIUS
+    of a crash, not the actual memory ceiling available to it. A
+    migration only has to happen once per form, so paying a few extra
+    minutes here to stay well under memory pressure is the right trade.
+
+    Why not filters=[("_submission_time", ...)] to only read one year's
+    rows per pass, instead of reading everything and masking in memory?
+    See the NOTE in _read_parquet_low_memory()'s own docstring --
+    Parquet's predicate pushdown can only skip whole row groups, and
     form 4498's file has only 2 of them, one holding almost all the
-    data).
+    data, so a filtered read still decodes nearly everything anyway.
+    Masking in memory after an unfiltered read at least bounds the cost
+    to one column at a time, regardless of which year it ends up in.
 
-    This instead reads each column ONCE (matching the ~25-30s / ~2.2GB
-    peak already proven for a full unfiltered _read_parquet_low_memory()
-    read of form 4498's real data), and only after decoding a column
-    decides which year-bucket each of its values belongs to -- via a
-    boolean mask per year, computed once from a single read of
-    _submission_time -- slicing straight into pre-sized per-year
-    DataFrames as it goes. No column is ever decoded more than once, and
-    the total memory held across all year-buckets at any point is the
-    same order as a single full read (never N times that).
+    The partition directory is wiped clean before writing anything, in
+    case a previous attempt crashed partway through and left stale or
+    partial files behind, and a completion marker is written only after
+    EVERY year has been written successfully -- see
+    _is_form_partitioned()'s docstring for why that matters.
     """
     pf = pq.ParquetFile(source_path)
     columns = [f.name for f in pf.schema_arrow]
@@ -1444,8 +1493,14 @@ def _split_into_year_partitions(form_id: int, source_path: Path) -> Dict[str, in
             f"Form {form_id}: source Parquet has no _submission_time column -- cannot partition by year."
         )
 
-    # Single read of the year key column; every other column below is
-    # bucketed using masks derived from THIS read, never its own filter.
+    partition_dir = _partition_dir(form_id)
+    if partition_dir.exists():
+        shutil.rmtree(partition_dir)
+    partition_dir.mkdir(parents=True, exist_ok=True)
+
+    # Single read of the year key column; every per-year pass below
+    # reuses this SAME precomputed Series rather than re-deriving years
+    # from a fresh read each time.
     year_table = pq.read_table(source_path, columns=["_submission_time"], use_threads=False)
     submission_times = year_table.column(0).to_pylist()
     del year_table
@@ -1454,42 +1509,40 @@ def _split_into_year_partitions(form_id: int, source_path: Path) -> Dict[str, in
     del submission_times
 
     unique_years = sorted(years.unique().tolist())
-    masks = {yr: (years == yr).to_numpy() for yr in unique_years}
-    row_counts = {yr: int(masks[yr].sum()) for yr in unique_years}
-    del years
+    row_counts: Dict[str, int] = {}
 
-    partitions = {
-        yr: pd.DataFrame(index=pd.RangeIndex(row_counts[yr]))
-        for yr in unique_years
-    }
+    for yr in unique_years:
+        mask = (years == yr).to_numpy()
+        n_rows_yr = int(mask.sum())
+        row_counts[yr] = n_rows_yr
 
-    for col in columns:
-        low_cardinality = not _is_high_cardinality_field(col)
-        read_dictionary = [col] if low_cardinality else None
+        part_df = pd.DataFrame(index=pd.RangeIndex(n_rows_yr))
 
-        table = pq.read_table(
-            source_path, columns=[col], read_dictionary=read_dictionary, use_threads=False
-        )
+        for col in columns:
+            low_cardinality = not _is_high_cardinality_field(col)
+            read_dictionary = [col] if low_cardinality else None
 
-        if low_cardinality:
-            series = table.column(0).to_pandas()
-            series = series.astype("category")
-        else:
-            series = table.column(0).to_pandas(types_mapper=pd.ArrowDtype)
+            table = pq.read_table(
+                source_path, columns=[col], read_dictionary=read_dictionary, use_threads=False
+            )
 
-        for yr in unique_years:
-            year_series = series[masks[yr]]
-            year_series.index = partitions[yr].index
-            partitions[yr][col] = year_series
-            del year_series
+            if low_cardinality:
+                series = table.column(0).to_pandas()
+                series = series.astype("category")
+            else:
+                series = table.column(0).to_pandas(types_mapper=pd.ArrowDtype)
 
-        del table, series
+            year_series = series[mask]
+            year_series.index = part_df.index
+            part_df[col] = year_series
+            del table, series, year_series
 
-    for yr, part_df in partitions.items():
         _write_partition_file(_partition_path(form_id, yr), part_df)
         del part_df
         gc.collect()
         pa.default_memory_pool().release_unused()
+
+    _migration_marker_path(form_id).write_text(datetime.now().isoformat())
 
     return row_counts
 
@@ -1505,24 +1558,30 @@ def _recombine_year_partitions(
     expects to find; partitioning is an internal storage detail, not a
     change to this pipeline's external contract.
 
-    Reads each partition as a native PyArrow Table (NOT a pandas
-    DataFrame) and casts each column to plain pa.string() at the Arrow
-    level via ``.cast()``, one partition at a time, through a shared
-    pq.ParquetWriter. This matters: an earlier version of this function
-    read each partition via _read_parquet_low_memory() into a pandas
-    DataFrame and then called pandas' ``.astype(str)`` on every column --
-    which re-triggered the EXACT memory blowup this whole file's history
-    is about (see build_dataframe_from_records()'s and
-    _merge_and_dedup()'s comments): pandas' plain string/object dtype
-    boxes every value as its own Python object, and doing that for all
-    822 columns of even one ~400k-row partition at once needs many GB,
-    which OOM-killed this function outright the first time it was
-    tested. Casting directly on the Arrow ChunkedArray instead (Arrow's
-    native cast, whether the source is dictionary-encoded or already
-    plain string) produces a compact contiguous buffer -- no Python
-    object boxing at all -- so peak memory here stays bounded by the
-    LARGEST SINGLE PARTITION's raw data volume, not by pandas' per-cell
-    overhead.
+    Reads each partition ONE ROW GROUP AT A TIME via
+    pq.ParquetFile.read_row_group() -- never the whole partition file at
+    once -- and casts each row group's columns to plain pa.string() at
+    the Arrow level via ``.cast()``, through a shared pq.ParquetWriter.
+    This bounds peak memory here to roughly one row group's worth of
+    data (see _PARTITION_ROW_GROUP_SIZE / _write_partition_file(), which
+    is what keeps partition files' row groups small enough for this to
+    actually work), regardless of how large any individual partition or
+    the form's total history grows.
+
+    Two earlier versions of this function both got this wrong in ways
+    worth remembering: the first read each partition via
+    _read_parquet_low_memory() into a pandas DataFrame and called
+    pandas' ``.astype(str)`` on every column, which re-triggered the
+    exact memory blowup this whole file's history is about (pandas'
+    plain string/object dtype boxes every value as its own Python
+    object). The second fixed that by casting at the Arrow level instead
+    -- correct, but still read each partition's ENTIRE file as one
+    pa.Table before casting, so its peak scaled with the largest
+    partition's total size (~2.7GB for form 4498's ~400k-row 2024
+    partition) rather than with a fixed row-group size; combined with
+    the one-time migration's own peak in the same process, that was
+    still enough to get OOM-killed on Connect Cloud. Reading row group
+    by row group removes that scaling entirely.
 
     Every partition's columns are reindexed onto the union of all
     partitions' columns (filling any column absent from a given
@@ -1564,34 +1623,38 @@ def _recombine_year_partitions(
         writer = pq.ParquetWriter(tmp_output_path, arrow_schema, compression="snappy")
 
         for p in partition_paths:
-            table = pq.read_table(p, use_threads=False)
-            n_rows = table.num_rows
+            pf = pq.ParquetFile(p)
 
-            arrays = []
-            for col in all_columns:
-                if col in table.column_names:
-                    arr = table.column(col)
-                    if not (pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type)):
-                        arr = arr.cast(pa.string())
-                    arr = pc.fill_null(arr, "")
-                else:
-                    arr = pa.chunked_array([pa.array([""] * n_rows, type=pa.string())])
-                arrays.append(arr)
+            for rg_idx in range(pf.num_row_groups):
+                table = pf.read_row_group(rg_idx)
+                n_rows = table.num_rows
 
-            out_table = pa.Table.from_arrays(arrays, schema=arrow_schema)
-            writer.write_table(out_table)
+                arrays = []
+                for col in all_columns:
+                    if col in table.column_names:
+                        arr = table.column(col)
+                        if not (pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type)):
+                            arr = arr.cast(pa.string())
+                        arr = pc.fill_null(arr, "")
+                    else:
+                        arr = pa.chunked_array([pa.array([""] * n_rows, type=pa.string())])
+                    arrays.append(arr)
 
-            total_rows += n_rows
+                out_table = pa.Table.from_arrays(arrays, schema=arrow_schema)
+                writer.write_table(out_table)
 
-            if "_submission_time" in table.column_names:
-                st_column = table.column("_submission_time")
-                st_values = [v for v in st_column.to_pylist() if v]
-                if st_values:
-                    part_max = max(str(v) for v in st_values)
-                    candidates = [t for t in [part_max, last_submission_time] if t]
-                    last_submission_time = max(candidates) if candidates else last_submission_time
+                total_rows += n_rows
 
-            del table, arrays, out_table
+                if "_submission_time" in table.column_names:
+                    st_column = table.column("_submission_time")
+                    st_values = [v for v in st_column.to_pylist() if v]
+                    if st_values:
+                        part_max = max(str(v) for v in st_values)
+                        candidates = [t for t in [part_max, last_submission_time] if t]
+                        last_submission_time = max(candidates) if candidates else last_submission_time
+
+                del table, arrays, out_table
+
             gc.collect()
             pa.default_memory_pool().release_unused()
 
