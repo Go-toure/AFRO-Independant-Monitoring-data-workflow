@@ -43,6 +43,12 @@ pacman::p_load(
 .ribr_this_file <- normalizePath(sub("^--file=", "",
   grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)))
 source(file.path(dirname(.ribr_this_file), "find_workflow_home.R"))
+# Kept (not rm()'d) as THIS_SCRIPT_PATH -- the isolated-file worker mode
+# further down (see "ISOLATED-FILE WORKER MODE") needs this script's own
+# path so it can re-invoke itself as a fresh Rscript child process for
+# any one oversized form, instead of processing it inline in this same
+# long-running session.
+THIS_SCRIPT_PATH <- .ribr_this_file
 rm(.ribr_this_file)
 base_dir <- find_workflow_home()
 
@@ -4587,6 +4593,108 @@ build_regional_im_repository <- function(processed_results, regional_repository_
 # ============================================================
 # BATCH RUNNER
 # ============================================================
+
+# A file at or above this size gets processed in its own, fresh Rscript
+# child process (see process_im_file_or_isolate() below) instead of
+# inline in this long-running session. This is a SIZE threshold, not a
+# form-ID check, on purpose -- it is meant to catch whichever form is
+# heaviest at any given time (today that's form 4498, at ~410 MB and
+# climbing every run; the next-largest form as of 2026-09-17 is only
+# ~117 MB), the same generic, threshold-based philosophy already used
+# on the Python fetch side (Fetch_im_data.py's own row-count
+# thresholds) rather than hardcoding a specific form.
+ISOLATED_FILE_SIZE_THRESHOLD_BYTES <- 150 * 1024^2  # 150 MB
+
+# Runs process_im_file() for one input file, isolating it in a fresh
+# Rscript child process when it's over ISOLATED_FILE_SIZE_THRESHOLD_BYTES.
+#
+# Why: process_im_file() loads the WHOLE file into memory as a tibble
+# (arrow::read_parquet() %>% as_tibble()) and runs several tidyverse
+# transformations over it, each of which can hold its own full copy in
+# memory at once. For a wide, high-row-count form (form 4498 is ~822
+# columns x 1.1M+ rows) that's a genuinely large amount of memory no
+# matter how it's processed. Worse, when this ran inline as part of the
+# same 34-file loop, R's own garbage collector doesn't necessarily
+# release every previous file's memory before the next file starts, so
+# the loop's memory footprint could keep climbing across iterations --
+# and once ONE file's processing gets OOM-killed (exit code 137), the
+# whole Rscript process dies with it, discarding every other file's
+# already-completed output along with it (as happened in production on
+# 2026-09-17, killed while reading form 4498's parquet file as the 12th
+# of 34 files).
+#
+# Isolating any oversized file in its own child process fixes both
+# problems: that file gets a completely fresh memory budget with
+# nothing left over from earlier files, and if it's OOM-killed anyway,
+# only that one child dies -- this parent loop catches the failure,
+# records it exactly like an ordinary per-file error (NULL data/qc, a
+# one-row summary noting the failure), and moves on to the next file
+# instead of losing the whole batch.
+process_im_file_or_isolate <- function(f, output_folder, qc_output_folder, lookup_table, this_script_path) {
+  failure_result <- function(msg) {
+    message("ERROR in file ", basename(f), ": ", msg)
+    list(
+      data = NULL,
+      qc = NULL,
+      summary = tibble(
+        file = basename(f),
+        rows_output = NA_integer_,
+        rows_qc = NA_integer_,
+        countries = NA_character_,
+        min_date = as.Date(NA),
+        max_date = as.Date(NA)
+      )
+    )
+  }
+
+  file_size <- tryCatch(file.size(f), error = function(e) NA_real_)
+
+  if (is.na(file_size) || file_size < ISOLATED_FILE_SIZE_THRESHOLD_BYTES) {
+    return(tryCatch(
+      process_im_file(f, output_folder, qc_output_folder, lookup_table),
+      error = function(e) failure_result(e$message)
+    ))
+  }
+
+  message(sprintf(
+    "[isolate] %s is %.1f MB (over the %.0f MB isolation threshold) -- processing it in its own Rscript process so an out-of-memory kill here can't take down the rest of this build.",
+    basename(f), file_size / 1024^2, ISOLATED_FILE_SIZE_THRESHOLD_BYTES / 1024^2
+  ))
+
+  result_path <- tempfile(fileext = ".rds")
+  on.exit(unlink(result_path), add = TRUE)
+
+  isolated_output <- tryCatch(
+    system2(
+      "Rscript",
+      args = c(shQuote(this_script_path), "--isolated-file", shQuote(f), shQuote(result_path)),
+      stdout = TRUE, stderr = TRUE
+    ),
+    error = function(e) NULL
+  )
+
+  if (!is.null(isolated_output)) {
+    cat(isolated_output, sep = "\n")
+  }
+
+  exit_status <- if (is.null(isolated_output)) -1L else attr(isolated_output, "status")
+  if (is.null(exit_status)) exit_status <- 0L
+
+  if (!identical(exit_status, 0L) || !file.exists(result_path)) {
+    return(failure_result(sprintf(
+      "isolated Rscript process failed or was killed (exit status: %s) -- likely out-of-memory.",
+      exit_status
+    )))
+  }
+
+  isolated_res <- tryCatch(readRDS(result_path), error = function(e) NULL)
+  if (is.null(isolated_res)) {
+    return(failure_result("isolated Rscript process finished but produced no readable result."))
+  }
+
+  isolated_res
+}
+
 process_all_im_files <- function(input_folder, output_folder, qc_output_folder, lookup_table) {
   input_pattern <- paste0("\\.(", paste(SUPPORTED_INPUT_EXTENSIONS, collapse = "|"), ")$")
   
@@ -4627,25 +4735,8 @@ process_all_im_files <- function(input_folder, output_folder, qc_output_folder, 
   summary_results <- list()
   
   for (f in files) {
-    res <- tryCatch(
-      process_im_file(f, output_folder, qc_output_folder, lookup_table),
-      error = function(e) {
-        message("ERROR in file ", basename(f), ": ", e$message)
-        list(
-          data = NULL,
-          qc = NULL,
-          summary = tibble(
-            file = basename(f),
-            rows_output = NA_integer_,
-            rows_qc = NA_integer_,
-            countries = NA_character_,
-            min_date = as.Date(NA),
-            max_date = as.Date(NA)
-          )
-        )
-      }
-    )
-    
+    res <- process_im_file_or_isolate(f, output_folder, qc_output_folder, lookup_table, THIS_SCRIPT_PATH)
+
     processed_results[[basename(f)]] <- res
     summary_results[[basename(f)]] <- res$summary
   }
@@ -4654,6 +4745,46 @@ process_all_im_files <- function(input_folder, output_folder, qc_output_folder, 
     processed_results = processed_results,
     summary_table = bind_rows(summary_results)
   )
+}
+
+# ============================================================
+# ISOLATED-FILE WORKER MODE
+# ============================================================
+# Invoked as `Rscript regional_im_repository_builder.R --isolated-file
+# <input_file> <result_rds_path>` -- process_im_file_or_isolate() above
+# shells out to exactly this, for any one file over
+# ISOLATED_FILE_SIZE_THRESHOLD_BYTES. Everything this needs
+# (process_im_file(), output_folder, qc_output_folder, lookup_table) is
+# already defined above by the time this runs, since the script is
+# sourced top-to-bottom either way -- this block just intercepts before
+# the normal 34-file batch run kicks off below, processes the ONE file
+# it was asked for, writes the result, and exits.
+cli_args <- commandArgs(trailingOnly = TRUE)
+if (length(cli_args) >= 3 && identical(cli_args[1], "--isolated-file")) {
+  isolated_input_file <- cli_args[2]
+  isolated_result_path <- cli_args[3]
+
+  isolated_res <- tryCatch(
+    process_im_file(isolated_input_file, output_folder, qc_output_folder, lookup_table),
+    error = function(e) {
+      message("ERROR in file ", basename(isolated_input_file), ": ", e$message)
+      list(
+        data = NULL,
+        qc = NULL,
+        summary = tibble(
+          file = basename(isolated_input_file),
+          rows_output = NA_integer_,
+          rows_qc = NA_integer_,
+          countries = NA_character_,
+          min_date = as.Date(NA),
+          max_date = as.Date(NA)
+        )
+      )
+    }
+  )
+
+  saveRDS(isolated_res, isolated_result_path)
+  quit(status = 0)
 }
 
 # ============================================================
