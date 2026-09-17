@@ -147,6 +147,21 @@ NIGERIA_IM_FORM_ID <- "7178"
 # this file's own filter/select narrowing ever ran).
 PRUNED_READ_ELIGIBLE_FORM_IDS <- c("4498")
 
+# Forms eligible for the chunked row-batch processing path in
+# process_im_file() -- see process_im_file_in_chunks() below for the full
+# rationale. Also an allowlist for the same reason as PRUNED_READ_ELIGIBLE_
+# FORM_IDS above: the chunked path re-derives select_columns_dynamically()
+# and re-runs every row-level transformation per chunk, which is only
+# proven equivalent to the single-pass path for forms whose
+# group_by()/summarise() combine step uses ONLY sum()/min()/max() (true
+# for every form today) and whose upstream transforms are purely
+# per-row/name-based (verified for 4498; NOT re-verified for every other
+# form, so this stays deliberately narrow). Currently just 4498 (1.15M+
+# rows -- 4x the next largest form -- OOM-killed even after the
+# column-pruned read and the single-pass safe_filter_data() rewrite got
+# it past its two earlier crash points).
+CHUNKED_PROCESSING_ELIGIBLE_FORM_IDS <- c("4498")
+
 # ============================================================
 # INLINE NIGERIA IM PROCESSOR SCRIPT FOR FORM 7178
 # No external source() dependency.
@@ -3500,6 +3515,652 @@ process_nigeria_im_file <- function(input_file, output_folder, qc_output_folder)
 }
 
 
+# ============================================================
+# CHUNKED ROW-BATCH PROCESSING (form 4498 and similar oversized forms)
+# ============================================================
+# Form 4498, even after the column-pruned read (228 of 822 columns) and
+# the single-pass safe_filter_data() rewrite, still gets OOM-killed --
+# [MEM] diagnostics from 2026-09-17 show it dying right after "after
+# select (before filter)" at ~1976 MB, meaning even ONE filtering pass
+# over 1,149,091 rows needs to briefly hold both the original table and
+# the filtered copy at once, and that alone is enough to exceed this
+# container's memory ceiling. No amount of trimming the NUMBER of copies
+# fixes that when the container doesn't have the headroom for even one
+# extra copy of a table this tall -- the only way around it is to never
+# hold a copy that tall in the first place.
+#
+# process_im_chunk_to_partial() is the single-pass path's per-row
+# pipeline (apply_country_specific_transformations() through
+# process_final_data(), the row-level start_date/end_date/cv mutate(),
+# and the group_by()/summarise() that used to produce F5 directly) lifted
+# verbatim and run on one ROW SLICE of the input at a time instead of the
+# whole file. Every one of those steps is a per-row vectorized
+# transformation with no dependency on any other row (verified by reading
+# each one: safe_filter_data(), create_summary_columns(),
+# standardize_districts()/_responses(), assign_vaccine_types(), and
+# process_final_data() all operate row-by-row or on column NAMES only),
+# so each row slice produces byte-for-byte the same values it would as
+# part of the full table.
+#
+# The one step that isn't purely row-wise is the group_by()/summarise()
+# itself -- but every aggregate in it is sum(), min(), or max(), and all
+# three are exactly "combinable": the sum of per-chunk partial sums
+# equals the sum over every row, and likewise min-of-mins and
+# max-of-maxes. So process_im_chunk_to_partial() returns each chunk's
+# PARTIAL per-group sums/min/max (a small table -- one row per distinct
+# Country/Region/District/Response/Vaccine.type/roundNumber group in that
+# chunk, not one row per raw record), and process_im_file_in_chunks()
+# below combines every chunk's partial table with the IDENTICAL
+# group_by()/summarise() call a second time (summing the partial sums,
+# taking min-of-mins and max-of-maxes) to get the true whole-file
+# aggregate -- mathematically identical to running that same
+# group_by()/summarise() once on the full 1.15M-row table. Everything
+# after that combine (the denominator-reconstruction mutate(),
+# add_sm_intelligence_indicators(), the lookup-table join, and the final
+# column selection/QC split) is a function of the already-aggregated
+# per-group table, not the raw per-row data, so it runs exactly once,
+# completely unchanged from the single-pass path.
+#
+# Only the original file's peak table (kept resident across the loop, so
+# later chunks can still be sliced from it) plus one chunk's transient
+# working set is ever alive at once -- not the original plus a
+# full-height filtered copy of it, which is what was killing 4498 one
+# step past where this same optimization pattern already fixed form 7621.
+
+process_im_chunk_to_partial <- function(data, file_name, qc_output_folder, active_hh_patterns, input_file) {
+  data <- apply_country_specific_transformations(data, file_name, qc_output_folder)
+  data <- rename_repetitive_columns(data)
+  
+  columns_to_select <- select_columns_dynamically(data, required_columns, active_hh_patterns)
+
+  # NOTE ON ORDER (select BEFORE filter, not after): [MEM] diagnostics from
+  # production (2026-09-17) showed peak RSS roughly doubling-to-tripling at
+  # this exact step for every one of the 31 successfully-processed forms --
+  # e.g. form 10267 went 884MB -> 2617MB while BOTH rows (167325 -> 74348)
+  # and columns (629 -> 248) went down, and form 7621 (792 columns, the
+  # widest form in the whole batch) was OOM-killed here outright. That
+  # pattern only makes sense if safe_filter_data() was filtering the FULL
+  # wide table (600-800+ columns) before select() ever got a chance to
+  # narrow it to the ~250 columns this pipeline actually keeps -- dplyr's
+  # filter() has to materialize every column's data for the surviving rows,
+  # so filtering wide is doing 3-4x more copying than it needs to.
+  #
+  # This reorder is safe because every column safe_filter_data() reads
+  # (Response, roundNumber, Type_Monitoring, Total_U5_Present, TotalFM) is
+  # already in required_columns above, so select_columns_dynamically() --
+  # which resolves against the FULL data, matching on the real column
+  # names via find_similar_column() -- always keeps whichever of these
+  # columns actually exist under their real names. select() only ever
+  # projects columns; it never touches row values. So narrowing to
+  # columns_to_select first, then filtering that narrower table, drops
+  # exactly the same rows for exactly the same reason as before -- just
+  # without ever materializing the columns nothing downstream needed.
+  GF <- data %>%
+    select(any_of(columns_to_select))
+  message(sprintf(
+    "[MEM] %s | after select (before filter): %d rows x %d cols, peak RSS: %.0f MB",
+    basename(input_file), nrow(GF), ncol(GF), peak_rss_mb()
+  ))
+
+  GF <- GF %>% safe_filter_data()
+
+  # (No "revert to unfiltered if this chunk's filter kills every row"
+  # fallback here, unlike the single-pass path this was lifted from --
+  # an individual chunk producing zero filtered rows is not the same as
+  # the WHOLE file doing so, and reverting just one chunk to unfiltered
+  # data would silently include rows the single-pass path would have
+  # dropped. process_im_file_in_chunks() checks for the true
+  # whole-file case after every chunk's contribution is combined.)
+  message(sprintf(
+    "[MEM] %s | after filter+select: %d rows x %d cols, peak RSS: %.0f MB",
+    basename(input_file), nrow(GF), ncol(GF), peak_rss_mb()
+  ))
+  
+  hh_cols <- names(GF)[str_detect(names(GF), "^HH\\[")]
+  
+  sm_text_keep_cols <- hh_cols[str_detect(
+    hh_cols,
+    regex("Source_Info_SIA_HH$|Other_Source_Info$", ignore_case = TRUE)
+  )]
+  
+  hh_numeric_cols <- setdiff(hh_cols, sm_text_keep_cols)
+  
+  for (col in hh_numeric_cols) {
+    GF[[col]] <- clean_yes_no_numeric(GF[[col]])
+  }
+  
+  for (col in sm_text_keep_cols) {
+    GF[[col]] <- as.character(GF[[col]])
+  }
+  
+  numeric_cols <- intersect(
+    c(
+      "HH_count", "Total_U5_Present", "TotalFM", "sum_missed_children",
+      "Total_Absent", "Total_refusal",
+      unlist(absence_total_candidates),
+      unlist(nc_total_candidates),
+      unlist(sm_count_candidates),
+      "Tot_child_NC_NotDecide_T", "Tot_child_NC_PolioFREE_T",
+      "Tot_child_NC_nOPV_T", "Tot_child_NC_ChildSick_T",
+      "Tot_child_NC_Others_T", "Tot_child_Abs_Sick_T"
+    ),
+    names(GF)
+  )
+  
+  if (length(numeric_cols) > 0) {
+    GF[numeric_cols] <- lapply(GF[numeric_cols], clean_numeric)
+  }
+  
+  if ("date_monitored" %in% names(GF)) {
+    GF <- GF %>% mutate(date_monitored = parse_mixed_dates(date_monitored))
+  }
+  
+  GH <- create_summary_columns(GF, file_name = file_name)
+  message(sprintf(
+    "[MEM] %s | after create_summary_columns: %d rows x %d cols, peak RSS: %.0f MB",
+    basename(input_file), nrow(GH), ncol(GH), peak_rss_mb()
+  ))
+  
+  if ("HH_count" %in% names(GH)) {
+    GH <- GH %>%
+      mutate(Number_of_HH_visited = suppressWarnings(as.numeric(HH_count)))
+  } else if ("Number_of_HH_visited" %in% names(GH)) {
+    GH <- GH %>%
+      mutate(Number_of_HH_visited = suppressWarnings(as.numeric(Number_of_HH_visited)))
+  } else {
+    GH$Number_of_HH_visited <- NA_real_
+  }
+  
+  if (!"Total_U5_Present" %in% names(GH)) GH$Total_U5_Present <- NA_real_
+  if (!"TotalFM" %in% names(GH)) GH$TotalFM <- NA_real_
+  
+  GJ <- GH %>%
+    mutate(
+      Total_U5_Present = suppressWarnings(as.numeric(Total_U5_Present)),
+      TotalFM = suppressWarnings(as.numeric(TotalFM))
+    ) %>%
+    standardize_districts()
+  
+  GO <- GJ %>% standardize_responses()
+  GK <- GO %>% assign_vaccine_types()
+
+  # Ethiopia (form 6839): override assign_vaccine_types()'s generic
+  # Response-text pattern matching with the calendar's own authoritative
+  # Vaccine.type for the campaign each row was attributed to -- see
+  # apply_ethiopia_6839_vaccine_override() above for why this can't just
+  # be set earlier and left alone (it would be dropped/overwritten
+  # before reaching here).
+  if (startsWith(file_name, "6839")) {
+    GK <- apply_ethiopia_6839_vaccine_override(GK)
+  }
+
+  GL <- GK %>% process_final_data()
+  
+  required_final_columns <- c(
+    "Country", "Region", "District", "Response", "Vaccine.type", "roundNumber",
+    "date_monitored", "Number_of_HH_visited", "u5_present", "u5_FM", "missed_child",
+    "denominator_reconstructed", "denominator_qc_flag",
+    "r_non_FM_Absent", "r_non_FM_NC", "r_non_FM_hh_notvisited", "r_non_FM_hh_notrevisited",
+    "r_non_FM_sleep", "r_non_FM_vaccinatedRoutine", "r_non_FM_other",
+    "care_Giver_Informed_SIA",
+    "sm_info_tv", "sm_info_radio", "sm_info_others", "sm_info_hworker",
+    "sm_info_mob_vanpa", "sm_info_town_crier", "sm_info_volunteers",
+    "sm_info_com_infocentre", "sm_info_community_leader",
+    "sm_info_religious_leader", "sm_info_mobile_social_media",
+    "sm_info_mourchidate", "sm_info_mosque", "sm_info_vaccinators",
+    "sm_info_h2h_mobilizer", "sm_info_sticker",
+    "sm_info_newspaper_text", "sm_info_teachers_student_text", "sm_info_iec_materials_text",
+    "sm_total_sources",
+    "check_sm_info", "sm_info_gap", "sm_info_overlap", "sm_reconciliation_flag",
+    "r_abs_sick", "r_abs_play_areas", "r_abs_market", "r_abs_school",
+    "r_abs_farm", "r_abs_social_event", "r_abs_travelling", "r_abs_parent_absent", "r_abs_other_detail",
+    "r_nc_religious_beliefs", "r_nc_side_effects", "r_nc_too_many_doses",
+    "r_nc_child_sick", "r_nc_covid", "r_nc_other_detail", "r_nc_not_decided",
+    "r_nc_polio_free", "r_nc_nopv",
+    "abs_detail_total", "nc_detail_total", "reasons_total",
+    "check_missed", "check_abs_detail", "check_nc_detail",
+    "unexplained_missed", "overreported_reasons",
+    "explained_ratio", "unexplained_ratio",
+    "reconciliation_flag", "abs_detail_flag", "nc_detail_flag", "qc_flag"
+  )
+  
+  for (col in required_final_columns) {
+    if (!col %in% names(GL)) {
+      GL[[col]] <- NA
+    }
+  }
+
+  GL %>%
+    mutate(
+      start_date = as_date(date_monitored),
+      end_date = as_date(date_monitored),
+      year = year(start_date),
+      cv = ifelse(u5_present > 0, round(u5_FM / u5_present, 2), NA_real_),
+      percent_care_Giver_Informed_SIA = ifelse(
+        Number_of_HH_visited > 0,
+        round((care_Giver_Informed_SIA / Number_of_HH_visited) * 100, 2),
+        NA_real_
+      )
+    ) %>%
+    group_by(Country, Region, District, Response, Vaccine.type, roundNumber) %>%
+    summarise(
+      start_date = min(start_date, na.rm = TRUE),
+      end_date = max(end_date, na.rm = TRUE),
+      Number_of_HH_visited = sum(Number_of_HH_visited, na.rm = TRUE),
+      u5_present = sum(u5_present, na.rm = TRUE),
+      u5_FM = sum(u5_FM, na.rm = TRUE),
+      missed_child = sum(missed_child, na.rm = TRUE),
+      denominator_reconstructed = sum(denominator_reconstructed, na.rm = TRUE),
+      
+      r_non_FM_Absent = sum(r_non_FM_Absent, na.rm = TRUE),
+      r_non_FM_NC = sum(r_non_FM_NC, na.rm = TRUE),
+      r_non_FM_hh_notvisited = sum(r_non_FM_hh_notvisited, na.rm = TRUE),
+      r_non_FM_hh_notrevisited = sum(r_non_FM_hh_notrevisited, na.rm = TRUE),
+      r_non_FM_sleep = sum(r_non_FM_sleep, na.rm = TRUE),
+      r_non_FM_vaccinatedRoutine = sum(r_non_FM_vaccinatedRoutine, na.rm = TRUE),
+      r_non_FM_other = sum(r_non_FM_other, na.rm = TRUE),
+      
+      care_Giver_Informed_SIA = sum(care_Giver_Informed_SIA, na.rm = TRUE),
+      
+      sm_info_tv = sum(sm_info_tv, na.rm = TRUE),
+      sm_info_radio = sum(sm_info_radio, na.rm = TRUE),
+      sm_info_others = sum(sm_info_others, na.rm = TRUE),
+      sm_info_hworker = sum(sm_info_hworker, na.rm = TRUE),
+      sm_info_mob_vanpa = sum(sm_info_mob_vanpa, na.rm = TRUE),
+      sm_info_town_crier = sum(sm_info_town_crier, na.rm = TRUE),
+      sm_info_volunteers = sum(sm_info_volunteers, na.rm = TRUE),
+      sm_info_com_infocentre = sum(sm_info_com_infocentre, na.rm = TRUE),
+      sm_info_community_leader = sum(sm_info_community_leader, na.rm = TRUE),
+      sm_info_religious_leader = sum(sm_info_religious_leader, na.rm = TRUE),
+      sm_info_mobile_social_media = sum(sm_info_mobile_social_media, na.rm = TRUE),
+      sm_info_mourchidate = sum(sm_info_mourchidate, na.rm = TRUE),
+      sm_info_mosque = sum(sm_info_mosque, na.rm = TRUE),
+      sm_info_vaccinators = sum(sm_info_vaccinators, na.rm = TRUE),
+      sm_info_h2h_mobilizer = sum(sm_info_h2h_mobilizer, na.rm = TRUE),
+      sm_info_sticker = sum(sm_info_sticker, na.rm = TRUE),
+      sm_info_newspaper_text = sum(sm_info_newspaper_text, na.rm = TRUE),
+      sm_info_teachers_student_text = sum(sm_info_teachers_student_text, na.rm = TRUE),
+      sm_info_iec_materials_text = sum(sm_info_iec_materials_text, na.rm = TRUE),
+      sm_total_sources = sum(sm_total_sources, na.rm = TRUE),
+      
+      r_abs_sick = sum(r_abs_sick, na.rm = TRUE),
+      r_abs_play_areas = sum(r_abs_play_areas, na.rm = TRUE),
+      r_abs_market = sum(r_abs_market, na.rm = TRUE),
+      r_abs_school = sum(r_abs_school, na.rm = TRUE),
+      r_abs_farm = sum(r_abs_farm, na.rm = TRUE),
+      r_abs_social_event = sum(r_abs_social_event, na.rm = TRUE),
+      r_abs_travelling = sum(r_abs_travelling, na.rm = TRUE),
+      r_abs_parent_absent = sum(r_abs_parent_absent, na.rm = TRUE),
+      r_abs_other_detail = sum(r_abs_other_detail, na.rm = TRUE),
+      
+      r_nc_religious_beliefs = sum(r_nc_religious_beliefs, na.rm = TRUE),
+      r_nc_side_effects = sum(r_nc_side_effects, na.rm = TRUE),
+      r_nc_too_many_doses = sum(r_nc_too_many_doses, na.rm = TRUE),
+      r_nc_child_sick = sum(r_nc_child_sick, na.rm = TRUE),
+      r_nc_covid = sum(r_nc_covid, na.rm = TRUE),
+      r_nc_other_detail = sum(r_nc_other_detail, na.rm = TRUE),
+      r_nc_not_decided = sum(r_nc_not_decided, na.rm = TRUE),
+      r_nc_polio_free = sum(r_nc_polio_free, na.rm = TRUE),
+      r_nc_nopv = sum(r_nc_nopv, na.rm = TRUE),
+      
+      abs_detail_total = sum(abs_detail_total, na.rm = TRUE),
+      nc_detail_total = sum(nc_detail_total, na.rm = TRUE),
+      reasons_total = sum(reasons_total, na.rm = TRUE),
+      unexplained_missed = sum(unexplained_missed, na.rm = TRUE),
+      overreported_reasons = sum(overreported_reasons, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+process_im_file_in_chunks <- function(data, input_file, output_file, qc_output_file, qc_output_folder,
+                                       file_name, active_hh_patterns, lookup_table, chunk_rows = 200000) {
+  n <- nrow(data)
+  chunk_starts <- seq(1, n, by = chunk_rows)
+  n_chunks <- length(chunk_starts)
+  partials <- vector("list", n_chunks)
+
+  for (i in seq_along(chunk_starts)) {
+    start_row <- chunk_starts[[i]]
+    end_row <- min(start_row + chunk_rows - 1, n)
+    message(sprintf(
+      "[chunk] %s: processing rows %d-%d of %d (chunk %d/%d)",
+      basename(input_file), start_row, end_row, n, i, n_chunks
+    ))
+
+    partials[[i]] <- tryCatch(
+      process_im_chunk_to_partial(
+        data[start_row:end_row, , drop = FALSE],
+        file_name, qc_output_folder, active_hh_patterns, input_file
+      ),
+      error = function(e) {
+        message("[chunk] error in rows ", start_row, "-", end_row, ": ", conditionMessage(e))
+        NULL
+      }
+    )
+    message(sprintf(
+      "[MEM] %s | after chunk %d/%d: peak RSS %.0f MB",
+      basename(input_file), i, n_chunks, peak_rss_mb()
+    ))
+  }
+
+  partials <- Filter(Negate(is.null), partials)
+  combined_partial <- if (length(partials) == 0) tibble() else bind_rows(partials)
+
+  if (nrow(combined_partial) == 0) {
+    message(
+      "Warning: chunked processing produced no filtered rows across the whole file for ",
+      basename(input_file), " -- writing an empty output rather than re-reading unfiltered."
+    )
+    FE <- tibble()
+    FE_QC <- tibble()
+    write_csv(FE, output_file)
+    write_csv(FE_QC, qc_output_file)
+    return(list(
+      data = FE,
+      qc = FE_QC,
+      summary = tibble(
+        file = basename(input_file),
+        rows_output = 0L,
+        rows_qc = 0L,
+        countries = NA_character_,
+        min_date = as.Date(NA),
+        max_date = as.Date(NA)
+      )
+    ))
+  }
+
+  F5 <- combined_partial %>%
+    group_by(Country, Region, District, Response, Vaccine.type, roundNumber) %>%
+    summarise(
+      start_date = min(start_date, na.rm = TRUE),
+      end_date = max(end_date, na.rm = TRUE),
+      Number_of_HH_visited = sum(Number_of_HH_visited, na.rm = TRUE),
+      u5_present = sum(u5_present, na.rm = TRUE),
+      u5_FM = sum(u5_FM, na.rm = TRUE),
+      missed_child = sum(missed_child, na.rm = TRUE),
+      denominator_reconstructed = sum(denominator_reconstructed, na.rm = TRUE),
+      
+      r_non_FM_Absent = sum(r_non_FM_Absent, na.rm = TRUE),
+      r_non_FM_NC = sum(r_non_FM_NC, na.rm = TRUE),
+      r_non_FM_hh_notvisited = sum(r_non_FM_hh_notvisited, na.rm = TRUE),
+      r_non_FM_hh_notrevisited = sum(r_non_FM_hh_notrevisited, na.rm = TRUE),
+      r_non_FM_sleep = sum(r_non_FM_sleep, na.rm = TRUE),
+      r_non_FM_vaccinatedRoutine = sum(r_non_FM_vaccinatedRoutine, na.rm = TRUE),
+      r_non_FM_other = sum(r_non_FM_other, na.rm = TRUE),
+      
+      care_Giver_Informed_SIA = sum(care_Giver_Informed_SIA, na.rm = TRUE),
+      
+      sm_info_tv = sum(sm_info_tv, na.rm = TRUE),
+      sm_info_radio = sum(sm_info_radio, na.rm = TRUE),
+      sm_info_others = sum(sm_info_others, na.rm = TRUE),
+      sm_info_hworker = sum(sm_info_hworker, na.rm = TRUE),
+      sm_info_mob_vanpa = sum(sm_info_mob_vanpa, na.rm = TRUE),
+      sm_info_town_crier = sum(sm_info_town_crier, na.rm = TRUE),
+      sm_info_volunteers = sum(sm_info_volunteers, na.rm = TRUE),
+      sm_info_com_infocentre = sum(sm_info_com_infocentre, na.rm = TRUE),
+      sm_info_community_leader = sum(sm_info_community_leader, na.rm = TRUE),
+      sm_info_religious_leader = sum(sm_info_religious_leader, na.rm = TRUE),
+      sm_info_mobile_social_media = sum(sm_info_mobile_social_media, na.rm = TRUE),
+      sm_info_mourchidate = sum(sm_info_mourchidate, na.rm = TRUE),
+      sm_info_mosque = sum(sm_info_mosque, na.rm = TRUE),
+      sm_info_vaccinators = sum(sm_info_vaccinators, na.rm = TRUE),
+      sm_info_h2h_mobilizer = sum(sm_info_h2h_mobilizer, na.rm = TRUE),
+      sm_info_sticker = sum(sm_info_sticker, na.rm = TRUE),
+      sm_info_newspaper_text = sum(sm_info_newspaper_text, na.rm = TRUE),
+      sm_info_teachers_student_text = sum(sm_info_teachers_student_text, na.rm = TRUE),
+      sm_info_iec_materials_text = sum(sm_info_iec_materials_text, na.rm = TRUE),
+      sm_total_sources = sum(sm_total_sources, na.rm = TRUE),
+      
+      r_abs_sick = sum(r_abs_sick, na.rm = TRUE),
+      r_abs_play_areas = sum(r_abs_play_areas, na.rm = TRUE),
+      r_abs_market = sum(r_abs_market, na.rm = TRUE),
+      r_abs_school = sum(r_abs_school, na.rm = TRUE),
+      r_abs_farm = sum(r_abs_farm, na.rm = TRUE),
+      r_abs_social_event = sum(r_abs_social_event, na.rm = TRUE),
+      r_abs_travelling = sum(r_abs_travelling, na.rm = TRUE),
+      r_abs_parent_absent = sum(r_abs_parent_absent, na.rm = TRUE),
+      r_abs_other_detail = sum(r_abs_other_detail, na.rm = TRUE),
+      
+      r_nc_religious_beliefs = sum(r_nc_religious_beliefs, na.rm = TRUE),
+      r_nc_side_effects = sum(r_nc_side_effects, na.rm = TRUE),
+      r_nc_too_many_doses = sum(r_nc_too_many_doses, na.rm = TRUE),
+      r_nc_child_sick = sum(r_nc_child_sick, na.rm = TRUE),
+      r_nc_covid = sum(r_nc_covid, na.rm = TRUE),
+      r_nc_other_detail = sum(r_nc_other_detail, na.rm = TRUE),
+      r_nc_not_decided = sum(r_nc_not_decided, na.rm = TRUE),
+      r_nc_polio_free = sum(r_nc_polio_free, na.rm = TRUE),
+      r_nc_nopv = sum(r_nc_nopv, na.rm = TRUE),
+      
+      abs_detail_total = sum(abs_detail_total, na.rm = TRUE),
+      nc_detail_total = sum(nc_detail_total, na.rm = TRUE),
+      reasons_total = sum(reasons_total, na.rm = TRUE),
+      unexplained_missed = sum(unexplained_missed, na.rm = TRUE),
+      overreported_reasons = sum(overreported_reasons, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      # Reconstruct denominator at aggregated district-round level if needed.
+      u5_present = case_when(
+        u5_present <= 0 & u5_FM > 0 & missed_child > 0 ~ u5_FM + missed_child,
+        TRUE ~ u5_present
+      ),
+      u5_FM = ifelse(u5_FM > u5_present & u5_present > 0, u5_present, u5_FM),
+      missed_child = pmax(0, u5_present - u5_FM),
+      cv = ifelse(u5_present > 0, round(u5_FM / u5_present, 2), NA_real_),
+      cv = case_when(
+        is.infinite(cv) ~ NA_real_,
+        cv < 0 ~ NA_real_,
+        cv > 1 ~ 1,
+        TRUE ~ cv
+      ),
+      denominator_qc_flag = case_when(
+        denominator_reconstructed > 0 ~ "Missing denominator reconstructed",
+        u5_present <= 0 & u5_FM > 0 ~ "Missing denominator unresolved",
+        TRUE ~ "Denominator OK"
+      ),
+      year = year(start_date),
+      percent_care_Giver_Informed_SIA = ifelse(
+        Number_of_HH_visited > 0,
+        round((care_Giver_Informed_SIA / Number_of_HH_visited) * 100, 2),
+        NA_real_
+      ),
+      
+      check_missed = missed_child - reasons_total,
+      check_abs_detail = r_non_FM_Absent - abs_detail_total,
+      check_nc_detail = r_non_FM_NC - nc_detail_total,
+      check_sm_info = care_Giver_Informed_SIA - sm_total_sources,
+      sm_info_gap = pmax(check_sm_info, 0),
+      sm_info_overlap = pmax(-check_sm_info, 0),
+      
+      explained_ratio = ifelse(missed_child > 0, round(reasons_total / missed_child, 3), NA_real_),
+      unexplained_ratio = ifelse(missed_child > 0, round(unexplained_missed / missed_child, 3), NA_real_),
+      
+      reconciliation_flag = case_when(
+        denominator_qc_flag == "Missing denominator reconstructed" ~ "Missing denominator reconstructed",
+        check_missed == 0 ~ "Consistent",
+        check_missed > 0 & reasons_total == 0 ~ "No reasons recorded",
+        check_missed > 0 ~ "Partial reasons recorded",
+        check_missed < 0 ~ "Overlapping reasons",
+        TRUE ~ "Unknown"
+      ),
+      
+      abs_detail_flag = case_when(
+        check_abs_detail == 0 ~ "Abs detail consistent",
+        check_abs_detail > 0 ~ "Abs detail incomplete",
+        check_abs_detail < 0 ~ "Abs detail overlapping",
+        TRUE ~ "Unknown"
+      ),
+      
+      nc_detail_flag = case_when(
+        check_nc_detail == 0 ~ "NC detail consistent",
+        check_nc_detail > 0 ~ "NC detail incomplete",
+        check_nc_detail < 0 ~ "NC detail overlapping",
+        TRUE ~ "Unknown"
+      ),
+      
+      sm_reconciliation_flag = case_when(
+        care_Giver_Informed_SIA > 0 & sm_total_sources == 0 ~ "No source recorded",
+        check_sm_info == 0 ~ "SM consistent",
+        check_sm_info < 0 ~ "Multiple sources per informed HH",
+        check_sm_info > 0 ~ "Some informed HH missing source",
+        TRUE ~ "Unknown"
+      ),
+      
+      qc_flag = case_when(
+        check_missed == 0 &
+          check_abs_detail == 0 &
+          check_nc_detail == 0 &
+          check_sm_info <= 0 ~ "OK",
+        TRUE ~ "Needs review"
+      )
+    ) %>%
+    add_sm_intelligence_indicators() %>%
+    filter(start_date > as_date("2019-10-01"))
+  
+  FI <- F5 %>%
+    left_join(
+      lookup_table,
+      by = c("Response", "Vaccine.type", "roundNumber"),
+      suffix = c("", "_lookup")
+    ) %>%
+    mutate(
+      start_date = coalesce(start_date_lookup, start_date),
+      end_date = coalesce(end_date_lookup, end_date),
+      round_start_date = coalesce(round_start_date, start_date - days(4))
+    ) %>%
+    select(-ends_with("_lookup")) %>%
+    filter(District != "NA")
+  
+  FE <- FI %>%
+    select(
+      country = Country,
+      province = Region,
+      district = District,
+      response = Response,
+      vaccine.type = Vaccine.type,
+      roundNumber,
+      round_start_date,
+      start_date_IM_end = start_date,
+      end_date_IM_end = end_date,
+      year,
+      Number_of_HH_visited,
+      u5_present,
+      u5_FM,
+      missed_child,
+      denominator_reconstructed,
+      denominator_qc_flag,
+      cv,
+      
+      r_non_FM_Absent,
+      r_non_FM_NC,
+      r_non_FM_hh_notvisited,
+      r_non_FM_hh_notrevisited,
+      r_non_FM_sleep,
+      r_non_FM_vaccinatedRoutine,
+      r_non_FM_other,
+      
+      care_Giver_Informed_SIA,
+      percent_care_Giver_Informed_SIA,
+      
+      sm_info_tv,
+      sm_info_radio,
+      sm_info_others,
+      sm_info_hworker,
+      sm_info_mob_vanpa,
+      sm_info_town_crier,
+      sm_info_volunteers,
+      sm_info_com_infocentre,
+      sm_info_community_leader,
+      sm_info_religious_leader,
+      sm_info_mobile_social_media,
+      sm_info_mourchidate,
+      sm_info_mosque,
+      sm_info_vaccinators,
+      sm_info_h2h_mobilizer,
+      sm_info_sticker,
+      sm_info_newspaper_text,
+      sm_info_teachers_student_text,
+      sm_info_iec_materials_text,
+      sm_total_sources,
+      check_sm_info,
+      sm_info_gap,
+      sm_info_overlap,
+      sm_reconciliation_flag,
+      sm_total_awareness_sources,
+      sm_intensity_group,
+      sm_non_compliance_pressure,
+      sm_gap_flag,
+      sm_priority_flag,
+      
+      r_abs_sick,
+      r_abs_play_areas,
+      r_abs_market,
+      r_abs_school,
+      r_abs_farm,
+      r_abs_social_event,
+      r_abs_travelling,
+      r_abs_parent_absent,
+      r_abs_other_detail,
+      
+      r_nc_religious_beliefs,
+      r_nc_side_effects,
+      r_nc_too_many_doses,
+      r_nc_child_sick,
+      r_nc_covid,
+      r_nc_other_detail,
+      r_nc_not_decided,
+      r_nc_polio_free,
+      r_nc_nopv,
+      
+      reasons_total,
+      abs_detail_total,
+      nc_detail_total,
+      check_missed,
+      check_abs_detail,
+      check_nc_detail,
+      unexplained_missed,
+      overreported_reasons,
+      explained_ratio,
+      unexplained_ratio,
+      reconciliation_flag,
+      abs_detail_flag,
+      nc_detail_flag,
+      qc_flag
+    ) %>%
+    arrange(start_date_IM_end)
+  
+  FE_QC <- FE %>%
+    filter(
+      qc_flag == "Needs review" |
+        denominator_qc_flag == "Missing denominator unresolved" |
+        abs(check_missed) >= 5 |
+        abs(check_abs_detail) >= 3 |
+        abs(check_nc_detail) >= 3 |
+        check_sm_info > 0
+    ) %>%
+    arrange(desc(abs(check_missed)), desc(abs(check_abs_detail)), desc(abs(check_nc_detail)), desc(check_sm_info))
+  
+  write_csv(FE, output_file)
+  write_csv(FE_QC, qc_output_file)
+  
+  message("Done: ", basename(input_file))
+  message("  Output: ", output_file)
+  message("  QC: ", qc_output_file)
+  
+  list(
+    data = FE,
+    qc = FE_QC,
+    summary = tibble(
+      file = basename(input_file),
+      rows_output = nrow(FE),
+      rows_qc = nrow(FE_QC),
+      countries = paste(unique(FE$country), collapse = ", "),
+      min_date = suppressWarnings(if (nrow(FE) > 0) min(FE$start_date_IM_end, na.rm = TRUE) else as.Date(NA)),
+      max_date = suppressWarnings(if (nrow(FE) > 0) max(FE$start_date_IM_end, na.rm = TRUE) else as.Date(NA))
+    )
+  )
+}
+
 process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_table) {
   file_name <- tools::file_path_sans_ext(basename(input_file))
   output_file <- file.path(output_folder, paste0(file_name, ".csv"))
@@ -3547,6 +4208,13 @@ process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_
   # form whose template omits it.
   if (!"Region" %in% names(data)) {
     data$Region <- NA_character_
+  }
+
+  if (file_name %in% CHUNKED_PROCESSING_ELIGIBLE_FORM_IDS) {
+    return(process_im_file_in_chunks(
+      data, input_file, output_file, qc_output_file, qc_output_folder,
+      file_name, active_hh_patterns, lookup_table
+    ))
   }
 
   data <- apply_country_specific_transformations(data, file_name, qc_output_folder)
