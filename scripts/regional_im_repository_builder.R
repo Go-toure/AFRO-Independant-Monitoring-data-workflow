@@ -45,52 +45,6 @@ peak_rss_mb <- function() {
   }, error = function(e) NA_real_)
 }
 
-# Chunks measure.vars into groups and melts each group separately,
-# rbindlist-ing the results, instead of reshaping every measure column in
-# one melt() call. Built for form 7178/Nigeria's reason-column reshape --
-# [MEM] diagnostics from 2026-09-17 show that step dying right after
-# "Processing missed-child reasons...", starting from an already
-# substantial ~2.6GB baseline, when melt() is asked to reshape every
-# NOimmReas_Child* column (there can be 100+) across 1M+ rows in one call.
-#
-# This changes nothing about the RESULT: data.table::melt() already
-# builds its output by grouping all rows for measure.vars[1] first, then
-# all rows for measure.vars[2], and so on -- melting a contiguous slice of
-# that same column order at a time and rbindlist-ing the slices back
-# together in order produces the exact same set of (row, variable, value)
-# triples a single melt() call would. Every downstream use of this table
-# (dcast() aggregation, vectorized row-wise reason classification) is
-# order-independent regardless, so even if row order were to differ this
-# could not change the final output -- this is purely a peak-memory cap:
-# instead of one melt() call materializing every measure column's reshape
-# at once, only chunk_size columns' worth is ever live at a time.
-chunked_melt <- function(dt, id.vars, measure.vars, variable.name, value.name,
-                          variable.factor = FALSE, chunk_size = 15) {
-  if (length(measure.vars) <= chunk_size) {
-    return(data.table::melt(
-      dt,
-      id.vars = id.vars,
-      measure.vars = measure.vars,
-      variable.name = variable.name,
-      value.name = value.name,
-      variable.factor = variable.factor
-    ))
-  }
-
-  chunks <- split(measure.vars, ceiling(seq_along(measure.vars) / chunk_size))
-  pieces <- lapply(chunks, function(cols) {
-    data.table::melt(
-      dt,
-      id.vars = id.vars,
-      measure.vars = cols,
-      variable.name = variable.name,
-      value.name = value.name,
-      variable.factor = variable.factor
-    )
-  })
-  data.table::rbindlist(pieces, use.names = TRUE)
-}
-
 # ============================================================
 # USER PATHS
 # ============================================================
@@ -970,7 +924,7 @@ NIGERIA_IM_SCRIPT_INLINE <- c(
   "  \"Vaccine.type\"",
   ")",
   "",
-  "reason_long_main <- chunked_melt(",
+  "reason_long_main <- melt(",
   "  AE,",
   "  id.vars = id_cols_reason,",
   "  measure.vars = reason_cols_main,",
@@ -982,7 +936,7 @@ NIGERIA_IM_SCRIPT_INLINE <- c(
   "reason_long_main[, reason_raw := normalize_reason_text(reason_raw)]",
   "reason_long_main <- reason_long_main[!is.na(reason_raw) & reason_raw != \"\"]",
   "",
-  "reason_long_other <- chunked_melt(",
+  "reason_long_other <- melt(",
   "  AE,",
   "  id.vars = \"row_id___\",",
   "  measure.vars = reason_cols_other,",
@@ -2630,30 +2584,58 @@ select_columns_dynamically <- function(df, required_cols, hh_patterns, hh_count 
   unique(selected_cols)
 }
 
+# Form 4498's [MEM] diagnostics from the 2026-09-17 run (after the
+# column-pruned read below got it past its old read-time crash) show it
+# now dying INSIDE this function instead, on 1,149,024 rows x 228 cols --
+# the largest row count of any form in the batch by a wide margin (the
+# next largest, form 7621, is 291,455). The five filter() calls below
+# used to run sequentially, each one a dplyr copy-on-modify step that
+# materializes a brand new tibble from the previous step's result -- up
+# to 5 successive full-ish-width copies for a table this tall, before
+# settling on the final row count.
+#
+# Replaced with one combined boolean vector (identical AND of the exact
+# same per-column conditions, in the same order, so it drops exactly the
+# same rows -- R's `&` short-circuits an already-FALSE row to FALSE
+# regardless of a later NA, matching how a row already dropped by an
+# earlier filter() call was never evaluated against a later one either)
+# and a single base-R subset. That's one O(n) logical vector plus one
+# materialization of the final result, instead of up to five.
 safe_filter_data <- function(df) {
-  result <- df
-  
-  if ("Type_Monitoring" %in% names(result)) {
-    result <- result %>% filter(Type_Monitoring == "EndProcess")
+  cond <- rep(TRUE, nrow(df))
+
+  if ("Type_Monitoring" %in% names(df)) {
+    cond <- cond & (df$Type_Monitoring == "EndProcess")
   }
-  
-  if ("Response" %in% names(result)) {
-    result <- result %>% filter(!is.na(Response), Response != "", Response != "n/a", Response != "NA")
+
+  if ("Response" %in% names(df)) {
+    cond <- cond & (!is.na(df$Response) & df$Response != "" &
+      df$Response != "n/a" & df$Response != "NA")
   }
-  
-  if ("roundNumber" %in% names(result)) {
-    result <- result %>% filter(!is.na(roundNumber), roundNumber != "", roundNumber != "n/a", roundNumber != "NA")
+
+  if ("roundNumber" %in% names(df)) {
+    cond <- cond & (!is.na(df$roundNumber) & df$roundNumber != "" &
+      df$roundNumber != "n/a" & df$roundNumber != "NA")
   }
-  
-  if ("Total_U5_Present" %in% names(result)) {
-    result <- result %>% filter(is.na(Total_U5_Present) | Total_U5_Present != "n/a")
+
+  if ("Total_U5_Present" %in% names(df)) {
+    cond <- cond & (is.na(df$Total_U5_Present) | df$Total_U5_Present != "n/a")
   }
-  
-  if ("TotalFM" %in% names(result)) {
-    result <- result %>% filter(!is.na(TotalFM))
+
+  if ("TotalFM" %in% names(df)) {
+    cond <- cond & (!is.na(df$TotalFM))
   }
-  
-  result
+
+  # `&` only ever produces NA when every operand so far has been TRUE or
+  # NA (a FALSE anywhere already short-circuits the row to FALSE), so an
+  # NA left in `cond` here means "would have been NA under the old
+  # sequential filter() chain too" -- and dplyr's filter() drops NA rows
+  # exactly like FALSE ones. Converting NA -> FALSE before indexing keeps
+  # that behavior; without it, `df[cond, ]` would keep those rows and
+  # fill them with NA instead of dropping them.
+  cond[is.na(cond)] <- FALSE
+
+  df[cond, , drop = FALSE]
 }
 
 standardize_districts <- function(df) {
