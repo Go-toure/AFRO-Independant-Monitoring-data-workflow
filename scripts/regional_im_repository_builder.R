@@ -3567,7 +3567,84 @@ process_nigeria_im_file <- function(input_file, output_folder, qc_output_folder)
 # full-height filtered copy of it, which is what was killing 4498 one
 # step past where this same optimization pattern already fixed form 7621.
 
+# Streaming counterpart of try_pruned_parquet_read() for the chunked
+# processing path. [MEM] diagnostics from the 2026-09-17 15:30 run showed
+# form 4498 "Killed" on chunk 1/6 before even its own first internal
+# checkpoint printed -- with peak RSS already at 2038 MB right after the
+# ordinary pruned read (arrow::read_parquet() %>% as_tibble() on the full
+# 1,149,175-row table), before any chunk-level processing had even
+# started. Holding that whole eagerly-materialized tibble resident for
+# the entire chunk loop (so chunks could be sliced out of it) left almost
+# no headroom -- chunking the DOWNSTREAM transform logic never addressed
+# the real memory cost, which was materializing the full file as R
+# vectors in the first place.
+#
+# This keeps the file open as an Arrow Table instead (as_data_frame =
+# FALSE): the whole file is still read once, but stays in Arrow's own
+# columnar in-memory format rather than being converted into R's
+# per-vector representation up front. Each chunk is sliced off with
+# Table$Slice() (a lightweight view into the Arrow table) and only THAT
+# slice is converted to an R data frame, via get_chunk() in
+# process_im_file_in_chunks() below -- so at most one chunk's worth of R
+# vectors is ever resident alongside the Arrow-format whole-file table,
+# never a second full-height R tibble copy of it.
+#
+# Same soft-fail contract as try_pruned_parquet_read(): returns NULL on
+# any failure (not a parquet file, empty/unmappable schema, or any other
+# error), so the caller falls back to a full in-memory read via
+# read_input_data() -- this can only make an already-failing file do
+# better, never introduce a new way to fail.
+prepare_chunked_arrow_stream <- function(input_file, file_name, active_hh_patterns) {
+  if (!identical(tolower(tools::file_ext(input_file)), "parquet")) return(NULL)
+
+  tryCatch({
+    raw_names <- names(arrow::open_dataset(input_file, format = "parquet")$schema)
+    if (length(raw_names) == 0) return(NULL)
+
+    renamed_names <- rename_repetitive_columns_names(raw_names)
+    raw_by_renamed <- setNames(raw_names, renamed_names)
+
+    stub <- as.data.frame(matrix(nrow = 0, ncol = length(renamed_names)))
+    names(stub) <- renamed_names
+
+    columns_to_select <- select_columns_dynamically(stub, required_columns, active_hh_patterns)
+    if (length(columns_to_select) == 0) return(NULL)
+
+    raw_col_select <- unname(raw_by_renamed[columns_to_select])
+    if (anyNA(raw_col_select)) return(NULL)
+
+    message(sprintf(
+      "[chunk-prune] %s: opening %d of %d columns as an Arrow table (kept in Arrow's columnar format -- not converted to an R data frame until each chunk is sliced off).",
+      basename(input_file), length(raw_col_select), length(raw_names)
+    ))
+
+    arrow_tbl <- arrow::read_parquet(input_file, col_select = all_of(raw_col_select), as_data_frame = FALSE)
+
+    message(sprintf(
+      "[MEM] %s | after opening Arrow table (whole file, not yet materialized as an R data frame): %d rows x %d cols, peak RSS: %.0f MB",
+      basename(input_file), arrow_tbl$num_rows, arrow_tbl$num_columns, peak_rss_mb()
+    ))
+
+    list(table = arrow_tbl, n = arrow_tbl$num_rows)
+  }, error = function(e) {
+    message("[chunk-prune] Arrow streaming setup failed (", conditionMessage(e), ") -- falling back to a full in-memory read.")
+    NULL
+  })
+}
+
 process_im_chunk_to_partial <- function(data, file_name, qc_output_folder, active_hh_patterns, input_file) {
+  minimum_im_markers <- c("Response", "roundNumber", "Type_Monitoring")
+  if (!any(minimum_im_markers %in% names(data))) {
+    stop("File does not look like an IM dataset.")
+  }
+
+  if (!"Country" %in% names(data)) {
+    data$Country <- NA_character_
+  }
+  if (!"Region" %in% names(data)) {
+    data$Region <- NA_character_
+  }
+
   data <- apply_country_specific_transformations(data, file_name, qc_output_folder)
   data <- rename_repetitive_columns(data)
   
@@ -3812,9 +3889,26 @@ process_im_chunk_to_partial <- function(data, file_name, qc_output_folder, activ
     )
 }
 
-process_im_file_in_chunks <- function(data, input_file, output_file, qc_output_file, qc_output_folder,
+process_im_file_in_chunks <- function(input_file, output_file, qc_output_file, qc_output_folder,
                                        file_name, active_hh_patterns, lookup_table, chunk_rows = 200000) {
-  n <- nrow(data)
+  stream <- prepare_chunked_arrow_stream(input_file, file_name, active_hh_patterns)
+
+  if (!is.null(stream)) {
+    n <- stream$n
+    arrow_tbl <- stream$table
+    get_chunk <- function(start_row, end_row) {
+      as.data.frame(arrow_tbl$Slice(start_row - 1, end_row - start_row + 1))
+    }
+  } else {
+    data <- read_input_data(input_file)
+    message(sprintf(
+      "[MEM] %s | after full fallback read (Arrow streaming unavailable for this file): %d rows x %d cols, peak RSS: %.0f MB",
+      basename(input_file), nrow(data), ncol(data), peak_rss_mb()
+    ))
+    n <- nrow(data)
+    get_chunk <- function(start_row, end_row) data[start_row:end_row, , drop = FALSE]
+  }
+
   chunk_starts <- seq(1, n, by = chunk_rows)
   n_chunks <- length(chunk_starts)
   partials <- vector("list", n_chunks)
@@ -3829,7 +3923,7 @@ process_im_file_in_chunks <- function(data, input_file, output_file, qc_output_f
 
     partials[[i]] <- tryCatch(
       process_im_chunk_to_partial(
-        data[start_row:end_row, , drop = FALSE],
+        get_chunk(start_row, end_row),
         file_name, qc_output_folder, active_hh_patterns, input_file
       ),
       error = function(e) {
@@ -4181,6 +4275,18 @@ process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_
     hh_patterns_standard
   }
 
+  # Chunked forms read their own data (as an Arrow table, streamed one
+  # row-slice at a time -- see prepare_chunked_arrow_stream() and
+  # process_im_file_in_chunks() above) instead of the eager full-tibble
+  # read below, so this has to branch BEFORE that read runs at all, not
+  # after it like the single-pass path used to.
+  if (file_name %in% CHUNKED_PROCESSING_ELIGIBLE_FORM_IDS) {
+    return(process_im_file_in_chunks(
+      input_file, output_file, qc_output_file, qc_output_folder,
+      file_name, active_hh_patterns, lookup_table
+    ))
+  }
+
   data <- try_pruned_parquet_read(input_file, file_name, active_hh_patterns)
   if (is.null(data)) {
     data <- read_input_data(input_file)
@@ -4208,13 +4314,6 @@ process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_
   # form whose template omits it.
   if (!"Region" %in% names(data)) {
     data$Region <- NA_character_
-  }
-
-  if (file_name %in% CHUNKED_PROCESSING_ELIGIBLE_FORM_IDS) {
-    return(process_im_file_in_chunks(
-      data, input_file, output_file, qc_output_file, qc_output_folder,
-      file_name, active_hh_patterns, lookup_table
-    ))
   }
 
   data <- apply_country_specific_transformations(data, file_name, qc_output_folder)
