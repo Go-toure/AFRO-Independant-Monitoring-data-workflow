@@ -376,6 +376,104 @@ sp_recover_baseline_file <- function(local_path, remote_filename) {
 }
 
 # ============================================================
+# SHAREPOINT RAW-DATA RECOVERY (independent Build Repository runs)
+# ============================================================
+# Unlike sp_recover_baseline_file() above (one small validation-baseline
+# file), this recovers the actual form-level parquet files
+# regional_im_repository_builder.R needs to run at all. Without this,
+# clicking "Build Repository" on its own -- on a fresh Posit Connect
+# Cloud container that never ran "Fetch Data" first in this same
+# session -- fails immediately with "No supported files found in:
+# data/raw" (as happened in production on 2026-09-17), even though
+# SharePoint's raw_state folder already has every form from the last
+# successful fetch. Lists that folder and downloads only whatever forms
+# are missing locally -- never touches a form that's already there, so
+# this can never clobber a fetch that just ran earlier in this same
+# session. Soft-fails throughout, same as sp_recover_baseline_file() --
+# a miss here just means Build Repository proceeds and fails with its
+# usual clear error, exactly as it does today.
+
+sp_list_folder <- function(token, drive_id, folder_path) {
+  items <- list()
+  url <- sprintf(
+    "https://graph.microsoft.com/v1.0/drives/%s/root:/%s:/children",
+    drive_id, utils::URLencode(folder_path)
+  )
+  tryCatch({
+    while (!is.null(url)) {
+      resp <- httr2::request(url) |>
+        httr2::req_auth_bearer_token(token) |>
+        httr2::req_perform() |>
+        httr2::resp_body_json()
+      items <- c(items, resp$value)
+      url <- resp[["@odata.nextLink"]]
+    }
+  }, error = function(e) NULL)
+  items
+}
+
+sp_recover_raw_forms <- function(raw_dir) {
+  if (!requireNamespace("httr2", quietly = TRUE)) return(invisible(NULL))
+
+  token <- sp_get_graph_token()
+  if (is.null(token)) return(invisible(NULL))
+  drive_id <- sp_get_drive_id(token)
+  if (is.null(drive_id)) return(invisible(NULL))
+
+  remote_folder <- "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/raw_state"
+  remote_items <- sp_list_folder(token, drive_id, remote_folder)
+  if (length(remote_items) == 0) return(invisible(NULL))
+
+  remote_names <- vapply(remote_items, function(it) it$name, character(1))
+  remote_parquet <- remote_names[grepl("\\.parquet$", remote_names, ignore.case = TRUE)]
+
+  dir.create(raw_dir, recursive = TRUE, showWarnings = FALSE)
+
+  recovered <- 0L
+  attempted <- 0L
+  for (name in remote_parquet) {
+    local_path <- file.path(raw_dir, name)
+    if (file.exists(local_path)) next  # already have it -- never overwrite
+
+    attempted <- attempted + 1L
+    ok <- tryCatch({
+      content_url <- sprintf(
+        "https://graph.microsoft.com/v1.0/drives/%s/root:/%s:/content",
+        drive_id, utils::URLencode(paste0(remote_folder, "/", name))
+      )
+      resp <- httr2::request(content_url) |>
+        httr2::req_auth_bearer_token(token) |>
+        httr2::req_perform()
+      writeBin(httr2::resp_body_raw(resp), local_path)
+      TRUE
+    }, error = function(e) FALSE)
+
+    if (ok) {
+      recovered <- recovered + 1L
+      meta_name <- sub("\\.parquet$", "_metadata.json", name, ignore.case = TRUE)
+      if (meta_name %in% remote_names) {
+        tryCatch({
+          meta_url <- sprintf(
+            "https://graph.microsoft.com/v1.0/drives/%s/root:/%s:/content",
+            drive_id, utils::URLencode(paste0(remote_folder, "/", meta_name))
+          )
+          meta_resp <- httr2::request(meta_url) |>
+            httr2::req_auth_bearer_token(token) |>
+            httr2::req_perform()
+          writeBin(httr2::resp_body_raw(meta_resp), file.path(raw_dir, meta_name))
+        }, error = function(e) NULL)
+      }
+    }
+  }
+
+  if (attempted > 0) {
+    log_info("Recovered {recovered}/{attempted} form(s) from SharePoint raw-state (no local copy existed yet).")
+  }
+
+  invisible(NULL)
+}
+
+# ============================================================
 # FUNCTION: Run R script in separate process (prevents quit() from stopping workflow)
 # ============================================================
 
@@ -616,6 +714,8 @@ if (!skip_fetch) {
 
 if (!skip_build) {
   log_info("\n[STEP 2] Building regional IM repository...")
+
+  sp_recover_raw_forms(file.path(BASE_DIR, "data", "raw"))
 
   sp_recover_baseline_file(
     file.path(BASE_DIR, "data", "final", "export_manifest.txt"),
