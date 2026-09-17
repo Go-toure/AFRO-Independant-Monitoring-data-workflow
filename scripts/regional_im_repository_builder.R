@@ -25,6 +25,26 @@ pacman::p_load(
   tidyverse, lubridate, readxl, readr, tools, tibble, qs, stringr, arrow, data.table, openxlsx
 )
 
+# Reads this process's PEAK resident memory (the high-water mark since it
+# started, not just current usage) from /proc/self/status -- the same
+# Linux-native technique Fetch_im_data.py's own "[MEM] Peak RSS" diagnostic
+# already uses on the Python side, so numbers from both scripts are
+# directly comparable. Purely diagnostic: returns NA_real_ (never raises)
+# on any non-Linux platform or read failure, and can never affect whether
+# processing succeeds. Added while chasing why forms 4498/7178/7621 still
+# get OOM-killed (exit 137) even fully isolated in their own fresh
+# process -- these checkpoints tell us how much memory each stage
+# actually uses instead of guessing from file size alone.
+peak_rss_mb <- function() {
+  tryCatch({
+    status_lines <- readLines("/proc/self/status", warn = FALSE)
+    vmhwm_line <- grep("^VmHWM:", status_lines, value = TRUE)
+    if (length(vmhwm_line) == 0) return(NA_real_)
+    kb <- as.numeric(regmatches(vmhwm_line, regexpr("[0-9]+", vmhwm_line)))
+    kb / 1024
+  }, error = function(e) NA_real_)
+}
+
 # ============================================================
 # USER PATHS
 # ============================================================
@@ -164,6 +184,7 @@ NIGERIA_IM_SCRIPT_INLINE <- c(
   "AB <- AB[!is.na(states)]",
   "",
   "cat(\"Read completed in:\", round(difftime(Sys.time(), t0, units = \"secs\"), 1), \"seconds\\n\")",
+  "message(sprintf(\"[MEM] %s | after read completed in: peak RSS %.0f MB\", basename(rds_file), peak_rss_mb()))",
   "",
   "# ============================================================",
   "# 2) HELPERS",
@@ -865,6 +886,7 @@ NIGERIA_IM_SCRIPT_INLINE <- c(
   "AE[, row_id___ := .I]",
   "",
   "cat(\"Base prep completed in:\", round(difftime(Sys.time(), t0, units = \"secs\"), 1), \"seconds\\n\")",
+  "message(sprintf(\"[MEM] %s | after base prep completed in: peak RSS %.0f MB\", basename(rds_file), peak_rss_mb()))",
   "",
   "# ============================================================",
   "# 5) OPTIMIZED REASON LONG TABLE",
@@ -928,6 +950,7 @@ NIGERIA_IM_SCRIPT_INLINE <- c(
   "",
   "cat(\"Reason long table rows:\", nrow(reason_long), \"\\n\")",
   "cat(\"Reason long processing completed in:\", round(difftime(Sys.time(), t0, units = \"secs\"), 1), \"seconds\\n\")",
+  "message(sprintf(\"[MEM] %s | after reason long processing completed in: peak RSS %.0f MB\", basename(rds_file), peak_rss_mb()))",
   "",
   "# ============================================================",
   "# 6) CLASSIFY REASONS",
@@ -944,6 +967,7 @@ NIGERIA_IM_SCRIPT_INLINE <- c(
   "reason_long[main_reason == \"r_non_FM_NC\", nc_reason := detect_nc_reason(reason_final)]",
   "",
   "cat(\"Reason classification completed in:\", round(difftime(Sys.time(), t0, units = \"secs\"), 1), \"seconds\\n\")",
+  "message(sprintf(\"[MEM] %s | after reason classification completed in: peak RSS %.0f MB\", basename(rds_file), peak_rss_mb()))",
   "",
   "# ============================================================",
   "# 7) WIDE REASON TABLES",
@@ -987,6 +1011,7 @@ NIGERIA_IM_SCRIPT_INLINE <- c(
   "for (v in setdiff(nc_reason_vars, names(nc_reason_wide))) nc_reason_wide[, (v) := 0L]",
   "",
   "cat(\"Reason wide tables completed in:\", round(difftime(Sys.time(), t0, units = \"secs\"), 1), \"seconds\\n\")",
+  "message(sprintf(\"[MEM] %s | after reason wide tables completed in: peak RSS %.0f MB\", basename(rds_file), peak_rss_mb()))",
   "",
   "# ============================================================",
   "# 8) SOCIAL MOBILIZATION - CORRECT NIGERIA CODEBOOK",
@@ -1083,6 +1108,7 @@ NIGERIA_IM_SCRIPT_INLINE <- c(
   "}",
   "",
   "cat(\"SM processing completed in:\", round(difftime(Sys.time(), t0, units = \"secs\"), 1), \"seconds\\n\")",
+  "message(sprintf(\"[MEM] %s | after sm processing completed in: peak RSS %.0f MB\", basename(rds_file), peak_rss_mb()))",
   "",
   "# ============================================================",
   "# 9) BASE REPOSITORY AGGREGATION",
@@ -1116,6 +1142,7 @@ NIGERIA_IM_SCRIPT_INLINE <- c(
   "AK_base[is.nan(cv) | is.infinite(cv), cv := NA_real_]",
   "",
   "cat(\"Base aggregation completed in:\", round(difftime(Sys.time(), t0, units = \"secs\"), 1), \"seconds\\n\")",
+  "message(sprintf(\"[MEM] %s | after base aggregation completed in: peak RSS %.0f MB\", basename(rds_file), peak_rss_mb()))",
   "",
   "# ============================================================",
   "# 10) MERGE FINAL REPOSITORY",
@@ -1438,6 +1465,7 @@ NIGERIA_IM_SCRIPT_INLINE <- c(
   "setcolorder(AK, c(existing_final_cols, remaining_cols))",
   "",
   "cat(\"Final merge completed in:\", round(difftime(Sys.time(), t0, units = \"secs\"), 1), \"seconds\\n\")",
+  "message(sprintf(\"[MEM] %s | after final merge completed in: peak RSS %.0f MB\", basename(rds_file), peak_rss_mb()))",
   "",
   "# ============================================================",
   "# 11) QC",
@@ -1536,6 +1564,7 @@ NIGERIA_IM_SCRIPT_INLINE <- c(
   "fwrite(AK, out_file)",
   "",
   "cat(\"Export completed in:\", round(difftime(Sys.time(), t0, units = \"secs\"), 1), \"seconds\\n\")",
+  "message(sprintf(\"[MEM] %s | after export completed in: peak RSS %.0f MB\", basename(rds_file), peak_rss_mb()))",
   "cat(\"\\nNigeria IM repository successfully written to:\\n\", out_file, \"\\n\")",
   "",
   "",
@@ -3362,12 +3391,17 @@ process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_
   message("\n============================================================")
   message("Processing file: ", basename(input_file))
   message("============================================================")
+  message(sprintf("[MEM] %s | peak RSS before read: %.0f MB", basename(input_file), peak_rss_mb()))
   
   if (identical(file_name, NIGERIA_IM_FORM_ID)) {
     return(process_nigeria_im_file(input_file, output_folder, qc_output_folder))
   }
   
   data <- read_input_data(input_file)
+  message(sprintf(
+    "[MEM] %s | after read: %d rows x %d cols, peak RSS: %.0f MB",
+    basename(input_file), nrow(data), ncol(data), peak_rss_mb()
+  ))
   
   minimum_im_markers <- c("Response", "roundNumber", "Type_Monitoring")
   if (!any(minimum_im_markers %in% names(data))) {
@@ -3408,6 +3442,10 @@ process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_
     message("Warning: No data after filtering. Using original data with selected columns.")
     GF <- data %>% select(any_of(columns_to_select))
   }
+  message(sprintf(
+    "[MEM] %s | after filter+select: %d rows x %d cols, peak RSS: %.0f MB",
+    basename(input_file), nrow(GF), ncol(GF), peak_rss_mb()
+  ))
   
   hh_cols <- names(GF)[str_detect(names(GF), "^HH\\[")]
   
@@ -3449,6 +3487,10 @@ process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_
   }
   
   GH <- create_summary_columns(GF, file_name = file_name)
+  message(sprintf(
+    "[MEM] %s | after create_summary_columns: %d rows x %d cols, peak RSS: %.0f MB",
+    basename(input_file), nrow(GH), ncol(GH), peak_rss_mb()
+  ))
   
   if ("HH_count" %in% names(GH)) {
     GH <- GH %>%
