@@ -4594,42 +4594,36 @@ build_regional_im_repository <- function(processed_results, regional_repository_
 # BATCH RUNNER
 # ============================================================
 
-# A file at or above this size gets processed in its own, fresh Rscript
-# child process (see process_im_file_or_isolate() below) instead of
-# inline in this long-running session. This is a SIZE threshold, not a
-# form-ID check, on purpose -- it is meant to catch whichever form is
-# heaviest at any given time (today that's form 4498, at ~410 MB and
-# climbing every run; the next-largest form as of 2026-09-17 is only
-# ~117 MB), the same generic, threshold-based philosophy already used
-# on the Python fetch side (Fetch_im_data.py's own row-count
-# thresholds) rather than hardcoding a specific form.
-ISOLATED_FILE_SIZE_THRESHOLD_BYTES <- 150 * 1024^2  # 150 MB
-
-# Runs process_im_file() for one input file, isolating it in a fresh
-# Rscript child process when it's over ISOLATED_FILE_SIZE_THRESHOLD_BYTES.
+# Runs process_im_file() for ONE input file in its own, fresh Rscript
+# child process -- unconditionally, for every file, regardless of size.
 #
-# Why: process_im_file() loads the WHOLE file into memory as a tibble
-# (arrow::read_parquet() %>% as_tibble()) and runs several tidyverse
-# transformations over it, each of which can hold its own full copy in
-# memory at once. For a wide, high-row-count form (form 4498 is ~822
-# columns x 1.1M+ rows) that's a genuinely large amount of memory no
-# matter how it's processed. Worse, when this ran inline as part of the
-# same 34-file loop, R's own garbage collector doesn't necessarily
-# release every previous file's memory before the next file starts, so
-# the loop's memory footprint could keep climbing across iterations --
-# and once ONE file's processing gets OOM-killed (exit code 137), the
-# whole Rscript process dies with it, discarding every other file's
-# already-completed output along with it (as happened in production on
-# 2026-09-17, killed while reading form 4498's parquet file as the 12th
-# of 34 files).
+# This started out as a size threshold (isolate only forms over 150 MB
+# on disk, on the assumption that form 4498 -- ~822 columns x 1.1M+
+# rows -- was the one file too big to process safely). That assumption
+# didn't survive contact with production: the very next run still got
+# OOM-killed (exit code 137), but on the 4th of 34 files (form 4344,
+# only 67 MB), nowhere near that threshold. That rules out "one huge
+# file" as the whole story -- R's own garbage collector doesn't
+# reliably release a form's memory before the next one starts in the
+# same long-running session, so this loop's memory footprint can climb
+# across iterations regardless of any single file's size, until
+# whichever file happens to be running when the ceiling gets crossed
+# takes the kill -- and takes the rest of the batch down with it (both
+# times this ran in production on 2026-09-17, every already-completed
+# form's output was lost along with it).
 #
-# Isolating any oversized file in its own child process fixes both
-# problems: that file gets a completely fresh memory budget with
-# nothing left over from earlier files, and if it's OOM-killed anyway,
-# only that one child dies -- this parent loop catches the failure,
-# records it exactly like an ordinary per-file error (NULL data/qc, a
-# one-row summary noting the failure), and moves on to the next file
-# instead of losing the whole batch.
+# A size threshold can't fix an accumulation problem. Isolating EVERY
+# file removes it entirely: nothing from any previous file is ever
+# still resident when the next one starts, so there is nothing left to
+# accumulate. If a file still gets OOM-killed on its own (a real
+# possibility for something the size of 4498), only that one child
+# process dies -- this parent loop catches the failure, records it
+# exactly like an ordinary per-file error (NULL data/qc, a one-row
+# summary noting the failure), and moves on to the next file instead of
+# losing the whole batch. The tradeoff is slower overall runtime (34
+# fresh Rscript startups, each reloading the same tidyverse/arrow
+# packages, instead of one long-running session) -- worth it while this
+# step can't otherwise complete at all.
 process_im_file_or_isolate <- function(f, output_folder, qc_output_folder, lookup_table, this_script_path) {
   failure_result <- function(msg) {
     message("ERROR in file ", basename(f), ": ", msg)
@@ -4647,18 +4641,9 @@ process_im_file_or_isolate <- function(f, output_folder, qc_output_folder, looku
     )
   }
 
-  file_size <- tryCatch(file.size(f), error = function(e) NA_real_)
-
-  if (is.na(file_size) || file_size < ISOLATED_FILE_SIZE_THRESHOLD_BYTES) {
-    return(tryCatch(
-      process_im_file(f, output_folder, qc_output_folder, lookup_table),
-      error = function(e) failure_result(e$message)
-    ))
-  }
-
   message(sprintf(
-    "[isolate] %s is %.1f MB (over the %.0f MB isolation threshold) -- processing it in its own Rscript process so an out-of-memory kill here can't take down the rest of this build.",
-    basename(f), file_size / 1024^2, ISOLATED_FILE_SIZE_THRESHOLD_BYTES / 1024^2
+    "[isolate] Processing %s in its own Rscript process (so an out-of-memory kill here can't take down the rest of this build, and nothing it allocates can accumulate into the next file's budget).",
+    basename(f)
   ))
 
   result_path <- tempfile(fileext = ".rds")
@@ -4752,8 +4737,9 @@ process_all_im_files <- function(input_folder, output_folder, qc_output_folder, 
 # ============================================================
 # Invoked as `Rscript regional_im_repository_builder.R --isolated-file
 # <input_file> <result_rds_path>` -- process_im_file_or_isolate() above
-# shells out to exactly this, for any one file over
-# ISOLATED_FILE_SIZE_THRESHOLD_BYTES. Everything this needs
+# shells out to exactly this for every single file in the batch (see
+# that function's own docstring for why it's unconditional now, not
+# just for oversized files). Everything this needs
 # (process_im_file(), output_folder, qc_output_folder, lookup_table) is
 # already defined above by the time this runs, since the script is
 # sourced top-to-bottom either way -- this block just intercepts before
