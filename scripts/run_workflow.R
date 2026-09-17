@@ -474,6 +474,163 @@ sp_recover_raw_forms <- function(raw_dir) {
 }
 
 # ============================================================
+# SHAREPOINT BUILD-OUTPUT BACKUP/RECOVERY (independent Clean Geonames runs)
+# ============================================================
+# clean_geonames.R's own input (data/final/Regional_IM_repository.csv) is
+# Build Repository's raw, pre-clean output -- unlike the raw form parquet
+# files above, it is never uploaded to SharePoint as part of Step 5 (only
+# the CLEANED file is). Without a copy of it somewhere, clicking "Clean
+# Geonames" on its own -- on a fresh Posit Connect Cloud container that
+# never ran "Build Repository" first in this same session -- fails
+# immediately with "Input file not found", the same class of problem
+# sp_recover_raw_forms() solved for Build Repository itself.
+#
+# Backs up the smallest of Build Repository's three output formats
+# (Regional_IM_repository.parquet, ~1-2 MB vs. ~16 MB for the CSV) to a
+# dedicated SharePoint folder right after a successful build, and recovers
+# it the same soft-fail way sp_recover_raw_forms() recovers raw parquet --
+# only when nothing usable already sits in data/final locally, so this can
+# never clobber a build that just ran earlier in this same session.
+# clean_geonames.R's own read_input_data() already falls back from .csv to
+# .parquet to .rds within data/final, so no change to that script is
+# needed: dropping the recovered .parquet there is enough for it to be
+# picked up automatically.
+
+sp_ensure_folder <- function(token, drive_id, folder_path) {
+  segments <- Filter(nzchar, strsplit(folder_path, "/")[[1]])
+  current <- ""
+
+  for (seg in segments) {
+    parent <- current
+    current <- if (nzchar(current)) paste0(current, "/", seg) else seg
+
+    exists <- tryCatch({
+      check_url <- sprintf(
+        "https://graph.microsoft.com/v1.0/drives/%s/root:/%s",
+        drive_id, utils::URLencode(current)
+      )
+      httr2::request(check_url) |>
+        httr2::req_auth_bearer_token(token) |>
+        httr2::req_perform()
+      TRUE
+    }, error = function(e) FALSE)
+
+    if (exists) next
+
+    created <- tryCatch({
+      if (nzchar(parent)) {
+        parent_url <- sprintf(
+          "https://graph.microsoft.com/v1.0/drives/%s/root:/%s",
+          drive_id, utils::URLencode(parent)
+        )
+        parent_id <- (httr2::request(parent_url) |>
+          httr2::req_auth_bearer_token(token) |>
+          httr2::req_perform() |>
+          httr2::resp_body_json())$id
+        create_url <- sprintf(
+          "https://graph.microsoft.com/v1.0/drives/%s/items/%s/children",
+          drive_id, parent_id
+        )
+      } else {
+        create_url <- sprintf("https://graph.microsoft.com/v1.0/drives/%s/root/children", drive_id)
+      }
+      httr2::request(create_url) |>
+        httr2::req_auth_bearer_token(token) |>
+        httr2::req_body_json(list(
+          name = seg,
+          folder = list(),
+          "@microsoft.graph.conflictBehavior" = "rename"
+        )) |>
+        httr2::req_perform()
+      TRUE
+    }, error = function(e) FALSE)
+
+    if (!created) return(FALSE)
+  }
+
+  TRUE
+}
+
+SP_BUILD_STATE_FOLDER <- "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/build_state"
+SP_BUILD_STATE_FILE <- "Regional_IM_repository.parquet"
+
+sp_backup_build_output <- function(final_dir) {
+  local_path <- file.path(final_dir, SP_BUILD_STATE_FILE)
+  if (!file.exists(local_path)) return(invisible(NULL))
+  if (!requireNamespace("httr2", quietly = TRUE)) return(invisible(NULL))
+
+  token <- sp_get_graph_token()
+  if (is.null(token)) return(invisible(NULL))
+  drive_id <- sp_get_drive_id(token)
+  if (is.null(drive_id)) return(invisible(NULL))
+
+  if (!sp_ensure_folder(token, drive_id, SP_BUILD_STATE_FOLDER)) {
+    log_warn("Could not ensure SharePoint build_state folder exists -- skipping build-output backup.")
+    return(invisible(NULL))
+  }
+
+  remote_path <- paste0(SP_BUILD_STATE_FOLDER, "/", SP_BUILD_STATE_FILE)
+  content_url <- sprintf(
+    "https://graph.microsoft.com/v1.0/drives/%s/root:/%s:/content",
+    drive_id, utils::URLencode(remote_path)
+  )
+
+  tryCatch({
+    httr2::request(content_url) |>
+      httr2::req_auth_bearer_token(token) |>
+      httr2::req_method("PUT") |>
+      httr2::req_headers("Content-Type" = "application/octet-stream") |>
+      httr2::req_body_file(local_path) |>
+      httr2::req_perform()
+    log_info("Backed up {SP_BUILD_STATE_FILE} to SharePoint build_state (for standalone Clean Geonames runs).")
+  }, error = function(e) {
+    log_warn("Could not back up {SP_BUILD_STATE_FILE} to SharePoint: {e$message}")
+  })
+
+  invisible(NULL)
+}
+
+sp_recover_build_output <- function(final_dir) {
+  # Only step in if NOTHING usable already exists locally -- never
+  # overwrite a file this session's own Build Repository just produced,
+  # and never clobber a fresher local copy with a possibly-stale
+  # SharePoint one.
+  existing <- c(
+    file.path(final_dir, "Regional_IM_repository.csv"),
+    file.path(final_dir, "Regional_IM_repository.parquet"),
+    file.path(final_dir, "Regional_IM_repository.rds")
+  )
+  if (any(file.exists(existing))) return(invisible(NULL))
+  if (!requireNamespace("httr2", quietly = TRUE)) return(invisible(NULL))
+
+  token <- sp_get_graph_token()
+  if (is.null(token)) return(invisible(NULL))
+  drive_id <- sp_get_drive_id(token)
+  if (is.null(drive_id)) return(invisible(NULL))
+
+  remote_path <- paste0(SP_BUILD_STATE_FOLDER, "/", SP_BUILD_STATE_FILE)
+  content_url <- sprintf(
+    "https://graph.microsoft.com/v1.0/drives/%s/root:/%s:/content",
+    drive_id, utils::URLencode(remote_path)
+  )
+  local_path <- file.path(final_dir, SP_BUILD_STATE_FILE)
+
+  tryCatch({
+    resp <- httr2::request(content_url) |>
+      httr2::req_auth_bearer_token(token) |>
+      httr2::req_perform()
+    dir.create(final_dir, recursive = TRUE, showWarnings = FALSE)
+    writeBin(httr2::resp_body_raw(resp), local_path)
+    log_info("Recovered {SP_BUILD_STATE_FILE} from SharePoint (no local Build Repository output existed yet).")
+  }, error = function(e) {
+    log_warn("Could not recover {SP_BUILD_STATE_FILE} from SharePoint: {e$message}")
+  })
+
+  invisible(NULL)
+}
+
+
+# ============================================================
 # FUNCTION: Run R script in separate process (prevents quit() from stopping workflow)
 # ============================================================
 
@@ -742,6 +899,7 @@ if (!skip_build) {
       quit(status = 1)
     }
     step_status$build <- "ok"
+    sp_backup_build_output(file.path(BASE_DIR, "data", "final"))
   } else {
     log_error("Builder script not found: {builder_script}")
     cat("\n[ERROR] [STEP 2] Builder script not found: ", builder_script, " - Workflow stopped.\n", sep = "")
@@ -773,6 +931,8 @@ clean_ok <- TRUE
 
 if (!skip_clean) {
   log_info("\n[STEP 3] Cleaning geonames...")
+
+  sp_recover_build_output(file.path(BASE_DIR, "data", "final"))
 
   sp_recover_baseline_file(
     file.path(BASE_DIR, "data", "final", "IM_geonames_cleaning_summary.csv"),
