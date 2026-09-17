@@ -45,6 +45,52 @@ peak_rss_mb <- function() {
   }, error = function(e) NA_real_)
 }
 
+# Chunks measure.vars into groups and melts each group separately,
+# rbindlist-ing the results, instead of reshaping every measure column in
+# one melt() call. Built for form 7178/Nigeria's reason-column reshape --
+# [MEM] diagnostics from 2026-09-17 show that step dying right after
+# "Processing missed-child reasons...", starting from an already
+# substantial ~2.6GB baseline, when melt() is asked to reshape every
+# NOimmReas_Child* column (there can be 100+) across 1M+ rows in one call.
+#
+# This changes nothing about the RESULT: data.table::melt() already
+# builds its output by grouping all rows for measure.vars[1] first, then
+# all rows for measure.vars[2], and so on -- melting a contiguous slice of
+# that same column order at a time and rbindlist-ing the slices back
+# together in order produces the exact same set of (row, variable, value)
+# triples a single melt() call would. Every downstream use of this table
+# (dcast() aggregation, vectorized row-wise reason classification) is
+# order-independent regardless, so even if row order were to differ this
+# could not change the final output -- this is purely a peak-memory cap:
+# instead of one melt() call materializing every measure column's reshape
+# at once, only chunk_size columns' worth is ever live at a time.
+chunked_melt <- function(dt, id.vars, measure.vars, variable.name, value.name,
+                          variable.factor = FALSE, chunk_size = 15) {
+  if (length(measure.vars) <= chunk_size) {
+    return(data.table::melt(
+      dt,
+      id.vars = id.vars,
+      measure.vars = measure.vars,
+      variable.name = variable.name,
+      value.name = value.name,
+      variable.factor = variable.factor
+    ))
+  }
+
+  chunks <- split(measure.vars, ceiling(seq_along(measure.vars) / chunk_size))
+  pieces <- lapply(chunks, function(cols) {
+    data.table::melt(
+      dt,
+      id.vars = id.vars,
+      measure.vars = cols,
+      variable.name = variable.name,
+      value.name = value.name,
+      variable.factor = variable.factor
+    )
+  })
+  data.table::rbindlist(pieces, use.names = TRUE)
+}
+
 # ============================================================
 # USER PATHS
 # ============================================================
@@ -130,6 +176,22 @@ for (d in required_dirs) {
 # ============================================================
 ALGERIA_IM_FORM_ID <- "8587"
 NIGERIA_IM_FORM_ID <- "7178"
+
+# Forms eligible for the column-pruned parquet read in process_im_file()
+# -- see try_pruned_parquet_read() below for the full rationale. This is
+# deliberately an ALLOWLIST, not a denylist: several forms'
+# apply_country_specific_transformations() branches reference EXTRA raw
+# columns beyond what required_columns/select_columns_dynamically() would
+# independently select on their own (e.g. form 4351 needs both a
+# "District" column AND a separate lowercase "district" column to survive
+# to its mutate(District = district) step -- pruning by required-column
+# matching alone could keep only one of the two, since both normalize to
+# the same fuzzy-match target). Only forms verified to need nothing beyond
+# the standard name-based selection logic belong here. Currently just
+# 4498, the form this was built for (822 columns x 1.15M+ rows, OOM-killed
+# at the ordinary full read in production on 2026-09-17, before any of
+# this file's own filter/select narrowing ever ran).
+PRUNED_READ_ELIGIBLE_FORM_IDS <- c("4498")
 
 # ============================================================
 # INLINE NIGERIA IM PROCESSOR SCRIPT FOR FORM 7178
@@ -908,7 +970,7 @@ NIGERIA_IM_SCRIPT_INLINE <- c(
   "  \"Vaccine.type\"",
   ")",
   "",
-  "reason_long_main <- melt(",
+  "reason_long_main <- chunked_melt(",
   "  AE,",
   "  id.vars = id_cols_reason,",
   "  measure.vars = reason_cols_main,",
@@ -920,7 +982,7 @@ NIGERIA_IM_SCRIPT_INLINE <- c(
   "reason_long_main[, reason_raw := normalize_reason_text(reason_raw)]",
   "reason_long_main <- reason_long_main[!is.na(reason_raw) & reason_raw != \"\"]",
   "",
-  "reason_long_other <- melt(",
+  "reason_long_other <- chunked_melt(",
   "  AE,",
   "  id.vars = \"row_id___\",",
   "  measure.vars = reason_cols_other,",
@@ -1993,6 +2055,79 @@ read_input_data <- function(input_file) {
   }
   
   stop("Unsupported file extension: .", ext, " for file: ", basename(input_file))
+}
+
+# ============================================================
+# COLUMN-PRUNED PARQUET READ (form 4498 and similar oversized forms)
+# ============================================================
+# Form 4498 (822 columns x 1.15M+ rows) gets OOM-killed at the read step
+# itself -- [MEM] diagnostics from 2026-09-17 show it dying with nothing
+# printed past "peak RSS before read: 301 MB", before any of this file's
+# own filter/select narrowing ever runs. Only ~250 of its 822 columns
+# ever survive select_columns_dynamically() downstream in
+# process_im_file(), so reading all 822 into memory just to discard most
+# of them is the real problem, not the row count.
+#
+# arrow::read_parquet(col_select = ...) can read only the needed columns
+# directly off disk, but the "needed" list has to be computed from
+# COLUMN NAMES alone, before any data is read. That only works for a form
+# whose column-selection path never depends on cell VALUES -- true of
+# select_columns_dynamically()/find_similar_column() (pure name matching)
+# and rename_repetitive_columns() (a pure regex rename on colnames()),
+# but not guaranteed for every apply_country_specific_transformations()
+# branch (see PRUNED_READ_ELIGIBLE_FORM_IDS above for why this is an
+# allowlist rather than "every parquet file").
+#
+# Soft-fails throughout: any error here, or any selected column that
+# can't be traced back to a raw parquet column, returns NULL so
+# process_im_file() falls back to the ordinary full read_input_data().
+# This is purely a memory optimization -- it can only make a file that
+# already fails today succeed, never introduce a new way to fail.
+
+# Name-only counterpart of rename_repetitive_columns() -- same regex,
+# operating on a character vector of column names instead of a data
+# frame, so it can run against a parquet schema before any data is read.
+rename_repetitive_columns_names <- function(col_names) {
+  pattern <- "^HH\\[\\d+\\]/HH/"
+  ifelse(grepl(pattern, col_names), gsub("HH/", "", col_names), col_names)
+}
+
+try_pruned_parquet_read <- function(input_file, file_name, active_hh_patterns) {
+  if (!identical(tolower(tools::file_ext(input_file)), "parquet")) return(NULL)
+  if (!file_name %in% PRUNED_READ_ELIGIBLE_FORM_IDS) return(NULL)
+
+  tryCatch({
+    raw_names <- names(arrow::open_dataset(input_file, format = "parquet")$schema)
+    if (length(raw_names) == 0) return(NULL)
+
+    # Mirror rename_repetitive_columns()'s pure name-based rename so the
+    # selection logic sees exactly the column names a full read would
+    # produce -- without needing the data itself.
+    renamed_names <- rename_repetitive_columns_names(raw_names)
+    raw_by_renamed <- setNames(raw_names, renamed_names)
+
+    # A zero-row stub with the post-rename names is all
+    # select_columns_dynamically()/find_similar_column() need -- both
+    # work off names(df) alone.
+    stub <- as.data.frame(matrix(nrow = 0, ncol = length(renamed_names)))
+    names(stub) <- renamed_names
+
+    columns_to_select <- select_columns_dynamically(stub, required_columns, active_hh_patterns)
+    if (length(columns_to_select) == 0) return(NULL)
+
+    raw_col_select <- unname(raw_by_renamed[columns_to_select])
+    if (anyNA(raw_col_select)) return(NULL)  # mapping gap -- bail to a full read
+
+    message(sprintf(
+      "[prune] %s: reading %d of %d columns directly from parquet (skipping the rest at the disk level).",
+      basename(input_file), length(raw_col_select), length(raw_names)
+    ))
+
+    arrow::read_parquet(input_file, col_select = all_of(raw_col_select)) %>% as_tibble()
+  }, error = function(e) {
+    message("[prune] column-pruned read failed (", conditionMessage(e), ") -- falling back to a full read.")
+    NULL
+  })
 }
 
 # ============================================================
@@ -3397,7 +3532,16 @@ process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_
     return(process_nigeria_im_file(input_file, output_folder, qc_output_folder))
   }
   
-  data <- read_input_data(input_file)
+  active_hh_patterns <- if (identical(file_name, ALGERIA_IM_FORM_ID)) {
+    hh_patterns_algeria
+  } else {
+    hh_patterns_standard
+  }
+
+  data <- try_pruned_parquet_read(input_file, file_name, active_hh_patterns)
+  if (is.null(data)) {
+    data <- read_input_data(input_file)
+  }
   message(sprintf(
     "[MEM] %s | after read: %d rows x %d cols, peak RSS: %.0f MB",
     basename(input_file), nrow(data), ncol(data), peak_rss_mb()
@@ -3425,12 +3569,6 @@ process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_
 
   data <- apply_country_specific_transformations(data, file_name, qc_output_folder)
   data <- rename_repetitive_columns(data)
-  
-  active_hh_patterns <- if (identical(file_name, ALGERIA_IM_FORM_ID)) {
-    hh_patterns_algeria
-  } else {
-    hh_patterns_standard
-  }
   
   columns_to_select <- select_columns_dynamically(data, required_columns, active_hh_patterns)
 
