@@ -3433,11 +3433,38 @@ process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_
   }
   
   columns_to_select <- select_columns_dynamically(data, required_columns, active_hh_patterns)
-  
+
+  # NOTE ON ORDER (select BEFORE filter, not after): [MEM] diagnostics from
+  # production (2026-09-17) showed peak RSS roughly doubling-to-tripling at
+  # this exact step for every one of the 31 successfully-processed forms --
+  # e.g. form 10267 went 884MB -> 2617MB while BOTH rows (167325 -> 74348)
+  # and columns (629 -> 248) went down, and form 7621 (792 columns, the
+  # widest form in the whole batch) was OOM-killed here outright. That
+  # pattern only makes sense if safe_filter_data() was filtering the FULL
+  # wide table (600-800+ columns) before select() ever got a chance to
+  # narrow it to the ~250 columns this pipeline actually keeps -- dplyr's
+  # filter() has to materialize every column's data for the surviving rows,
+  # so filtering wide is doing 3-4x more copying than it needs to.
+  #
+  # This reorder is safe because every column safe_filter_data() reads
+  # (Response, roundNumber, Type_Monitoring, Total_U5_Present, TotalFM) is
+  # already in required_columns above, so select_columns_dynamically() --
+  # which resolves against the FULL data, matching on the real column
+  # names via find_similar_column() -- always keeps whichever of these
+  # columns actually exist under their real names. select() only ever
+  # projects columns; it never touches row values. So narrowing to
+  # columns_to_select first, then filtering that narrower table, drops
+  # exactly the same rows for exactly the same reason as before -- just
+  # without ever materializing the columns nothing downstream needed.
   GF <- data %>%
-    safe_filter_data() %>%
     select(any_of(columns_to_select))
-  
+  message(sprintf(
+    "[MEM] %s | after select (before filter): %d rows x %d cols, peak RSS: %.0f MB",
+    basename(input_file), nrow(GF), ncol(GF), peak_rss_mb()
+  ))
+
+  GF <- GF %>% safe_filter_data()
+
   if (nrow(GF) == 0) {
     message("Warning: No data after filtering. Using original data with selected columns.")
     GF <- data %>% select(any_of(columns_to_select))
