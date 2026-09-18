@@ -177,8 +177,10 @@ sp_backup_file <- function(local_path, remote_path) {
   if (is.null(drive_id)) return(invisible(NULL))
 
   remote_folder <- dirname(remote_path)
-  if (!sp_ensure_folder(token, drive_id, remote_folder)) {
-    message("Could not ensure SharePoint folder ", remote_folder, " exists -- skipping backup of ", basename(local_path), ".")
+  folder_result <- sp_ensure_folder(token, drive_id, remote_folder)
+  if (!folder_result$ok) {
+    error_detail <- if (is.null(folder_result$error)) "unknown error" else folder_result$error
+    message("Could not ensure SharePoint folder ", remote_folder, " exists -- skipping backup of ", basename(local_path), ". Reason: ", error_detail)
     return(invisible(NULL))
   }
 

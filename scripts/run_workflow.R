@@ -497,6 +497,14 @@ sp_recover_raw_forms <- function(raw_dir) {
 # picked up automatically.
 
 sp_ensure_folder <- function(token, drive_id, folder_path) {
+  # Returns list(ok = TRUE/FALSE, error = <message or NULL>, folder = <segment
+  # that failed, or the full path on success>) -- a plain TRUE/FALSE used to
+  # be returned here, but every caller's failure log was then reduced to a
+  # generic "could not ensure folder" with no way to tell a real problem
+  # (permissions, a renamed site, SharePoint quota) apart from a transient
+  # blip. Capturing the actual error from the CREATE call (the "exists"
+  # check failing is normal/expected -- it just means "doesn't exist yet")
+  # lets every caller log something a human can actually act on.
   segments <- Filter(nzchar, strsplit(folder_path, "/")[[1]])
   current <- ""
 
@@ -517,6 +525,7 @@ sp_ensure_folder <- function(token, drive_id, folder_path) {
 
     if (exists) next
 
+    create_error <- NULL
     created <- tryCatch({
       if (nzchar(parent)) {
         parent_url <- sprintf(
@@ -543,12 +552,17 @@ sp_ensure_folder <- function(token, drive_id, folder_path) {
         )) |>
         httr2::req_perform()
       TRUE
-    }, error = function(e) FALSE)
+    }, error = function(e) {
+      create_error <<- conditionMessage(e)
+      FALSE
+    })
 
-    if (!created) return(FALSE)
+    if (!created) {
+      return(list(ok = FALSE, error = create_error, folder = current))
+    }
   }
 
-  TRUE
+  list(ok = TRUE, error = NULL, folder = folder_path)
 }
 
 SP_BUILD_STATE_FOLDER <- "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/build_state"
@@ -564,8 +578,10 @@ sp_backup_build_output <- function(final_dir) {
   drive_id <- sp_get_drive_id(token)
   if (is.null(drive_id)) return(invisible(NULL))
 
-  if (!sp_ensure_folder(token, drive_id, SP_BUILD_STATE_FOLDER)) {
-    log_warn("Could not ensure SharePoint build_state folder exists -- skipping build-output backup.")
+  folder_result <- sp_ensure_folder(token, drive_id, SP_BUILD_STATE_FOLDER)
+  if (!folder_result$ok) {
+    error_detail <- if (is.null(folder_result$error)) "unknown error" else folder_result$error
+    log_warn("Could not ensure SharePoint build_state folder ({folder_result$folder}) exists -- skipping build-output backup. Reason: {error_detail}")
     return(invisible(NULL))
   }
 
@@ -662,8 +678,10 @@ sp_backup_clean_output <- function(final_dir) {
   drive_id <- sp_get_drive_id(token)
   if (is.null(drive_id)) return(invisible(NULL))
 
-  if (!sp_ensure_folder(token, drive_id, SP_CLEAN_STATE_FOLDER)) {
-    log_warn("Could not ensure SharePoint clean_state folder exists -- skipping clean-output backup.")
+  folder_result <- sp_ensure_folder(token, drive_id, SP_CLEAN_STATE_FOLDER)
+  if (!folder_result$ok) {
+    error_detail <- if (is.null(folder_result$error)) "unknown error" else folder_result$error
+    log_warn("Could not ensure SharePoint clean_state folder ({folder_result$folder}) exists -- skipping clean-output backup. Reason: {error_detail}")
     return(invisible(NULL))
   }
 
