@@ -631,6 +631,65 @@ sp_recover_build_output <- function(final_dir) {
 
 
 # ============================================================
+# SHAREPOINT CLEAN-OUTPUT BACKUP (independent Intelligence Engine / Report /
+# Upload runs)
+# ============================================================
+# afro_im_intilligence_analysis_engine.R, AFRO_Advocacy_Intelligence_Report.R
+# (via generate_reports_and_deck.R) and upload_to_sharepoint.py all read
+# data/final/Regional_IM_repository_cleaned.csv -- Clean Geonames' own
+# output. The Shiny dashboard launches all three of those directly as
+# their own standalone process (see shiny_app/app.R's STEPS list),
+# bypassing this launcher entirely, so they can't rely on anything defined
+# here -- each instead calls sp_recover_file() from the shared
+# scripts/sharepoint_recovery.R to recover this same file for itself. This
+# function is this launcher's side of that: it backs the file up right
+# after a successful Clean Geonames run, mirroring sp_backup_build_output()
+# above. The CSV itself (not a smaller parquet, unlike that other backup)
+# is backed up here on purpose: all three consumers read this exact
+# filename with a plain read_csv() / fixed path, with no format-fallback
+# logic to fall back on the way clean_geonames.R's own reader has.
+
+SP_CLEAN_STATE_FOLDER <- "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/clean_state"
+SP_CLEAN_STATE_FILE <- "Regional_IM_repository_cleaned.csv"
+
+sp_backup_clean_output <- function(final_dir) {
+  local_path <- file.path(final_dir, SP_CLEAN_STATE_FILE)
+  if (!file.exists(local_path)) return(invisible(NULL))
+  if (!requireNamespace("httr2", quietly = TRUE)) return(invisible(NULL))
+
+  token <- sp_get_graph_token()
+  if (is.null(token)) return(invisible(NULL))
+  drive_id <- sp_get_drive_id(token)
+  if (is.null(drive_id)) return(invisible(NULL))
+
+  if (!sp_ensure_folder(token, drive_id, SP_CLEAN_STATE_FOLDER)) {
+    log_warn("Could not ensure SharePoint clean_state folder exists -- skipping clean-output backup.")
+    return(invisible(NULL))
+  }
+
+  remote_path <- paste0(SP_CLEAN_STATE_FOLDER, "/", SP_CLEAN_STATE_FILE)
+  content_url <- sprintf(
+    "https://graph.microsoft.com/v1.0/drives/%s/root:/%s:/content",
+    drive_id, utils::URLencode(remote_path)
+  )
+
+  tryCatch({
+    httr2::request(content_url) |>
+      httr2::req_auth_bearer_token(token) |>
+      httr2::req_method("PUT") |>
+      httr2::req_headers("Content-Type" = "application/octet-stream") |>
+      httr2::req_body_file(local_path) |>
+      httr2::req_perform()
+    log_info("Backed up {SP_CLEAN_STATE_FILE} to SharePoint clean_state (for standalone Intelligence Engine / Report+Deck / Upload runs).")
+  }, error = function(e) {
+    log_warn("Could not back up {SP_CLEAN_STATE_FILE} to SharePoint: {e$message}")
+  })
+
+  invisible(NULL)
+}
+
+
+# ============================================================
 # FUNCTION: Run R script in separate process (prevents quit() from stopping workflow)
 # ============================================================
 
@@ -946,6 +1005,9 @@ if (!skip_clean) {
   success <- run_r_script(clean_script, "Clean Geonames")
   clean_ok <- success
   step_status$clean <- if (success) "ok" else "failed_soft"
+  if (success) {
+    sp_backup_clean_output(file.path(BASE_DIR, "data", "final"))
+  }
   if (!success) {
     log_warn("Geonames cleaning had issues, but workflow continues")
     cat("\n[WARN] [STEP 3] Clean Geonames FAILED - downstream steps will use the PREVIOUS cleaned file, if any.\n")

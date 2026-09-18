@@ -54,6 +54,19 @@ dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
 
+# Recover this script's own input (Regional_IM_repository_cleaned.csv,
+# Clean Geonames' output) from SharePoint if the Shiny dashboard just
+# launched this as its own standalone "Intelligence Engine" step, on a
+# fresh container where Clean Geonames didn't just run in this same
+# session -- see scripts/sharepoint_recovery.R's own header comment.
+source(file.path(BASE_DIR, "scripts", "sharepoint_recovery.R"))
+sp_load_secrets_env(BASE_DIR)
+sp_recover_file(
+  input_file,
+  paste0("7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/clean_state/", basename(input_file))
+)
+
+
 # ============================================================
 # 1. LOAD DATA
 # ============================================================
@@ -519,3 +532,24 @@ message("============================================================")
 message("PHASE 1 IM INTELLIGENCE ANALYSIS COMPLETED SUCCESSFULLY")
 message("Outputs saved in: ", output_dir)
 message("============================================================")
+
+
+# ============================================================
+# 11. BACK UP PHASE 1 TABLES TO SHAREPOINT
+# ============================================================
+# AFRO_Advocacy_Intelligence_Report.R (via generate_reports_and_deck.R)
+# reads these 4 tables directly, but the Shiny dashboard launches it as
+# its own standalone "Generate Report + Deck" step, bypassing this script
+# and run_workflow.R entirely -- see that script's own recovery call and
+# scripts/sharepoint_recovery.R's header comment for the full picture.
+for (phase1_table in c(
+  "01_missed_children_root_cause.csv",
+  "02_sm_effectiveness_analysis.csv",
+  "03_operational_failure_analysis.csv",
+  "04_district_risk_scoring.csv"
+)) {
+  sp_backup_file(
+    file.path(table_dir, phase1_table),
+    paste0("7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/phase1_state/", phase1_table)
+  )
+}
