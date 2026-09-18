@@ -553,7 +553,29 @@ sp_ensure_folder <- function(token, drive_id, folder_path) {
         httr2::req_perform()
       TRUE
     }, error = function(e) {
-      create_error <<- conditionMessage(e)
+      # conditionMessage(e) alone is just the HTTP status line (e.g. "HTTP
+      # 400 Bad Request"), which isn't enough to act on -- Microsoft Graph
+      # normally returns a JSON body with the real error.code/error.message
+      # explaining what was actually wrong with the request. httr2 attaches
+      # the raw response to the condition as e$resp for exactly this case
+      # (see httr2's own error-handling docs); pull the body out when it's
+      # there, and fall back to the plain status line if it isn't (e.g. a
+      # connection-level error with no response at all).
+      detail <- conditionMessage(e)
+      if (!is.null(e$resp)) {
+        body_detail <- tryCatch({
+          body <- httr2::resp_body_json(e$resp)
+          if (!is.null(body$error$message)) {
+            paste0(body$error$code, ": ", body$error$message)
+          } else {
+            NULL
+          }
+        }, error = function(e2) NULL)
+        if (!is.null(body_detail)) {
+          detail <- paste0(detail, " -- ", body_detail)
+        }
+      }
+      create_error <<- detail
       FALSE
     })
 
