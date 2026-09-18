@@ -324,6 +324,43 @@ def upload_file(token, drive_id, local_path, remote_filename, folder_path=None):
     print(f"  [OK] Uploaded: {result['name']} ({result.get('size', 0):,} bytes)")
     return result
 
+CLEAN_STATE_FOLDER = "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/clean_state"
+CLEAN_STATE_FILE = "Regional_IM_repository_cleaned.csv"
+
+def recover_clean_output_if_missing(token, drive_id):
+    """Downloads Regional_IM_repository_cleaned.csv from SharePoint's
+    clean_state folder into data/final/ if it isn't already there locally.
+
+    Clean Geonames' own cleaned CSV is what this script actually uploads,
+    but the "Upload SharePoint" button in the Shiny dashboard runs this
+    script directly (bypassing run_workflow.R entirely), so on a fresh
+    Posit Connect Cloud container -- one where Clean Geonames didn't just
+    run in this same session -- there is nothing here to upload at all.
+    run_workflow.R backs this same file up to clean_state right after a
+    successful Clean Geonames run (see sp_backup_clean_output() there);
+    this just mirrors that recovery for this script's own standalone path.
+    Soft-fails throughout -- a miss here just means the upload below
+    proceeds and reports "[FAIL] REQUIRED file missing", exactly as it
+    does today.
+    """
+    local_path = os.path.join(FINAL_DIR, CLEAN_STATE_FILE)
+    if os.path.exists(local_path):
+        return
+
+    try:
+        remote_path = f"{CLEAN_STATE_FOLDER}/{CLEAN_STATE_FILE}"
+        url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{remote_path}:/content"
+        response = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=180)
+        if response.status_code != 200:
+            return
+        os.makedirs(FINAL_DIR, exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(response.content)
+        print(f"  Recovered {CLEAN_STATE_FILE} from SharePoint (no local Clean Geonames output existed yet).")
+    except requests.exceptions.RequestException:
+        pass
+
+
 def upload_to_sharepoint():
     """Upload files to SharePoint"""
     
@@ -349,7 +386,14 @@ def upload_to_sharepoint():
     # Get site and drive
     print("\n[2/5] Connecting to SharePoint...")
     site_id, drive_id = get_site_and_drive(token)
-    
+
+    # Recover Clean Geonames' cleaned output from SharePoint if this script
+    # is running standalone (the Shiny dashboard's "Upload SharePoint" button
+    # launches it directly, bypassing run_workflow.R entirely) and nothing
+    # usable already exists locally -- see recover_clean_output_if_missing()'s
+    # own docstring above.
+    recover_clean_output_if_missing(token, drive_id)
+
     # Create target folder(s) if they don't exist
     print("\n[3/5] Ensuring target folder exists...")
     if TARGET_FOLDER:

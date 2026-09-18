@@ -92,6 +92,25 @@ if (!is.numeric(analysis_months) || length(analysis_months) != 1 ||
   stop("analysis_months must be one whole number greater than or equal to 1.")
 }
 
+# Recover this script's inputs from SharePoint if the Shiny dashboard just
+# launched this as its own standalone "Generate Report + Deck" step (via
+# generate_reports_and_deck.R), on a fresh container where Clean Geonames
+# and/or the Intelligence Engine didn't just run in this same session --
+# see scripts/sharepoint_recovery.R's own header comment.
+source(file.path(BASE_DIR, "scripts", "sharepoint_recovery.R"))
+sp_load_secrets_env(BASE_DIR)
+sp_recover_file(
+  source_repository_file,
+  paste0("7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/clean_state/", basename(source_repository_file))
+)
+for (phase1_file in c(risk_file, root_file, op_file, sm_file)) {
+  sp_recover_file(
+    phase1_file,
+    paste0("7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/phase1_state/", basename(phase1_file))
+  )
+}
+
+
 # ============================================================
 # LOAD PHASE 1 OUTPUTS
 # ============================================================
