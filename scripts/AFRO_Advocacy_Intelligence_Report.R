@@ -99,15 +99,27 @@ if (!is.numeric(analysis_months) || length(analysis_months) != 1 ||
 # see scripts/sharepoint_recovery.R's own header comment.
 source(file.path(BASE_DIR, "scripts", "sharepoint_recovery.R"))
 sp_load_secrets_env(BASE_DIR)
-sp_recover_file(
-  source_repository_file,
-  paste0("7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/clean_state/", basename(source_repository_file))
-)
-for (phase1_file in c(risk_file, root_file, op_file, sm_file)) {
+tryCatch({
   sp_recover_file(
-    phase1_file,
-    paste0("7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/phase1_state/", basename(phase1_file))
+    source_repository_file,
+    paste0("7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/clean_state/", basename(source_repository_file))
   )
+}, error = function(e) {
+  # Best-effort recovery, not required -- an unexpected bug here should
+  # never stop this script before it even attempts to load its inputs
+  # (see afro_im_intilligence_analysis_engine.R's matching comment for
+  # why this defensive wrapping was added).
+  message("SharePoint recovery of ", basename(source_repository_file), " hit an unexpected error (continuing): ", conditionMessage(e))
+})
+for (phase1_file in c(risk_file, root_file, op_file, sm_file)) {
+  tryCatch({
+    sp_recover_file(
+      phase1_file,
+      paste0("7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/phase1_state/", basename(phase1_file))
+    )
+  }, error = function(e) {
+    message("SharePoint recovery of ", basename(phase1_file), " hit an unexpected error (continuing): ", conditionMessage(e))
+  })
 }
 
 

@@ -61,10 +61,18 @@ dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
 # session -- see scripts/sharepoint_recovery.R's own header comment.
 source(file.path(BASE_DIR, "scripts", "sharepoint_recovery.R"))
 sp_load_secrets_env(BASE_DIR)
-sp_recover_file(
-  input_file,
-  paste0("7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/clean_state/", basename(input_file))
-)
+tryCatch({
+  sp_recover_file(
+    input_file,
+    paste0("7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/clean_state/", basename(input_file))
+  )
+}, error = function(e) {
+  # This recovery is best-effort, not required (if input_file already
+  # exists locally the script proceeds normally either way) -- an
+  # unexpected bug here should never stop this script before it even
+  # starts the real analysis.
+  message("SharePoint recovery of ", basename(input_file), " hit an unexpected error (continuing): ", conditionMessage(e))
+})
 
 
 # ============================================================
@@ -548,8 +556,18 @@ for (phase1_table in c(
   "03_operational_failure_analysis.csv",
   "04_district_risk_scoring.csv"
 )) {
-  sp_backup_file(
-    file.path(table_dir, phase1_table),
-    paste0("7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/phase1_state/", phase1_table)
-  )
+  tryCatch({
+    sp_backup_file(
+      file.path(table_dir, phase1_table),
+      paste0("7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/phase1_state/", phase1_table)
+    )
+  }, error = function(e) {
+    # The analysis above already completed successfully and its outputs
+    # are already saved locally -- a bug or transient issue in this
+    # bonus SharePoint backup step must never turn a successful run into
+    # a failed one (exactly this happened once already: a return-type
+    # mismatch in sp_ensure_folder() crashed this loop with "$ operator
+    # is invalid for atomic vectors" and took the whole step down with it).
+    message("SharePoint backup of ", phase1_table, " hit an unexpected error (continuing -- analysis outputs are already saved locally): ", conditionMessage(e))
+  })
 }
