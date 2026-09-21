@@ -547,7 +547,13 @@ sp_ensure_folder <- function(token, drive_id, folder_path) {
         httr2::req_auth_bearer_token(token) |>
         httr2::req_body_json(list(
           name = seg,
-          folder = list(),
+          # An empty R list() has NULL names, so jsonlite serializes it as
+          # JSON [] (array) by default -- Graph's schema requires "folder"
+          # to be an OBJECT ({}), and rejects [] with a 400 "Property
+          # folder in payload has a value that does not match schema".
+          # Giving it an explicit (empty) names attribute makes jsonlite
+          # treat it as an object instead.
+          folder = structure(list(), names = character(0)),
           "@microsoft.graph.conflictBehavior" = "rename"
         )) |>
         httr2::req_perform()

@@ -82,6 +82,11 @@ sp_get_drive_id <- function(token) {
 }
 
 sp_ensure_folder <- function(token, drive_id, folder_path) {
+  # Returns list(ok = TRUE/FALSE, error = <message or NULL>, folder = <segment
+  # that failed, or the full path on success>) -- kept in sync with
+  # run_workflow.R's own copy of this function (both had to exist
+  # separately since this file is sourced by scripts that never go through
+  # run_workflow.R -- see this file's header comment).
   segments <- Filter(nzchar, strsplit(folder_path, "/")[[1]])
   current <- ""
 
@@ -102,6 +107,7 @@ sp_ensure_folder <- function(token, drive_id, folder_path) {
 
     if (exists) next
 
+    create_error <- NULL
     created <- tryCatch({
       if (nzchar(parent)) {
         parent_url <- sprintf(
@@ -123,17 +129,50 @@ sp_ensure_folder <- function(token, drive_id, folder_path) {
         httr2::req_auth_bearer_token(token) |>
         httr2::req_body_json(list(
           name = seg,
-          folder = list(),
+          # An empty R list() has NULL names, so jsonlite serializes it as
+          # JSON [] (array) by default -- Graph's schema requires "folder"
+          # to be an OBJECT ({}), and rejects [] with a 400 "Property
+          # folder in payload has a value that does not match schema".
+          # Giving it an explicit (empty) names attribute makes jsonlite
+          # treat it as an object instead.
+          folder = structure(list(), names = character(0)),
           "@microsoft.graph.conflictBehavior" = "rename"
         )) |>
         httr2::req_perform()
       TRUE
-    }, error = function(e) FALSE)
+    }, error = function(e) {
+      # conditionMessage(e) alone is just the HTTP status line (e.g. "HTTP
+      # 400 Bad Request"), which isn't enough to act on -- Microsoft Graph
+      # normally returns a JSON body with the real error.code/error.message
+      # explaining what was actually wrong with the request. httr2 attaches
+      # the raw response to the condition as e$resp for exactly this case
+      # (see httr2's own error-handling docs); pull the body out when it's
+      # there, and fall back to the plain status line if it isn't (e.g. a
+      # connection-level error with no response at all).
+      detail <- conditionMessage(e)
+      if (!is.null(e$resp)) {
+        body_detail <- tryCatch({
+          body <- httr2::resp_body_json(e$resp)
+          if (!is.null(body$error$message)) {
+            paste0(body$error$code, ": ", body$error$message)
+          } else {
+            NULL
+          }
+        }, error = function(e2) NULL)
+        if (!is.null(body_detail)) {
+          detail <- paste0(detail, " -- ", body_detail)
+        }
+      }
+      create_error <<- detail
+      FALSE
+    })
 
-    if (!created) return(FALSE)
+    if (!created) {
+      return(list(ok = FALSE, error = create_error, folder = current))
+    }
   }
 
-  TRUE
+  list(ok = TRUE, error = NULL, folder = folder_path)
 }
 
 sp_recover_file <- function(local_path, remote_path) {
