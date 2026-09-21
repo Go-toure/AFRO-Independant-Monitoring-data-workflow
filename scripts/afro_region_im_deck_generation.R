@@ -161,7 +161,12 @@ possible_names <- list(
   priority = c("02_AFRO_top_priority_districts.png", "02_AFRO_top_priority_districts_EXECUTIVE.png"),
   country_risk = c("03_AFRO_country_risk_profile.png", "03_AFRO_country_risk_profile_EXECUTIVE.png"),
   sm_awareness = c("04_AFRO_SM_awareness_vs_coverage.png", "04_AFRO_SM_awareness_vs_coverage_EXECUTIVE.png"),
-  cv_heatmap = c("05_AFRO_cv_heatmap.png"),
+  # "05_AFRO_cv_heatmap.png" was the originally-planned filename, but no
+  # code ever produced it (slide slot 05 was later repurposed for the
+  # Operational Failure Profile chart instead) -- kept as a fallback in
+  # case an old already-generated file with that exact name exists on
+  # disk, but the real chart is now written as the filename listed first.
+  cv_heatmap = c("07_AFRO_cv_heatmap_by_country_round_EXECUTIVE.png", "05_AFRO_cv_heatmap.png"),
   advocacy = c("06_AFRO_advocacy_recommendation_card.png", "05_AFRO_advocacy_recommendation_card.png")
 )
 
