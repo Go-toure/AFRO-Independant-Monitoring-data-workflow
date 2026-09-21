@@ -819,6 +819,85 @@ p5 <- operational_failure_regional %>%
 ggsave(file.path(plot_dir, "05_AFRO_operational_failure_profile_EXECUTIVE.png"), p5, width = 13, height = 8, dpi = 300)
 
 # ============================================================
+# VISUAL 5b: CV (COVERAGE) HEATMAP -- COUNTRY x CAMPAIGN ROUND
+# ============================================================
+# afro_region_im_deck_generation.R has always looked for a "CV Heatmap
+# -- Country x Campaign Round" slide image here (possible_names$cv_heatmap
+# = "05_AFRO_cv_heatmap.png"), but no code anywhere ever produced that
+# file -- this slide slot was apparently planned once, then later
+# repurposed for the (unrelated, non-heatmap) Operational Failure
+# Profile chart above, and the deck's own filename list was never
+# updated to match. This builds the heatmap the deck has been silently
+# skipping ever since (see afro_region_im_deck_generation.R's own
+# "CV heatmap image not found (will be skipped)" message).
+#
+# "cv" throughout this script means COVERAGE (u5_fm / u5_present, see
+# safe_divide() calls above), not "coefficient of variation" -- kept
+# as the short column name the rest of this pipeline already uses
+# (regional_cv_pct on the KPI card, the y-axis of VISUAL 4, etc.).
+#
+# round_number arrives as a character column from the upstream risk-
+# scoring join, so it is re-parsed to numeric ONLY to order the x-axis
+# chronologically within a campaign; a round label that isn't a plain
+# number (rare, but not guaranteed never to happen in real IM data)
+# falls back to alphabetical order rather than being dropped.
+cv_heatmap_data <- risk_data %>%
+  filter(!is.na(country), !is.na(round_number), !is.na(cv)) %>%
+  group_by(country, round_number) %>%
+  summarise(
+    mean_cv = mean(cv, na.rm = TRUE),
+    observations = n(),
+    .groups = "drop"
+  )
+
+if (nrow(cv_heatmap_data) == 0) {
+  message("No country x round-number coverage data available -- skipping CV heatmap chart.")
+} else {
+  round_lookup <- cv_heatmap_data %>%
+    distinct(round_number) %>%
+    mutate(round_numeric = suppressWarnings(as.numeric(round_number)))
+
+  round_order <- if (all(!is.na(round_lookup$round_numeric))) {
+    round_lookup %>% arrange(round_numeric) %>% pull(round_number)
+  } else {
+    round_lookup %>% arrange(round_number) %>% pull(round_number)
+  }
+
+  country_order <- cv_heatmap_data %>%
+    group_by(country) %>%
+    summarise(overall_mean_cv = mean(mean_cv, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(overall_mean_cv)) %>%
+    pull(country)
+
+  p_cv_heatmap <- cv_heatmap_data %>%
+    mutate(
+      round_number = factor(round_number, levels = round_order),
+      country = factor(country, levels = rev(country_order))
+    ) %>%
+    ggplot(aes(x = round_number, y = country, fill = mean_cv)) +
+    geom_tile(color = "white", linewidth = 0.4) +
+    geom_text(aes(label = percent(mean_cv, accuracy = 1)), size = 2.9, color = dark_grey) +
+    scale_fill_gradient2(
+      low = alert_red, mid = "white", high = who_blue,
+      midpoint = 0.90, labels = percent_format(), name = "Coverage"
+    ) +
+    labs(
+      title = "Coverage heatmap by country and campaign round",
+      subtitle = "Mean coverage rate (children reached / children present) per country x round",
+      x = "Campaign round",
+      y = NULL,
+      caption = "Advocacy use: spot countries/rounds needing catch-up before the next round"
+    ) +
+    theme_un_advocacy(base_size = 11) +
+    theme(panel.grid = element_blank())
+
+  ggsave(
+    file.path(plot_dir, "07_AFRO_cv_heatmap_by_country_round_EXECUTIVE.png"),
+    p_cv_heatmap, width = 13, height = 11, dpi = 300
+  )
+}
+
+# ============================================================
 # VISUAL 6: ADVOCACY RECOMMENDATION CARD
 # ============================================================
 recommendation_card <- ggplot() +
