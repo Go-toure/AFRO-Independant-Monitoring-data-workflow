@@ -1633,6 +1633,51 @@ def _merge_and_dedup(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.Data
     if "_id" not in existing_df.columns or "_id" not in new_df.columns:
         raise ValueError("No _id column available -- cannot safely de-duplicate merge.")
 
+    # Reconcile categorical columns to a SHARED set of categories before
+    # concatenating. pd.concat() only keeps a column as Categorical dtype
+    # when both sides' CategoricalDtype are EXACTLY equal (same categories,
+    # same order) -- otherwise it silently falls back to plain 'object'
+    # dtype for that column. new_df is built from just the newly-fetched
+    # handful of records, so its per-column category set is almost never
+    # identical to existing_df's (which has accumulated every distinct
+    # value ever seen for that column) -- meaning, before this fix, EVERY
+    # incremental merge silently expanded nearly every categorical column
+    # in existing_df back to full per-row Python strings for the duration
+    # of this function, undoing build_dataframe_from_records()'s /
+    # _read_parquet_low_memory()'s categorical compression entirely.
+    #
+    # Measured directly against form 5710's real data (694 columns,
+    # 106,079 rows): existing_df is ~157 MB deep-memory as read, but the
+    # concat below (unpatched) produced a ~3.7 GB combined DataFrame -- 619
+    # of 694 columns silently degraded from category to object, landing
+    # almost exactly on what a fully un-optimized DataFrame of this shape
+    # needs (see build_dataframe_from_records()'s own docstring on form
+    # 4498's ~44 GB unoptimized figure, scaled down to this form's
+    # column/row count). This is very likely what has been OOM-killing
+    # form 5710's fetch step (exit 137) on Connect Cloud's tighter memory
+    # ceiling: not the full fetch, but every single incremental merge --
+    # and the same silent blowup happens for every other form's
+    # incremental merges too, just usually staying under whatever memory
+    # ceiling is available.
+    #
+    # union_categoricals() computes the union of both sides' categories
+    # once, cheaply; giving both existing_df and new_df that SAME
+    # CategoricalDtype before pd.concat() means pd.concat() sees matching
+    # dtypes and keeps the result Categorical directly, without ever
+    # materializing an expanded object array in the first place -- this
+    # avoids the transient memory spike entirely, not just the combined
+    # DataFrame's final resting size.
+    for col in existing_df.columns:
+        if col not in new_df.columns:
+            continue
+        if isinstance(existing_df[col].dtype, pd.CategoricalDtype) and isinstance(new_df[col].dtype, pd.CategoricalDtype):
+            unioned = pd.api.types.union_categoricals(
+                [existing_df[col].values, new_df[col].values], sort_categories=False
+            )
+            shared_categories = unioned.categories
+            existing_df[col] = existing_df[col].cat.set_categories(shared_categories)
+            new_df[col] = new_df[col].cat.set_categories(shared_categories)
+
     combined = pd.concat([existing_df, new_df], ignore_index=True, sort=False)
     # existing_df can be tens of MB on disk and several times that once
     # loaded as a DataFrame -- free it now rather than holding it (plus
