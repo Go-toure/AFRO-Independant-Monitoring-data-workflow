@@ -2390,7 +2390,48 @@ def run_full_fetch(form_id: int, i: int, total_forms: int, page_size: int) -> Di
             "records": 0, "new_records": 0, "size_mb": 0, "path": str(output_path)
         }
 
-    metadata = save_to_parquet(data, form_id)
+    # Build the DataFrame, then drop the raw `data` list immediately --
+    # rather than calling save_to_parquet(data, form_id) and letting THIS
+    # function's own `data` variable stay alive (as an argument reference)
+    # for the entire nested call, all the way through the Parquet write and
+    # the SharePoint upload that follow. Python doesn't release a local
+    # variable just because a callee is done with its own copy of it --
+    # it stays referenced, and therefore resident in memory, until this
+    # frame either reassigns/deletes it or returns. For a wide form like
+    # 5710 (694 columns, 106,080 records), that meant the raw record list
+    # AND the fully-built categorical DataFrame were BOTH resident for the
+    # whole save step, not just the moment the DataFrame is actually built
+    # from it -- a much longer, and therefore riskier, peak-memory window
+    # than necessary on Connect Cloud's tighter memory ceiling. Capturing
+    # the row count up front and explicitly deleting `data` right after the
+    # DataFrame exists shrinks that double-materialization window back down
+    # to just the unavoidable part (building the DataFrame in the first
+    # place) instead of the entire remainder of this function.
+    #
+    # This inlines what save_to_parquet() used to do on our behalf (kept,
+    # unused by this path now, for any external caller); see its docstring
+    # for the write_parquet_and_metadata()/_clear_stale_partitions() steps
+    # reproduced below.
+    record_count = len(data)
+    df = build_dataframe_from_records(data)
+    del data
+    gc.collect()
+
+    now_iso = datetime.now().isoformat()
+    meta_extra = {
+        "fetch_mode": "full",
+        "last_full_fetch": now_iso,
+        "last_submission_time": _max_submission_time(df),
+        "fetch_complete": True,
+    }
+
+    metadata = write_parquet_and_metadata(df, form_id, meta_extra)
+
+    if metadata is not None:
+        # This full fetch just overwrote the combined file directly -- any
+        # year-partition files left over from before it are now stale (see
+        # _clear_stale_partitions()'s docstring for why that matters).
+        _clear_stale_partitions(form_id)
 
     if not metadata:
         console(f"   ❌ Save failed for form {form_id}")
@@ -2400,11 +2441,11 @@ def run_full_fetch(form_id: int, i: int, total_forms: int, page_size: int) -> Di
         }
 
     file_size = output_path.stat().st_size / (1024 * 1024)
-    console(f"   💾 Saved: {form_id}.parquet | {len(data):,} rows | {file_size:.2f} MB")
+    console(f"   💾 Saved: {form_id}.parquet | {record_count:,} rows | {file_size:.2f} MB")
 
     return {
         "form_id": form_id, "status": "full",
-        "records": len(data), "new_records": len(data),
+        "records": record_count, "new_records": record_count,
         "size_mb": round(file_size, 2), "path": str(output_path)
     }
 
