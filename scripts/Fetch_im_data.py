@@ -182,7 +182,7 @@ def _read_parquet_low_memory(path, filters=None) -> pd.DataFrame:
 
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 
 
 # ============================================================
@@ -810,13 +810,43 @@ def fetch_all_data(
 ):
     """Fetch ALL records for one form (full fetch) with compact live console progress.
 
-    Returns ``(all_data, fetch_complete)``. ``fetch_complete`` is False if a
-    page had to be given up on after retries (see ``fetch_page``) — in that
-    case ``all_data`` is only a PARTIAL, untrustworthy result and callers
-    must not save it over existing data or treat its max submission time as
-    a safe incremental cursor.
+    Returns ``(combined_df, fetch_complete)`` -- an object-dtype DataFrame,
+    not a list of records (see below for why this changed).
+    ``fetch_complete`` is False if a page had to be given up on after
+    retries (see ``fetch_page``) — in that case ``combined_df`` is only a
+    PARTIAL, untrustworthy result and callers must not save it over
+    existing data or treat its max submission time as a safe incremental
+    cursor.
+
+    Used to accumulate every page's raw flattened record dicts into one
+    Python list (``all_data``) for the ENTIRE fetch, only converting to a
+    DataFrame once every page was in. For a wide form that's enormously
+    wasteful: each row-dict repeats all of that form's field names as its
+    own keys and carries its own dict/hash-table overhead, on top of the
+    actual values. Measured directly against form 5710's real data
+    (694 columns): building its full 106,079-record list this way costs
+    ~4.8 GB, BEFORE build_dataframe_from_records() ever runs -- and the
+    2026-09-21 and 2026-09-22 production runs both died (exit 137) while
+    STILL PAGING (page 8-11 of 11), i.e. accumulating this same list, not
+    during the later DataFrame-build/save step. An object-dtype DataFrame
+    of one page needs only a 2D array of pointers (no per-row key
+    duplication) -- roughly two orders of magnitude smaller for a page
+    this wide. Building one small DataFrame per page and dropping that
+    page's raw JSON/dict records immediately (rather than keeping them
+    around until the very end) keeps the peak to whatever the largest
+    single page plus the running concatenated total costs, instead of the
+    full multi-hundred-thousand-record list all at once.
+
+    Every page's DataFrame stays plain 'object' dtype (no categorical
+    conversion yet), so concatenating them at the end is a plain-dtype
+    concat with nothing to reconcile -- contrast this with what
+    _merge_and_dedup() has to do when combining DataFrames whose
+    categorical dtypes actually differ. The result is the same shape
+    pd.DataFrame(all_data) used to build from the full flat record list,
+    just without ever materializing that list in full.
     """
-    all_data = []
+    page_frames: List[pd.DataFrame] = []
+    total_records = 0
     page = 1
     fetch_complete = True
 
@@ -825,53 +855,64 @@ def fetch_all_data(
 
     while True:
         live_line(
-            f"   ⏳ Fetching page {page} | Records so far: {len(all_data):,}"
+            f"   ⏳ Fetching page {page} | Records so far: {total_records:,}"
         )
 
-        data = fetch_page(form_id, page, page_size)
+        page_records = fetch_page(form_id, page, page_size)
 
-        if data is None:
+        if page_records is None:
             clear_live_line()
             detail(f"Form {form_id} | Page {page} | Giving up -- fetch marked INCOMPLETE.")
             fetch_complete = False
             break
 
-        if not data:
+        if not page_records:
             clear_live_line()
             detail(f"Form {form_id} | Page {page} | No data returned.")
             break
 
-        flattened_data = [flatten_dict(record) for record in data]
-        all_data.extend(flattened_data)
+        flattened_page = [flatten_dict(record) for record in page_records]
+        page_df = pd.DataFrame(flattened_page)
+        del page_records, flattened_page
+
+        page_frames.append(page_df)
+        total_records += len(page_df)
 
         detail(
-            f"Form {form_id} | Page {page} | Retrieved {len(data):,} records | "
-            f"Running total: {len(all_data):,}"
+            f"Form {form_id} | Page {page} | Retrieved {len(page_df):,} records | "
+            f"Running total: {total_records:,}"
         )
 
         live_line(
-            f"   ⏳ Page {page} complete | Records so far: {len(all_data):,}"
+            f"   ⏳ Page {page} complete | Records so far: {total_records:,}"
         )
 
-        if len(data) < page_size:
+        if len(page_df) < page_size:
             clear_live_line()
             break
 
         page += 1
         time.sleep(0.5)
 
+    if page_frames:
+        combined_df = pd.concat(page_frames, ignore_index=True, sort=False)
+        del page_frames
+        gc.collect()
+    else:
+        combined_df = pd.DataFrame()
+
     if fetch_complete:
-        console(f"   ✅ Fetch complete: {len(all_data):,} records across {page} page(s)")
+        console(f"   ✅ Fetch complete: {len(combined_df):,} records across {page} page(s)")
     else:
         console(
             f"   ⚠️  Fetch INCOMPLETE: page {page} failed after retries — only "
-            f"{len(all_data):,} record(s) retrieved. Existing data will NOT be "
+            f"{len(combined_df):,} record(s) retrieved. Existing data will NOT be "
             f"overwritten with this partial result."
         )
 
-    detail(f"[DONE] Form {form_id}: {len(all_data):,} total records | complete={fetch_complete}")
+    detail(f"[DONE] Form {form_id}: {len(combined_df):,} total records | complete={fetch_complete}")
 
-    return all_data, fetch_complete
+    return combined_df, fetch_complete
 
 
 def fetch_new_data(
@@ -975,10 +1016,20 @@ def extract_gps_components(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_dataframe_from_records(data: List[Dict]) -> pd.DataFrame:
-    """Turn a list of flattened record dicts into the standard IM DataFrame
-    (all-string columns, GPS components split out). Shared by full and
-    incremental fetches so both produce identical column shapes.
+def build_dataframe_from_records(data: Union[List[Dict], pd.DataFrame]) -> pd.DataFrame:
+    """Turn flattened records into the standard IM DataFrame (all-string
+    columns, GPS components split out). Shared by full and incremental
+    fetches so both produce identical column shapes.
+
+    ``data`` is normally a List[Dict] (the small incremental-merge batches
+    still build one this way), but fetch_all_data() now hands this an
+    already-concatenated object-dtype DataFrame instead -- see its own
+    docstring for why. When it's already a DataFrame, it's used directly
+    (no ``pd.DataFrame(data)`` copy) and every column below is cast IN
+    PLACE on that same object: there is no separate "raw records" form
+    left over afterward to free, unlike the List[Dict] path, where `data`
+    and the newly-built `df` really are two distinct objects until the
+    caller drops its own reference to `data`.
 
     Fills/casts one column at a time instead of calling
     ``df.fillna("").astype(str)`` on the whole table in one shot. pandas'
@@ -991,7 +1042,7 @@ def build_dataframe_from_records(data: List[Dict]) -> pd.DataFrame:
     the fetch itself had completed cleanly). Doing it column by column
     keeps the extra allocation to one column's worth of data at a time.
     """
-    df = pd.DataFrame(data)
+    df = data if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
 
     for col in df.columns:
         series = df[col]
@@ -2383,39 +2434,25 @@ def run_full_fetch(form_id: int, i: int, total_forms: int, page_size: int) -> Di
             "path": str(output_path)
         }
 
-    if not data:
+    if data.empty:
         console(f"   ⚠️  No data fetched for form {form_id}")
         return {
             "form_id": form_id, "status": "failed_no_data",
             "records": 0, "new_records": 0, "size_mb": 0, "path": str(output_path)
         }
 
-    # Build the DataFrame, then drop the raw `data` list immediately --
-    # rather than calling save_to_parquet(data, form_id) and letting THIS
-    # function's own `data` variable stay alive (as an argument reference)
-    # for the entire nested call, all the way through the Parquet write and
-    # the SharePoint upload that follow. Python doesn't release a local
-    # variable just because a callee is done with its own copy of it --
-    # it stays referenced, and therefore resident in memory, until this
-    # frame either reassigns/deletes it or returns. For a wide form like
-    # 5710 (694 columns, 106,080 records), that meant the raw record list
-    # AND the fully-built categorical DataFrame were BOTH resident for the
-    # whole save step, not just the moment the DataFrame is actually built
-    # from it -- a much longer, and therefore riskier, peak-memory window
-    # than necessary on Connect Cloud's tighter memory ceiling. Capturing
-    # the row count up front and explicitly deleting `data` right after the
-    # DataFrame exists shrinks that double-materialization window back down
-    # to just the unavoidable part (building the DataFrame in the first
-    # place) instead of the entire remainder of this function.
-    #
-    # This inlines what save_to_parquet() used to do on our behalf (kept,
-    # unused by this path now, for any external caller); see its docstring
-    # for the write_parquet_and_metadata()/_clear_stale_partitions() steps
+    # `data` is already the fully page-concatenated DataFrame fetch_all_data()
+    # built (see its docstring) -- there's no separate raw-records list left
+    # to free here the way there used to be. build_dataframe_from_records()
+    # casts every column IN PLACE on this same object rather than copying it
+    # (since it's already a DataFrame, not a List[Dict]), so `df` below and
+    # `data` end up being the same object; this inlines what
+    # save_to_parquet() used to do on our behalf (kept, unused by this path
+    # now, for any external caller) -- see its docstring for the
+    # write_parquet_and_metadata()/_clear_stale_partitions() steps
     # reproduced below.
     record_count = len(data)
     df = build_dataframe_from_records(data)
-    del data
-    gc.collect()
 
     now_iso = datetime.now().isoformat()
     meta_extra = {
