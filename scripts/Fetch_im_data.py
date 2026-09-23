@@ -2380,30 +2380,317 @@ def decide_fetch_mode(
     )
 
 
+def _fetch_parts_dir(form_id: int) -> Path:
+    return RAW_DIR / f"{form_id}_fetch_parts"
+
+
+def _fetch_part_path(form_id: int, page: int) -> Path:
+    return _fetch_parts_dir(form_id) / f"{form_id}_page{page:05d}.parquet"
+
+
+def _clear_stale_fetch_parts(form_id: int) -> None:
+    """Remove any leftover per-page part files from a previous full-fetch
+    attempt for this form that was killed partway through (OOM, network
+    failure, container restart) before run_full_fetch() starts fetching
+    fresh pages. Without this, a retry could combine this run's pages
+    together with a previous, unrelated attempt's leftover pages (or
+    stale pages from before the form's column set changed), producing a
+    corrupted combined file. Never raises -- a part file that can't be
+    removed is harmless leftover, not a reason to abort the fetch."""
+    parts_dir = _fetch_parts_dir(form_id)
+
+    if not parts_dir.exists():
+        return
+
+    for p in parts_dir.glob(f"{form_id}_page*.parquet"):
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+
+def _write_fetch_page_part(form_id: int, page: int, page_df: pd.DataFrame, page_size: int) -> Path:
+    """Cast one fetched page to the pipeline's standard all-string shape
+    (GPS fields split out via extract_gps_components(), same as
+    build_dataframe_from_records()) and write it immediately as its own
+    small Parquet part file, deliberately WITHOUT category/dictionary
+    encoding -- see _combine_fetch_parts_streaming()'s docstring for why
+    the final combine also stays plain-string, matching the precedent
+    _recombine_year_partitions() already established.
+
+    Writing with a row-group size no larger than this page's own row
+    count means every part file this run produces is exactly one row
+    group, which is what keeps _combine_fetch_parts_streaming()'s own
+    memory bounded to one page at a time regardless of how large
+    --page-size is set to.
+    """
+    for col in page_df.columns:
+        series = page_df[col]
+        if series.isna().any():
+            series = series.fillna("")
+        page_df[col] = series.astype(str)
+
+    page_df = extract_gps_components(page_df)
+
+    path = _fetch_part_path(form_id, page)
+    _write_partition_file(path, page_df, row_group_size=min(page_size, _PARTITION_ROW_GROUP_SIZE))
+    return path
+
+
+def _combine_fetch_parts_streaming(form_id: int, part_paths: List[Path]) -> Optional[Dict]:
+    """Stream every per-page part file a full fetch just wrote (see
+    _write_fetch_page_part()) into one combined {form_id}.parquet -- the
+    file every other consumer of this pipeline (the R scripts,
+    SharePoint, decide_fetch_mode() on the next run) expects to find.
+
+    This is the SAME row-group-bounded streaming pattern
+    _recombine_year_partitions() already uses for incremental-partitioned
+    forms (see that function's docstring for the full history of why it's
+    shaped this way): read each part ONE ROW GROUP AT A TIME via
+    pq.ParquetFile.read_row_group(), reindex onto the union of every
+    part's columns (filling any column absent from a given part with an
+    empty-string array), cast everything to plain pa.string() through a
+    single shared pq.ParquetWriter, and rename into place atomically only
+    on full success. Peak memory here scales with one row group (one
+    page), never with the form's total size -- this is what lets a form
+    as large as 4498 (822 columns x ~1.15M rows) complete a full fetch at
+    all, where accumulating one combined in-memory DataFrame across every
+    page (the previous approach) could not.
+
+    Plain string output (no dictionary/category encoding) is the same
+    trade _recombine_year_partitions() makes and for the same reason:
+    pq.ParquetWriter requires one identical schema across every
+    write_table() call, while different pages can legitimately end up
+    with differently-sized dictionaries (or, for a rarely-answered
+    question, be entirely missing a column another page has) --
+    downstream consumers (_read_parquet_low_memory()) already re-derive
+    category/ArrowDtype from plain Parquet values on read, so nothing is
+    lost by writing plain strings here.
+    """
+    if not part_paths:
+        detail(f"[WARNING] Form {form_id} | No fetch part files found to combine.")
+        return None
+
+    all_columns: List[str] = []
+    seen = set()
+    for p in part_paths:
+        for name in pq.ParquetFile(p).schema_arrow.names:
+            if name not in seen:
+                seen.add(name)
+                all_columns.append(name)
+
+    output_path = RAW_DIR / f"{form_id}.parquet"
+    tmp_output_path = RAW_DIR / f"{form_id}.parquet.tmp"
+    arrow_schema = pa.schema([(name, pa.string()) for name in all_columns])
+
+    total_rows = 0
+    last_submission_time = None
+    writer = None
+
+    try:
+        writer = pq.ParquetWriter(tmp_output_path, arrow_schema, compression="snappy")
+
+        for p in part_paths:
+            pf = pq.ParquetFile(p)
+
+            for rg_idx in range(pf.num_row_groups):
+                table = pf.read_row_group(rg_idx)
+                n_rows = table.num_rows
+
+                arrays = []
+                for col in all_columns:
+                    if col in table.column_names:
+                        arr = table.column(col)
+                        if not (pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type)):
+                            arr = arr.cast(pa.string())
+                        arr = pc.fill_null(arr, "")
+                    else:
+                        arr = pa.chunked_array([pa.array([""] * n_rows, type=pa.string())])
+                    arrays.append(arr)
+
+                out_table = pa.Table.from_arrays(arrays, schema=arrow_schema)
+                writer.write_table(out_table)
+
+                total_rows += n_rows
+
+                if "_submission_time" in table.column_names:
+                    st_column = table.column("_submission_time")
+                    st_values = [v for v in st_column.to_pylist() if v]
+                    if st_values:
+                        part_max = max(str(v) for v in st_values)
+                        candidates = [t for t in [part_max, last_submission_time] if t]
+                        last_submission_time = max(candidates) if candidates else last_submission_time
+
+                del table, arrays, out_table
+
+            gc.collect()
+            pa.default_memory_pool().release_unused()
+
+        writer.close()
+        writer = None
+
+        tmp_output_path.replace(output_path)
+
+    except Exception as e:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        detail(f"[WARNING] Form {form_id} | Combine of fetch page parts failed: {e}")
+        return None
+
+    file_size_mb = output_path.stat().st_size / (1024 * 1024)
+    now_iso = datetime.now().isoformat()
+
+    metadata = {
+        "workflow": "Independent Monitoring IM",
+        "form_id": form_id,
+        "records": int(total_rows),
+        "columns": int(len(all_columns)),
+        "parquet_size_mb": round(file_size_mb, 2),
+        "estimated_memory_size_mb": None,
+        "compression_ratio": None,
+        "last_fetch": now_iso,
+        "shape": f"{total_rows}x{len(all_columns)}",
+        "format": "parquet",
+        "engine": "pyarrow",
+        "output_path": str(output_path),
+        "fetch_mode": "full",
+        "last_full_fetch": now_iso,
+        "last_submission_time": last_submission_time,
+        "fetch_complete": True,
+    }
+
+    metadata_path = RAW_DIR / f"{form_id}_metadata.json"
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+    detail(
+        f"[SAVED] Form {form_id}: {total_rows:,} rows | {file_size_mb:.2f} MB | "
+        f"{len(all_columns):,} columns | mode=full ({len(part_paths)} page part(s))"
+    )
+
+    upload_raw_to_sharepoint(form_id)
+
+    return metadata
+
+
 def run_full_fetch(form_id: int, i: int, total_forms: int, page_size: int) -> Dict:
     """Perform a full fetch + full overwrite save for one form. Returns a
-    results-row dict for the run summary."""
-    output_path = RAW_DIR / f"{form_id}.parquet"
+    results-row dict for the run summary.
 
-    data, fetch_complete = fetch_all_data(
-        form_id=form_id,
-        form_index=i,
-        total_forms=total_forms,
-        page_size=page_size
-    )
+    Fetches and writes one page at a time straight to its own small
+    Parquet part file (see _write_fetch_page_part()), then combines all
+    parts into the final {form_id}.parquet via a row-group-bounded
+    streaming combine (see _combine_fetch_parts_streaming()) -- never
+    accumulating more than one page's DataFrame in memory at once.
+
+    This replaces the previous fetch_all_data()-based path (accumulate
+    every page's DataFrame, pd.concat() them all once, then
+    build_dataframe_from_records() casts/category-encodes the WHOLE
+    combined DataFrame). That fix was a real, confirmed improvement for
+    most forms (form 5710: peak RSS fell from ~4.8-5.3 GB to 1,554 MB in
+    production), but still peaks in the multi-GB range for the
+    pipeline's widest/largest forms, because it still builds one
+    in-memory DataFrame covering the form's ENTIRE row/column extent
+    before it can be written or category-encoded. Confirmed in
+    production: form 4498 (822 columns x ~1.15M rows historically) was
+    still OOM-killed (exit 137) at page 55 of ~113 needed even with that
+    fix in place. Writing straight to disk page-by-page removes that
+    ceiling entirely -- peak memory here scales with one page, never
+    with the form's total size.
+
+    fetch_all_data() and the List[Dict]/DataFrame-input branch of
+    build_dataframe_from_records() are left defined but unused by this
+    function (matching the precedent of save_to_parquet() being left
+    unused after the very first fix in this file's history) -- nothing
+    else in the repo calls fetch_all_data().
+    """
+    output_path = RAW_DIR / f"{form_id}.parquet"
+    parts_dir = _fetch_parts_dir(form_id)
+
+    # A previous full-fetch attempt for this form may have been killed
+    # partway through (OOM, network failure, container restart), leaving
+    # stale page parts behind -- never combine those together with this
+    # attempt's fresh pages.
+    _clear_stale_fetch_parts(form_id)
+
+    part_paths: List[Path] = []
+    total_records = 0
+    page = 1
+    fetch_complete = True
+
+    console(f"📦 Form {form_id} ({i}/{total_forms}) | FULL fetch")
+    detail(f"[FETCH:FULL] Form {form_id}")
+
+    while True:
+        live_line(
+            f"   ⏳ Fetching page {page} | Records so far: {total_records:,}"
+        )
+
+        page_records = fetch_page(form_id, page, page_size)
+
+        if page_records is None:
+            clear_live_line()
+            detail(f"Form {form_id} | Page {page} | Giving up -- fetch marked INCOMPLETE.")
+            fetch_complete = False
+            break
+
+        if not page_records:
+            clear_live_line()
+            detail(f"Form {form_id} | Page {page} | No data returned.")
+            break
+
+        flattened_page = [flatten_dict(record) for record in page_records]
+        page_df = pd.DataFrame(flattened_page)
+        del page_records, flattened_page
+
+        page_len = len(page_df)
+        part_path = _write_fetch_page_part(form_id, page, page_df, page_size)
+        del page_df
+        part_paths.append(part_path)
+        total_records += page_len
+
+        detail(
+            f"Form {form_id} | Page {page} | Retrieved {page_len:,} records | "
+            f"Running total: {total_records:,}"
+        )
+
+        live_line(
+            f"   ⏳ Page {page} complete | Records so far: {total_records:,}"
+        )
+
+        if page_len < page_size:
+            clear_live_line()
+            break
+
+        page += 1
+        gc.collect()
+        pa.default_memory_pool().release_unused()
+        time.sleep(0.5)
+
+    detail(f"[DONE] Form {form_id}: {total_records:,} total records | complete={fetch_complete}")
 
     if not fetch_complete:
         # A page failed after retries partway through the fetch. Never
         # overwrite the existing (possibly larger, definitely more trusted)
         # Parquet file with this partial result -- just flag the metadata so
         # decide_fetch_mode retries a full fetch again next run, and leave
-        # the data file exactly as it was.
+        # the data file exactly as it was. The partial pages already
+        # written to disk are discarded, not combined.
         console(
-            f"   ⚠️  Form {form_id} | Full fetch INCOMPLETE ({len(data):,} row(s) retrieved "
+            f"   ⚠️  Form {form_id} | Full fetch INCOMPLETE ({total_records:,} row(s) retrieved "
             f"before giving up) -- keeping the PREVIOUS {form_id}.parquet untouched. "
             f"Will retry a full fetch again next run."
         )
         detail(f"Form {form_id} | Full fetch incomplete -- existing data left untouched.")
+
+        for p in part_paths:
+            try:
+                p.unlink()
+            except Exception:
+                pass
 
         metadata_path = RAW_DIR / f"{form_id}_metadata.json"
         prior_metadata = {}
@@ -2417,7 +2704,7 @@ def run_full_fetch(form_id: int, i: int, total_forms: int, page_size: int) -> Di
 
         prior_metadata["fetch_complete"] = False
         prior_metadata["last_full_fetch_attempt"] = datetime.now().isoformat()
-        prior_metadata["last_full_fetch_attempt_rows_retrieved"] = len(data)
+        prior_metadata["last_full_fetch_attempt_rows_retrieved"] = total_records
 
         try:
             create_workflow_folders()
@@ -2434,35 +2721,28 @@ def run_full_fetch(form_id: int, i: int, total_forms: int, page_size: int) -> Di
             "path": str(output_path)
         }
 
-    if data.empty:
+    if not part_paths:
         console(f"   ⚠️  No data fetched for form {form_id}")
         return {
             "form_id": form_id, "status": "failed_no_data",
             "records": 0, "new_records": 0, "size_mb": 0, "path": str(output_path)
         }
 
-    # `data` is already the fully page-concatenated DataFrame fetch_all_data()
-    # built (see its docstring) -- there's no separate raw-records list left
-    # to free here the way there used to be. build_dataframe_from_records()
-    # casts every column IN PLACE on this same object rather than copying it
-    # (since it's already a DataFrame, not a List[Dict]), so `df` below and
-    # `data` end up being the same object; this inlines what
-    # save_to_parquet() used to do on our behalf (kept, unused by this path
-    # now, for any external caller) -- see its docstring for the
-    # write_parquet_and_metadata()/_clear_stale_partitions() steps
-    # reproduced below.
-    record_count = len(data)
-    df = build_dataframe_from_records(data)
+    console(f"   ✅ Fetch complete: {total_records:,} records across {page} page(s)")
 
-    now_iso = datetime.now().isoformat()
-    meta_extra = {
-        "fetch_mode": "full",
-        "last_full_fetch": now_iso,
-        "last_submission_time": _max_submission_time(df),
-        "fetch_complete": True,
-    }
+    metadata = _combine_fetch_parts_streaming(form_id, part_paths)
 
-    metadata = write_parquet_and_metadata(df, form_id, meta_extra)
+    for p in part_paths:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+    try:
+        if parts_dir.exists() and not any(parts_dir.iterdir()):
+            parts_dir.rmdir()
+    except Exception:
+        pass
 
     if metadata is not None:
         # This full fetch just overwrote the combined file directly -- any
@@ -2478,11 +2758,11 @@ def run_full_fetch(form_id: int, i: int, total_forms: int, page_size: int) -> Di
         }
 
     file_size = output_path.stat().st_size / (1024 * 1024)
-    console(f"   💾 Saved: {form_id}.parquet | {record_count:,} rows | {file_size:.2f} MB")
+    console(f"   💾 Saved: {form_id}.parquet | {total_records:,} rows | {file_size:.2f} MB")
 
     return {
         "form_id": form_id, "status": "full",
-        "records": record_count, "new_records": record_count,
+        "records": total_records, "new_records": total_records,
         "size_mb": round(file_size, 2), "path": str(output_path)
     }
 
