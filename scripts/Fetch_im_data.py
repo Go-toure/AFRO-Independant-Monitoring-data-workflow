@@ -1358,9 +1358,49 @@ def _merge_incremental_isolated(
 
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             console(f"   \u26a0\ufe0f  Form {form_id} | Isolated merge subprocess timed out after 20 minutes.")
-            detail(f"Form {form_id} | Isolated merge subprocess timed out.")
+
+            # [TIMING] Fix added 2026-09-24: Python's subprocess.run()
+            # DOES populate TimeoutExpired.stdout/.stderr with whatever
+            # the child had already printed before being killed -- the
+            # previous version of this handler never read them, so every
+            # [TIMING] line the child printed in its first 20 minutes
+            # (see _recover_partitions_from_sharepoint() / _save_
+            # incremental_partitioned()) was silently discarded right
+            # when it was needed most. Surface the tail via console() so
+            # it lands directly in the Pipeline Status output, not just
+            # logs/fetch_log.txt.
+            # subprocess.run(..., text=True) is expected to decode
+            # stdout/stderr to str, but CPython's TimeoutExpired path has
+            # a long-standing quirk where it can hand back raw bytes
+            # instead (confirmed directly against this container's
+            # Python 3.11) -- decode defensively so this never crashes
+            # or prints an ugly b'...' repr regardless of interpreter
+            # version.
+            def _as_text(value):
+                if value is None:
+                    return ""
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="replace")
+                return value
+
+            partial_stdout = _as_text(e.stdout)
+            partial_stderr = _as_text(e.stderr)
+
+            if partial_stdout.strip():
+                tail_lines = partial_stdout.strip().splitlines()[-40:]
+                console(f"   [TIMING] Form {form_id} | Output captured before the timeout kill (last {len(tail_lines)} line(s)):")
+                for line in tail_lines:
+                    console(f"      {line}")
+            else:
+                console(f"   [TIMING] Form {form_id} | No output was captured before the timeout kill.")
+
+            detail(
+                f"Form {form_id} | Isolated merge subprocess timed out.\n"
+                f"--- child stdout (last 4000 chars, partial -- process was killed) ---\n{partial_stdout[-4000:]}\n"
+                f"--- child stderr (last 4000 chars, partial -- process was killed) ---\n{partial_stderr[-4000:]}"
+            )
             return None
 
         if proc.returncode != 0:
