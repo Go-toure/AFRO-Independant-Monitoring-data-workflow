@@ -1450,6 +1450,23 @@ def _merge_incremental_isolated(
             )
             return None
 
+        # [TIMING] Fix added 2026-09-24, round 3: surface the child's
+        # [TIMING] lines even on a SUCCESSFUL run -- previously only a
+        # timeout or a non-zero exit ever surfaced any of this
+        # subprocess's own console() output (see the TimeoutExpired
+        # handler above and the returncode != 0 branch just above this).
+        # That meant a successful run of form 4498's isolated merge --
+        # even one that took close to the full 20-minute budget -- gave
+        # zero visibility into per-phase timing, so a creeping slowdown
+        # could only ever be noticed via the NEXT timeout, never seen
+        # coming. Same 40-line tail cap as the timeout path; proc.stdout
+        # is already a decoded str here (unlike TimeoutExpired.stdout,
+        # subprocess.run()'s own CompletedProcess.stdout does not have
+        # the bytes/str quirk), so no decoding needed.
+        timing_lines = [line for line in proc.stdout.splitlines() if "[TIMING]" in line]
+        for line in timing_lines[-40:]:
+            console(line)
+
         if not result_path.exists():
             detail(f"Form {form_id} | Isolated merge subprocess exited 0 but wrote no result file.")
             return None
