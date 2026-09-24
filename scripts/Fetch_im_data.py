@@ -491,9 +491,25 @@ def upload_raw_to_sharepoint(form_id: int) -> None:
     parquet_path = RAW_DIR / f"{form_id}.parquet"
     meta_path = RAW_DIR / f"{form_id}_metadata.json"
 
+    # [TIMING] Diagnostic instrumentation added 2026-09-24, round 2 -- see
+    # _recombine_year_partitions()'s note on t_write_start. This is one of
+    # the two candidate uploads suspected of consuming the 20-minute
+    # isolated-merge timeout for large partitioned forms (form 4498's
+    # combined file alone can be several hundred MB); per-file timing here
+    # mirrors what _recover_partitions_from_sharepoint() already does on
+    # the download side.
     ok = True
     if parquet_path.exists():
-        ok = sp.upload_file(token, drive_id, parquet_path, f"{SP_RAW_FOLDER}/{parquet_path.name}") and ok
+        parquet_mb = parquet_path.stat().st_size / (1024 * 1024)
+        t_upload_start = time.time()
+        parquet_ok = sp.upload_file(token, drive_id, parquet_path, f"{SP_RAW_FOLDER}/{parquet_path.name}")
+        parquet_elapsed = time.time() - t_upload_start
+        rate = parquet_mb / parquet_elapsed if parquet_elapsed > 0 else 0.0
+        console(
+            f"   [TIMING] Form {form_id} | Uploaded {parquet_path.name} ({parquet_mb:.1f} MB) "
+            f"in {parquet_elapsed:.1f}s ({rate:.2f} MB/s) -- {'OK' if parquet_ok else 'FAILED'}"
+        )
+        ok = parquet_ok and ok
     if meta_path.exists():
         ok = sp.upload_file(token, drive_id, meta_path, f"{SP_RAW_FOLDER}/{meta_path.name}") and ok
 
@@ -502,9 +518,20 @@ def upload_raw_to_sharepoint(form_id: int) -> None:
     else:
         detail(f"[sharepoint] Form {form_id} | WARNING: raw state sync to SharePoint failed (kept local copy only).")
 
+    t_csv_start = time.time()
     csv_path = _export_csv(form_id)
+    csv_export_elapsed = time.time() - t_csv_start
     if csv_path is not None:
+        csv_mb = csv_path.stat().st_size / (1024 * 1024)
+        t_upload_start = time.time()
         csv_ok = sp.upload_file(token, drive_id, csv_path, f"{SP_RAW_FOLDER}/{csv_path.name}")
+        csv_upload_elapsed = time.time() - t_upload_start
+        rate = csv_mb / csv_upload_elapsed if csv_upload_elapsed > 0 else 0.0
+        console(
+            f"   [TIMING] Form {form_id} | CSV twin: exported ({csv_mb:.1f} MB) in "
+            f"{csv_export_elapsed:.1f}s, uploaded in {csv_upload_elapsed:.1f}s ({rate:.2f} MB/s) "
+            f"-- {'OK' if csv_ok else 'FAILED'}"
+        )
         if csv_ok:
             detail(f"[sharepoint] Form {form_id} | CSV twin synced to SharePoint.")
         else:
@@ -1534,10 +1561,36 @@ def _upload_partitions_to_sharepoint(form_id: int) -> None:
     remote_folder = _sp_partition_folder(form_id)
     sp.ensure_folder(token, drive_id, remote_folder)
 
+    # [TIMING] Diagnostic instrumentation added 2026-09-24, round 2 -- see
+    # _recombine_year_partitions()'s note on t_write_start. The other
+    # candidate upload: pushing every year-partition file (~1.28GB total
+    # for form 4498) synchronously, once per incremental run. Per-file
+    # timing here mirrors the download side in
+    # _recover_partitions_from_sharepoint().
     partition_files = sorted(partition_dir.glob(f"{form_id}_*.parquet"))
     ok = True
+    upload_start = time.time()
+    total_bytes = 0
     for p in partition_files:
-        ok = sp.upload_file(token, drive_id, p, f"{remote_folder}/{p.name}") and ok
+        file_mb = p.stat().st_size / (1024 * 1024)
+        t_file_start = time.time()
+        file_ok = sp.upload_file(token, drive_id, p, f"{remote_folder}/{p.name}")
+        file_elapsed = time.time() - t_file_start
+        rate = file_mb / file_elapsed if file_elapsed > 0 else 0.0
+        total_bytes += p.stat().st_size
+        console(
+            f"   [TIMING] Form {form_id} | Uploaded {p.name} ({file_mb:.1f} MB) "
+            f"in {file_elapsed:.1f}s ({rate:.2f} MB/s) -- {'OK' if file_ok else 'FAILED'}"
+        )
+        ok = file_ok and ok
+
+    total_elapsed = time.time() - upload_start
+    total_mb = total_bytes / (1024 * 1024)
+    overall_rate = total_mb / total_elapsed if total_elapsed > 0 else 0.0
+    console(
+        f"   [TIMING] Form {form_id} | Uploaded {len(partition_files)} year partition(s) "
+        f"({total_mb:.1f} MB total) to SharePoint in {total_elapsed:.1f}s ({overall_rate:.2f} MB/s)"
+    )
 
     marker_path = _migration_marker_path(form_id)
     if ok and marker_path.exists():
@@ -2035,6 +2088,22 @@ def _recombine_year_partitions(
     last_submission_time = previous_metadata.get("last_submission_time")
     writer = None
 
+    # [TIMING] Diagnostic instrumentation added 2026-09-24, round 2: the
+    # first round of timing (per-year merge) showed the merge computation
+    # itself is fast (44.8s for form 4498's 2026 partition), but the
+    # isolated subprocess still timed out with no further output -- which
+    # means the remaining ~19 minutes is somewhere inside this function's
+    # OWN black box: the row-group write loop below, or (more likely,
+    # given this same write loop measured only ~57s in an earlier
+    # standalone test against the same real 4498 data) the two SharePoint
+    # upload calls at the end of this function, which push the combined
+    # file (up to several hundred MB) plus every year-partition file
+    # (~1.28GB for form 4498) synchronously, with no timing visibility of
+    # their own until now. Splitting the timing here, per call, is what
+    # will finally show which one it is on the next run, even if the
+    # process gets killed again before this function returns.
+    t_write_start = time.time()
+
     try:
         writer = pq.ParquetWriter(tmp_output_path, arrow_schema, compression="snappy")
 
@@ -2089,6 +2158,11 @@ def _recombine_year_partitions(
         return None
 
     file_size_mb = output_path.stat().st_size / (1024 * 1024)
+    write_elapsed = time.time() - t_write_start
+    console(
+        f"   [TIMING] Form {form_id} | Wrote combined file ({total_rows:,} rows, "
+        f"{file_size_mb:.1f} MB) in {write_elapsed:.1f}s"
+    )
 
     metadata = {
         "workflow": "Independent Monitoring IM",
@@ -2122,8 +2196,17 @@ def _recombine_year_partitions(
         f"({len(partition_paths)} year partition(s))"
     )
 
+    # [TIMING] See the note above t_write_start: these two calls are the
+    # other prime suspect for where the 20-minute timeout goes, now timed
+    # individually (each also has its own per-file timing -- see
+    # upload_raw_to_sharepoint() / _upload_partitions_to_sharepoint()).
+    t_upload_raw_start = time.time()
     upload_raw_to_sharepoint(form_id)
+    console(f"   [TIMING] Form {form_id} | upload_raw_to_sharepoint() took {time.time() - t_upload_raw_start:.1f}s")
+
+    t_upload_partitions_start = time.time()
     _upload_partitions_to_sharepoint(form_id)
+    console(f"   [TIMING] Form {form_id} | _upload_partitions_to_sharepoint() took {time.time() - t_upload_partitions_start:.1f}s")
 
     return metadata
 
