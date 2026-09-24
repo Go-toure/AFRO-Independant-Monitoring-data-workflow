@@ -1534,9 +1534,11 @@ def _recover_partitions_from_sharepoint(form_id: int) -> bool:
     if not token:
         return False
 
+    t_list_start = time.time()
     remote_folder = _sp_partition_folder(form_id)
     remote_items = sp.list_folder(token, drive_id, remote_folder)
     remote_names = {item["name"] for item in remote_items}
+    list_elapsed = time.time() - t_list_start
 
     marker_name = "_MIGRATION_COMPLETE"
     if marker_name not in remote_names:
@@ -1551,24 +1553,69 @@ def _recover_partitions_from_sharepoint(form_id: int) -> bool:
     partition_dir = _partition_dir(form_id)
     partition_dir.mkdir(parents=True, exist_ok=True)
 
+    # [TIMING] Diagnostic instrumentation added 2026-09-24 to find out where
+    # form 4498's isolated-merge subprocess was spending its 20-minute
+    # timeout (see the isolated-merge timeout warning in run logs).
+    # _recombine_year_partitions() itself measured only ~57s against real
+    # 4498 data (7 partitions, 1.15M rows, 822 cols) -- this download loop
+    # is the prime suspect, since Connect Cloud containers are ephemeral
+    # and this ~1.28GB (for 4498) re-download happens on EVERY incremental
+    # run, not just once. Uses console() rather than detail() so these
+    # lines land in the Pipeline Status output the user already has easy
+    # access to, not just logs/fetch_log.txt.
+    download_start = time.time()
+    total_bytes = 0
+
     for name in partition_names:
+        file_start = time.time()
         ok = sp.download_file(token, drive_id, f"{remote_folder}/{name}", partition_dir / name)
+        file_elapsed = time.time() - file_start
+
         if not ok:
+            console(
+                f"   [TIMING] Form {form_id} | Partition download FAILED for {name} "
+                f"after {file_elapsed:.1f}s -- falling back to full local migration."
+            )
             detail(
                 f"[sharepoint] Form {form_id} | Partition recovery failed downloading "
                 f"{name} -- falling back to full local migration."
             )
             return False
 
+        file_bytes = (partition_dir / name).stat().st_size
+        total_bytes += file_bytes
+        file_mb = file_bytes / (1024 * 1024)
+        rate = file_mb / file_elapsed if file_elapsed > 0 else 0.0
+        console(
+            f"   [TIMING] Form {form_id} | Downloaded {name} ({file_mb:.1f} MB) "
+            f"in {file_elapsed:.1f}s ({rate:.2f} MB/s)"
+        )
+
+    marker_start = time.time()
     marker_ok = sp.download_file(
         token, drive_id, f"{remote_folder}/{marker_name}", partition_dir / marker_name
     )
+    marker_elapsed = time.time() - marker_start
+
     if not marker_ok:
+        console(
+            f"   [TIMING] Form {form_id} | Completion-marker download FAILED "
+            f"after {marker_elapsed:.1f}s -- falling back to full local migration."
+        )
         detail(
             f"[sharepoint] Form {form_id} | Partition recovery failed downloading the "
             f"completion marker -- falling back to full local migration."
         )
         return False
+
+    download_elapsed = time.time() - download_start
+    total_mb = total_bytes / (1024 * 1024)
+    overall_rate = total_mb / download_elapsed if download_elapsed > 0 else 0.0
+    console(
+        f"   [TIMING] Form {form_id} | Recovered {len(partition_names)} year partition(s) "
+        f"({total_mb:.1f} MB total) from SharePoint in {download_elapsed:.1f}s "
+        f"({overall_rate:.2f} MB/s) [folder listing: {list_elapsed:.1f}s]"
+    )
 
     detail(
         f"[sharepoint] Form {form_id} | Recovered {len(partition_names)} year partition(s) "
@@ -2062,6 +2109,15 @@ def _save_incremental_partitioned(
     """
     existing_path = RAW_DIR / f"{form_id}.parquet"
 
+    # [TIMING] Diagnostic instrumentation added 2026-09-24 -- see
+    # _recover_partitions_from_sharepoint()'s own timing lines for why.
+    # This wraps the three phases of a partitioned merge (recover-or-
+    # migrate, per-year merge, final recombine) so a summary line at the
+    # end of this function shows which phase actually consumed the 20
+    # minutes, instead of only knowing the isolated subprocess as a whole
+    # timed out.
+    t_phase_start = time.time()
+
     if not _is_form_partitioned(form_id) and not _recover_partitions_from_sharepoint(form_id):
         detail(
             f"Form {form_id} | Existing data has grown past the "
@@ -2074,6 +2130,9 @@ def _save_incremental_partitioned(
             detail(f"[WARNING] Form {form_id} | Year-partition migration failed: {e}")
             return None
         detail(f"Form {form_id} | Migrated to year partitions: {row_counts}")
+
+    t_recover_elapsed = time.time() - t_phase_start
+    t_phase_start = time.time()
 
     new_df = build_dataframe_from_records(new_data)
 
@@ -2090,6 +2149,7 @@ def _save_incremental_partitioned(
     for year, year_new_df in new_df.groupby("_partition_year", observed=True):
         year_new_df = year_new_df.drop(columns=["_partition_year"])
         partition_path = _partition_path(form_id, year)
+        t_year_start = time.time()
 
         if partition_path.exists():
             try:
@@ -2112,10 +2172,29 @@ def _save_incremental_partitioned(
             detail(f"[WARNING] Form {form_id} | Could not write partition {partition_path.name}: {e}")
             return None
 
+        console(
+            f"   [TIMING] Form {form_id} | Year {year} partition merge "
+            f"({len(merged):,} total rows) took {time.time() - t_year_start:.1f}s"
+        )
+
         del merged
         gc.collect()
 
-    return _recombine_year_partitions(form_id, previous_metadata, new_records_this_run=len(new_data))
+    t_merge_elapsed = time.time() - t_phase_start
+    t_phase_start = time.time()
+
+    result = _recombine_year_partitions(form_id, previous_metadata, new_records_this_run=len(new_data))
+
+    t_recombine_elapsed = time.time() - t_phase_start
+    t_total_elapsed = t_recover_elapsed + t_merge_elapsed + t_recombine_elapsed
+    console(
+        f"   [TIMING] Form {form_id} | Partitioned merge total: "
+        f"recover/migrate={t_recover_elapsed:.1f}s, per-year merge={t_merge_elapsed:.1f}s, "
+        f"recombine={t_recombine_elapsed:.1f}s -- TOTAL={t_total_elapsed:.1f}s "
+        f"({t_total_elapsed/60:.1f} min)"
+    )
+
+    return result
 
 
 def touch_metadata_checked(form_id: int, previous_metadata: Dict) -> Dict:
