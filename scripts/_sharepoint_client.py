@@ -18,6 +18,7 @@ already does on the dashboard's read side.
 """
 
 import os
+import time
 import requests
 from pathlib import Path
 from typing import Optional, List, Dict
@@ -43,6 +44,96 @@ def credentials_available() -> bool:
 
 def _auth(token: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+def _log_sp_failure(
+    op: str,
+    remote_path: str,
+    response: Optional["requests.Response"] = None,
+    exc: Optional[Exception] = None,
+) -> None:
+    """Print the real HTTP status code behind a write-side SharePoint
+    failure (and, for a 429, its Retry-After header) instead of leaving
+    every failure indistinguishable as a bare 'FAILED' in the pipeline
+    log. Added 2026-09-25 after a run where every upload after the first
+    two forms failed for the rest of the run with no way to tell a
+    throttled 429 apart from an expired token (401), a permissions
+    problem (403), or a transient 5xx -- this is purely a diagnostic
+    side-channel: it never raises, and it changes nothing about any
+    caller's own return value or the rest of this module's
+    never-raises/best-effort contract.
+
+    Prefers `response` (a real HTTP response was received, just not a
+    success one) over `exc` (no response at all -- a network-level
+    failure like a timeout or connection error)."""
+    try:
+        if response is not None:
+            retry_after = response.headers.get("Retry-After")
+            extra = f", Retry-After={retry_after}s" if retry_after else ""
+            body = response.text[:300].replace("\n", " ") if response.text else ""
+            print(
+                f"   [sharepoint-error] {op} -- HTTP {response.status_code}{extra} "
+                f"on {remote_path}: {body}",
+                flush=True,
+            )
+        elif exc is not None:
+            print(
+                f"   [sharepoint-error] {op} -- {type(exc).__name__} on {remote_path}: {exc}",
+                flush=True,
+            )
+    except Exception:
+        pass
+
+
+def _request_with_retry(
+    method: str,
+    url: str,
+    max_attempts: int = 4,
+    retry_delays: Optional[List[int]] = None,
+    **kwargs,
+) -> "requests.Response":
+    """requests.request(), retrying up to max_attempts times on a 429
+    (Too Many Requests) response before handing the caller whatever the
+    last attempt returned -- the write-side counterpart to
+    Fetch_im_data.py's own fetch_page(), which already retries a 429 from
+    the ONA/Kobo API with a backoff. Added 2026-09-25: this SharePoint
+    write path had no such handling at all, so a run that hit Graph's
+    rate limit after roughly two forms' worth of write requests then
+    failed every single write for the rest of that ~15-minute run, with
+    nothing to back off and retry.
+
+    Honors a Retry-After response header when Graph sends one (it
+    usually does on a 429), falling back to retry_delays otherwise.
+    Only 429 triggers a retry here -- any other status (including other
+    4xx/5xx) is returned immediately on the first attempt, unchanged
+    from this module's previous behavior, so the caller's own
+    raise_for_status() / status-code handling still sees exactly what it
+    always did for every failure mode except this one. A genuine network
+    exception (timeout, connection error) is NOT retried here either --
+    it propagates immediately, exactly as before this change."""
+    if retry_delays is None:
+        retry_delays = [15, 30, 60]
+
+    response = requests.request(method, url, **kwargs)
+    for attempt in range(1, max_attempts):
+        if response.status_code != 429:
+            return response
+
+        retry_after = response.headers.get("Retry-After")
+        try:
+            delay = int(retry_after) if retry_after else retry_delays[min(attempt - 1, len(retry_delays) - 1)]
+        except (TypeError, ValueError):
+            delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
+
+        print(
+            f"   [sharepoint] Rate limited (429) on {method} {url.split('?')[0]} -- "
+            f"waiting {delay}s (attempt {attempt}/{max_attempts - 1})...",
+            flush=True,
+        )
+        time.sleep(delay)
+        response = requests.request(method, url, **kwargs)
+
+    return response
 
 
 def get_token() -> Optional[str]:
@@ -142,7 +233,8 @@ def ensure_folder(token: str, drive_id: str, folder_path: str) -> bool:
             else:
                 create_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/children"
 
-            resp = requests.post(
+            resp = _request_with_retry(
+                "POST",
                 create_url,
                 headers=_auth(token),
                 json={
@@ -153,7 +245,8 @@ def ensure_folder(token: str, drive_id: str, folder_path: str) -> bool:
                 timeout=30,
             )
             resp.raise_for_status()
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as e:
+            _log_sp_failure("ensure_folder", current, response=getattr(e, "response", None), exc=e)
             return False
 
     return True
@@ -212,7 +305,8 @@ def upload_file(token: str, drive_id: str, local_path: Path, remote_path: str) -
             content = f.read()
 
         url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{remote_path}:/content"
-        r = requests.put(
+        r = _request_with_retry(
+            "PUT",
             url,
             headers={**_auth(token), "Content-Type": "application/octet-stream"},
             data=content,
@@ -220,7 +314,8 @@ def upload_file(token: str, drive_id: str, local_path: Path, remote_path: str) -
         )
         r.raise_for_status()
         return True
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e:
+        _log_sp_failure("upload_file", remote_path, response=getattr(e, "response", None), exc=e)
         return False
 
 
@@ -233,7 +328,8 @@ def _upload_large_file(token: str, drive_id: str, local_path: Path, remote_path:
         session_url = (
             f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{remote_path}:/createUploadSession"
         )
-        session_resp = requests.post(
+        session_resp = _request_with_retry(
+            "POST",
             session_url,
             headers=_auth(token),
             json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
@@ -250,7 +346,8 @@ def _upload_large_file(token: str, drive_id: str, local_path: Path, remote_path:
                     break
                 end = start + len(chunk) - 1
 
-                r = requests.put(
+                r = _request_with_retry(
+                    "PUT",
                     upload_url,
                     headers={
                         "Content-Length": str(len(chunk)),
@@ -263,14 +360,17 @@ def _upload_large_file(token: str, drive_id: str, local_path: Path, remote_path:
                 # 200/201 on the final chunk (item created), 202 ("Accepted")
                 # on every chunk in between.
                 if r.status_code not in (200, 201, 202):
+                    _log_sp_failure("_upload_large_file:chunk", remote_path, response=r)
                     return False
 
                 start += len(chunk)
 
         return True
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e:
+        _log_sp_failure("_upload_large_file:session", remote_path, response=getattr(e, "response", None), exc=e)
         return False
-    except OSError:
+    except OSError as e:
+        _log_sp_failure("_upload_large_file:file-read", remote_path, exc=e)
         return False
 
 
@@ -284,10 +384,11 @@ def delete_item(token: str, drive_id: str, item_path: str) -> bool:
     recoverable, not a permanent destroy."""
     try:
         url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{item_path}"
-        r = requests.delete(url, headers=_auth(token), timeout=60)
+        r = _request_with_retry("DELETE", url, headers=_auth(token), timeout=60)
         if r.status_code in (204, 404):
             return True
         r.raise_for_status()
         return True
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e:
+        _log_sp_failure("delete_item", item_path, response=getattr(e, "response", None), exc=e)
         return False
