@@ -399,42 +399,76 @@ def sync_missing_raw_from_sharepoint(form_ids) -> None:
     detail(f"[sharepoint] Raw-state sync: recovered {recovered}/{len(missing_forms)} missing form(s).")
 
 
-# A form's CSV twin (see _export_csv()) exists for exactly one reason,
-# per its own docstring: so someone without a Parquet-aware tool can
-# open a form's raw data in something like Excel. Excel's own hard row
-# limit is 1,048,576 rows per sheet (including the header row) -- past
-# that, a .csv simply cannot be opened in full in the one tool this
-# feature is for. Skipping the export/upload above that threshold isn't
-# a behavior change to anything the CSV twin actually accomplishes,
-# since it was already incapable of fulfilling its purpose there; it
-# just stops paying the (large, and by far the most variable) cost of
-# generating and uploading a file nobody can fully use. Measured
-# directly against form 4498 (1,152,474 rows, already past this limit):
-# the CSV twin alone -- export + upload of a 3.85 GB file -- took 427s,
-# 60% of that run's entire 716s isolated-merge time, and was the prime
-# suspect for the timeouts this pipeline saw on 2026-09-23/24 (SharePoint
-# upload throughput is by far the most run-to-run variable step here).
+# A form's CSV twin (see _export_csv()) exists for exactly one reason:
+# so someone without a Parquet-aware tool can open a form's raw data in
+# something like Excel. Excel's own hard row limit is 1,048,576 rows per
+# sheet (including the header row) -- past that, a single combined .csv
+# simply cannot be opened in full in the one tool this feature is for.
+# A form this large already gets migrated to year-partitioned Parquet
+# storage (_is_form_partitioned() / _PARTITION_ROW_THRESHOLD) well
+# before it could reach this limit, so the fix applied 2026-09-25 mirrors
+# that: give a "heavy" (partitioned) form one CSV per year partition
+# instead of one combined CSV -- see _export_csv_year_partitions() /
+# _upload_csv_partitions_to_sharepoint(), called automatically for any
+# such form. Each year's CSV stays comfortably under this limit for the
+# same reason a year's worth of Parquet data does: new submissions
+# almost always land in the current year, so no single year has ever
+# approached the form's overall total. An earlier version of this fix
+# skipped the CSV twin entirely above this threshold instead of
+# partitioning it -- kept here as the named reference for that limit,
+# since several docstrings below still explain the fix in terms of it.
 _CSV_EXPORT_MAX_ROWS = 1_048_576
+
+
+def _write_csv_from_parquet(source_path: Path, dest_path: Path) -> None:
+    """Stream one Parquet file into one CSV file, ONE ROW GROUP AT A TIME
+    via pq.ParquetFile.read_row_group() straight into pyarrow's own
+    CSVWriter -- never loading the whole file into a pandas DataFrame.
+    Shared by _export_csv() (one combined-file CSV twin, for a
+    non-partitioned form) and _export_csv_year_partitions() (one CSV per
+    year partition, for a partitioned/"heavy" form), so both get the
+    same memory-safe streaming behavior regardless of how large the
+    source file is (see _merge_and_dedup() / _recombine_year_
+    partitions()'s own docstrings for the memory history this avoids
+    repeating).
+
+    Raises on failure; callers decide how to handle that (a CSV export
+    failing must never fail the fetch it happened alongside -- see both
+    callers' own docstrings)."""
+    writer = None
+    try:
+        pf = pq.ParquetFile(source_path)
+        for rg_idx in range(pf.num_row_groups):
+            table = pf.read_row_group(rg_idx)
+            if writer is None:
+                writer = pa_csv.CSVWriter(str(dest_path), table.schema)
+            writer.write_table(table)
+            del table
+
+        if writer is None:
+            # No row groups at all (an empty file) -- still produce a
+            # header-only CSV rather than no file.
+            writer = pa_csv.CSVWriter(str(dest_path), pf.schema_arrow)
+
+        writer.close()
+        writer = None
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        gc.collect()
+        pa.default_memory_pool().release_unused()
 
 
 def _export_csv(form_id: int) -> Optional[Path]:
     """Write a CSV twin of this form's just-finalized combined Parquet
     file, for anyone who wants to open a form's raw data directly
-    without a Parquet-aware tool (Excel, a text editor, etc).
-
-    Streams the Parquet file ONE ROW GROUP AT A TIME via
-    pq.ParquetFile.read_row_group() straight into pyarrow's own
-    CSVWriter -- never loads the whole form into a pandas DataFrame --
-    so this is safe to run unconditionally for every form, including
-    form 4498's 800+-column, 1M+-row combined file, without
-    reintroducing the exact memory blowup the rest of this file's
-    history is about (see _merge_and_dedup() / _recombine_year_
-    partitions()'s own docstrings). A combined file written by
-    _recombine_year_partitions() already has many small
-    (_PARTITION_ROW_GROUP_SIZE-sized) row groups for exactly this
-    reason; a plain (non-partitioned) form's file has only one or two
-    larger ones, which is the same size of data this pipeline already
-    safely handles elsewhere for those smaller forms.
+    without a Parquet-aware tool (Excel, a text editor, etc). Only
+    called for a NON-partitioned form -- see _CSV_EXPORT_MAX_ROWS's
+    docstring and _export_csv_year_partitions() for the partitioned
+    ("heavy" form) equivalent.
 
     Returns the CSV's path on success, or None on any failure (never
     raises) -- a CSV export failing must not fail the fetch it happened
@@ -459,35 +493,52 @@ def _export_csv(form_id: int) -> Optional[Path]:
     csv_export_dir = RAW_DIR / "csv_export"
     csv_export_dir.mkdir(parents=True, exist_ok=True)
     csv_path = csv_export_dir / f"{form_id}.csv"
-    writer = None
     try:
-        pf = pq.ParquetFile(source_path)
-        for rg_idx in range(pf.num_row_groups):
-            table = pf.read_row_group(rg_idx)
-            if writer is None:
-                writer = pa_csv.CSVWriter(str(csv_path), table.schema)
-            writer.write_table(table)
-            del table
-
-        if writer is None:
-            # No row groups at all (an empty form) -- still produce a
-            # header-only CSV rather than no file.
-            writer = pa_csv.CSVWriter(str(csv_path), pf.schema_arrow)
-
-        writer.close()
-        writer = None
+        _write_csv_from_parquet(source_path, csv_path)
         return csv_path
     except Exception as e:
-        if writer is not None:
-            try:
-                writer.close()
-            except Exception:
-                pass
         detail(f"[WARNING] Form {form_id} | CSV export failed: {e}")
         return None
-    finally:
-        gc.collect()
-        pa.default_memory_pool().release_unused()
+
+
+def _export_csv_year_partitions(form_id: int) -> List[Path]:
+    """Write one CSV twin per local year-partition file, for a
+    partitioned ("heavy") form -- the per-year counterpart to
+    _export_csv()'s single combined-file CSV. Added 2026-09-25 to
+    replace skipping the CSV twin outright for a form whose combined row
+    count exceeds Excel's 1,048,576-row limit (see
+    _CSV_EXPORT_MAX_ROWS): the same year-partitioning already used for
+    Parquet storage keeps each CSV comfortably under that limit too.
+    Named {form_id}_{year}.csv, matching the existing
+    {form_id}_{year}.parquet partition naming, and written to the same
+    csv_export/ subfolder _export_csv() uses (invisible to the R
+    repository builder's non-recursive glob of data/raw/ -- see that
+    function's docstring).
+
+    Returns the list of CSV paths written (only for partitions that
+    exported successfully); never raises -- a failure on one year's CSV
+    must not block the others or fail the fetch this happened
+    alongside."""
+    partition_dir = _partition_dir(form_id)
+    partition_paths = sorted(partition_dir.glob(f"{form_id}_*.parquet"))
+    if not partition_paths:
+        return []
+
+    csv_export_dir = RAW_DIR / "csv_export"
+    csv_export_dir.mkdir(parents=True, exist_ok=True)
+
+    written: List[Path] = []
+    for p in partition_paths:
+        # p.stem is already "{form_id}_{year}", matching the naming this
+        # function's docstring documents.
+        csv_path = csv_export_dir / f"{p.stem}.csv"
+        try:
+            _write_csv_from_parquet(p, csv_path)
+            written.append(csv_path)
+        except Exception as e:
+            detail(f"[WARNING] Form {form_id} | CSV export failed for partition {p.name}: {e}")
+
+    return written
 
 
 def upload_raw_to_sharepoint(form_id: int) -> None:
@@ -536,32 +587,25 @@ def upload_raw_to_sharepoint(form_id: int) -> None:
     else:
         detail(f"[sharepoint] Form {form_id} | WARNING: raw state sync to SharePoint failed (kept local copy only).")
 
-    # [FIX] Added 2026-09-25: skip the CSV twin entirely for a form whose
-    # row count already exceeds Excel's own 1,048,576-row limit -- see
-    # _CSV_EXPORT_MAX_ROWS's docstring. Row count is read from the
-    # Parquet file's metadata only (pq.ParquetFile(...).metadata.num_rows
-    # never reads the actual column data), so this check itself is cheap
-    # regardless of how large the form is.
-    skip_csv = False
-    if parquet_path.exists():
-        try:
-            num_rows = pq.ParquetFile(parquet_path).metadata.num_rows
-        except Exception:
-            num_rows = None
-        if num_rows is not None and num_rows > _CSV_EXPORT_MAX_ROWS:
-            skip_csv = True
-            detail(
-                f"[sharepoint] Form {form_id} | Skipping CSV twin: {num_rows:,} rows exceeds "
-                f"Excel's {_CSV_EXPORT_MAX_ROWS:,}-row limit, so a CSV twin could not be opened "
-                f"in full in the one tool this export exists for."
-            )
-            console(
-                f"   [TIMING] Form {form_id} | Skipped CSV twin ({num_rows:,} rows > "
-                f"{_CSV_EXPORT_MAX_ROWS:,}-row Excel limit)"
-            )
+    # [FIX] Updated 2026-09-25: a partitioned ("heavy") form gets its CSV
+    # twin exported and uploaded per year partition instead -- see
+    # _upload_csv_partitions_to_sharepoint() / _export_csv_year_
+    # partitions(), called automatically from _recombine_year_
+    # partitions() right alongside this function, for any form that
+    # reaches partitioned storage. A single combined CSV for a form that
+    # size would exceed Excel's 1,048,576-row limit (see
+    # _CSV_EXPORT_MAX_ROWS) -- the one tool this export exists for -- so
+    # it's skipped here entirely rather than exported twice in two
+    # different shapes.
+    if _is_form_partitioned(form_id):
+        detail(
+            f"[sharepoint] Form {form_id} | Combined CSV twin skipped (partitioned form) -- "
+            f"synced as per-year CSV partitions instead."
+        )
+        return
 
     t_csv_start = time.time()
-    csv_path = None if skip_csv else _export_csv(form_id)
+    csv_path = _export_csv(form_id)
     csv_export_elapsed = time.time() - t_csv_start
     if csv_path is not None:
         csv_mb = csv_path.stat().st_size / (1024 * 1024)
@@ -1661,6 +1705,60 @@ def _upload_partitions_to_sharepoint(form_id: int) -> None:
         detail(f"[sharepoint] Form {form_id} | WARNING: partition sync to SharePoint failed (kept local copy only; a future run will retry).")
 
 
+def _upload_csv_partitions_to_sharepoint(form_id: int) -> None:
+    """Export and push one CSV twin per year partition to the same
+    SharePoint subfolder as the Parquet partitions (_sp_partition_
+    folder()) -- the per-year counterpart to upload_raw_to_sharepoint()'s
+    single CSV twin, automatically applied to any partitioned ("heavy")
+    form. See _export_csv_year_partitions()'s docstring for why:
+    partitioning by year keeps every CSV under Excel's row limit, unlike
+    one combined CSV for a form the size of 4498. Per-file timing here
+    mirrors _upload_partitions_to_sharepoint()'s own pattern. Never
+    raises -- same best-effort contract as the rest of this SharePoint
+    layer; a failure here just means these CSVs are stale until a future
+    run's upload succeeds (the Parquet partitions -- this pipeline's
+    real source of truth -- are uploaded separately and are unaffected)."""
+    token, drive_id = _get_sp_session()
+    if not token:
+        return
+
+    csv_paths = _export_csv_year_partitions(form_id)
+    if not csv_paths:
+        return
+
+    remote_folder = _sp_partition_folder(form_id)
+    sp.ensure_folder(token, drive_id, remote_folder)
+
+    ok = True
+    upload_start = time.time()
+    total_bytes = 0
+    for p in csv_paths:
+        file_mb = p.stat().st_size / (1024 * 1024)
+        t_file_start = time.time()
+        file_ok = sp.upload_file(token, drive_id, p, f"{remote_folder}/{p.name}")
+        file_elapsed = time.time() - t_file_start
+        rate = file_mb / file_elapsed if file_elapsed > 0 else 0.0
+        total_bytes += p.stat().st_size
+        console(
+            f"   [TIMING] Form {form_id} | Uploaded CSV twin {p.name} ({file_mb:.1f} MB) "
+            f"in {file_elapsed:.1f}s ({rate:.2f} MB/s) -- {'OK' if file_ok else 'FAILED'}"
+        )
+        ok = file_ok and ok
+
+    total_elapsed = time.time() - upload_start
+    total_mb = total_bytes / (1024 * 1024)
+    overall_rate = total_mb / total_elapsed if total_elapsed > 0 else 0.0
+    console(
+        f"   [TIMING] Form {form_id} | Uploaded {len(csv_paths)} CSV year partition(s) "
+        f"({total_mb:.1f} MB total) to SharePoint in {total_elapsed:.1f}s ({overall_rate:.2f} MB/s)"
+    )
+
+    if ok:
+        detail(f"[sharepoint] Form {form_id} | {len(csv_paths)} CSV year partition(s) synced to SharePoint.")
+    else:
+        detail(f"[sharepoint] Form {form_id} | WARNING: CSV partition sync to SharePoint failed for one or more years.")
+
+
 def _recover_partitions_from_sharepoint(form_id: int) -> bool:
     """Best-effort attempt to restore an already-completed year-partition
     migration from SharePoint instead of redoing the expensive local
@@ -2266,6 +2364,15 @@ def _recombine_year_partitions(
     t_upload_partitions_start = time.time()
     _upload_partitions_to_sharepoint(form_id)
     console(f"   [TIMING] Form {form_id} | _upload_partitions_to_sharepoint() took {time.time() - t_upload_partitions_start:.1f}s")
+
+    # [FIX] Added 2026-09-25: upload_raw_to_sharepoint() above skips its
+    # combined CSV twin for a partitioned form (see that function's own
+    # note) -- this is what replaces it, automatically, for every such
+    # "heavy" form: one CSV per year partition instead of one combined
+    # CSV that would exceed Excel's row limit.
+    t_upload_csv_partitions_start = time.time()
+    _upload_csv_partitions_to_sharepoint(form_id)
+    console(f"   [TIMING] Form {form_id} | _upload_csv_partitions_to_sharepoint() took {time.time() - t_upload_csv_partitions_start:.1f}s")
 
     return metadata
 
