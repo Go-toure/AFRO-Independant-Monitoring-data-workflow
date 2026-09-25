@@ -399,6 +399,24 @@ def sync_missing_raw_from_sharepoint(form_ids) -> None:
     detail(f"[sharepoint] Raw-state sync: recovered {recovered}/{len(missing_forms)} missing form(s).")
 
 
+# A form's CSV twin (see _export_csv()) exists for exactly one reason,
+# per its own docstring: so someone without a Parquet-aware tool can
+# open a form's raw data in something like Excel. Excel's own hard row
+# limit is 1,048,576 rows per sheet (including the header row) -- past
+# that, a .csv simply cannot be opened in full in the one tool this
+# feature is for. Skipping the export/upload above that threshold isn't
+# a behavior change to anything the CSV twin actually accomplishes,
+# since it was already incapable of fulfilling its purpose there; it
+# just stops paying the (large, and by far the most variable) cost of
+# generating and uploading a file nobody can fully use. Measured
+# directly against form 4498 (1,152,474 rows, already past this limit):
+# the CSV twin alone -- export + upload of a 3.85 GB file -- took 427s,
+# 60% of that run's entire 716s isolated-merge time, and was the prime
+# suspect for the timeouts this pipeline saw on 2026-09-23/24 (SharePoint
+# upload throughput is by far the most run-to-run variable step here).
+_CSV_EXPORT_MAX_ROWS = 1_048_576
+
+
 def _export_csv(form_id: int) -> Optional[Path]:
     """Write a CSV twin of this form's just-finalized combined Parquet
     file, for anyone who wants to open a form's raw data directly
@@ -518,8 +536,32 @@ def upload_raw_to_sharepoint(form_id: int) -> None:
     else:
         detail(f"[sharepoint] Form {form_id} | WARNING: raw state sync to SharePoint failed (kept local copy only).")
 
+    # [FIX] Added 2026-09-25: skip the CSV twin entirely for a form whose
+    # row count already exceeds Excel's own 1,048,576-row limit -- see
+    # _CSV_EXPORT_MAX_ROWS's docstring. Row count is read from the
+    # Parquet file's metadata only (pq.ParquetFile(...).metadata.num_rows
+    # never reads the actual column data), so this check itself is cheap
+    # regardless of how large the form is.
+    skip_csv = False
+    if parquet_path.exists():
+        try:
+            num_rows = pq.ParquetFile(parquet_path).metadata.num_rows
+        except Exception:
+            num_rows = None
+        if num_rows is not None and num_rows > _CSV_EXPORT_MAX_ROWS:
+            skip_csv = True
+            detail(
+                f"[sharepoint] Form {form_id} | Skipping CSV twin: {num_rows:,} rows exceeds "
+                f"Excel's {_CSV_EXPORT_MAX_ROWS:,}-row limit, so a CSV twin could not be opened "
+                f"in full in the one tool this export exists for."
+            )
+            console(
+                f"   [TIMING] Form {form_id} | Skipped CSV twin ({num_rows:,} rows > "
+                f"{_CSV_EXPORT_MAX_ROWS:,}-row Excel limit)"
+            )
+
     t_csv_start = time.time()
-    csv_path = _export_csv(form_id)
+    csv_path = None if skip_csv else _export_csv(form_id)
     csv_export_elapsed = time.time() - t_csv_start
     if csv_path is not None:
         csv_mb = csv_path.stat().st_size / (1024 * 1024)
