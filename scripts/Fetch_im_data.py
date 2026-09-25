@@ -1706,18 +1706,30 @@ def _upload_partitions_to_sharepoint(form_id: int) -> None:
 
 
 def _upload_csv_partitions_to_sharepoint(form_id: int) -> None:
-    """Export and push one CSV twin per year partition to the same
-    SharePoint subfolder as the Parquet partitions (_sp_partition_
-    folder()) -- the per-year counterpart to upload_raw_to_sharepoint()'s
-    single CSV twin, automatically applied to any partitioned ("heavy")
-    form. See _export_csv_year_partitions()'s docstring for why:
-    partitioning by year keeps every CSV under Excel's row limit, unlike
-    one combined CSV for a form the size of 4498. Per-file timing here
-    mirrors _upload_partitions_to_sharepoint()'s own pattern. Never
-    raises -- same best-effort contract as the rest of this SharePoint
-    layer; a failure here just means these CSVs are stale until a future
-    run's upload succeeds (the Parquet partitions -- this pipeline's
-    real source of truth -- are uploaded separately and are unaffected)."""
+    """Export and push one CSV twin per year partition to SP_RAW_FOLDER
+    (raw_state's own root) -- the per-year counterpart to
+    upload_raw_to_sharepoint()'s single CSV twin, automatically applied
+    to any partitioned ("heavy") form. See _export_csv_year_partitions()'s
+    docstring for why: partitioning by year keeps every CSV under Excel's
+    row limit, unlike one combined CSV for a form the size of 4498.
+
+    Deliberately uploaded to raw_state's root, NOT into
+    _sp_partition_folder() alongside the Parquet partitions: those
+    Parquet partitions are purely an internal recovery mechanism (see
+    _upload_partitions_to_sharepoint()'s docstring) that nobody browsing
+    SharePoint by hand has any reason to open, while these CSVs exist
+    specifically for a person to open directly -- exactly like the
+    single combined {form_id}.parquet already sits at that same root, so
+    a person looking for form 4498's data finds the combined Parquet and
+    every year's CSV together in one place instead of having to know
+    about an internal partitions/ subfolder.
+
+    Per-file timing here mirrors _upload_partitions_to_sharepoint()'s own
+    pattern. Never raises -- same best-effort contract as the rest of
+    this SharePoint layer; a failure here just means these CSVs are
+    stale until a future run's upload succeeds (the Parquet partitions --
+    this pipeline's real source of truth -- are uploaded separately and
+    are unaffected)."""
     token, drive_id = _get_sp_session()
     if not token:
         return
@@ -1726,7 +1738,7 @@ def _upload_csv_partitions_to_sharepoint(form_id: int) -> None:
     if not csv_paths:
         return
 
-    remote_folder = _sp_partition_folder(form_id)
+    remote_folder = SP_RAW_FOLDER
     sp.ensure_folder(token, drive_id, remote_folder)
 
     ok = True
