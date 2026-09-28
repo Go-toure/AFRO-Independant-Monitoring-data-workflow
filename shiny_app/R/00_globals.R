@@ -18,7 +18,38 @@ pkgs_needed <- c("shiny","bslib","bsicons","DT","plotly","dplyr",
                  "readr","lubridate","arrow","shinyjs","scales","processx",
                  "ellmer","shinychat","openxlsx","zip","writexl")
 new_pkgs <- pkgs_needed[!pkgs_needed %in% rownames(installed.packages())]
-if (length(new_pkgs) > 0) install.packages(new_pkgs, quiet = TRUE)
+if (length(new_pkgs) > 0) {
+  # Best-effort only -- NEVER let this crash Shiny startup. On Connect
+  # Cloud, required packages are meant to be pre-provisioned via
+  # shiny_app/manifest.json (regenerate it with generate_shiny_manifest.R
+  # after adding any new package dependency, then commit + push + redeploy).
+  # This install.packages() call exists purely to smooth over local/RStudio
+  # runs, where no manifest-driven provisioning happens and a personal CRAN
+  # mirror is normally already configured.
+  #
+  # Discovered the hard way: adding "writexl" here before its manifest.json
+  # entry had actually been regenerated/deployed meant Connect Cloud didn't
+  # pre-provide it, so new_pkgs was non-empty for the first time ever in
+  # production -- and Connect Cloud's environment intentionally leaves
+  # options("repos") unset (it doesn't expect content to self-install), so
+  # the bare install.packages() call below threw "attempt to use CRAN
+  # without setting a mirror" and took the ENTIRE app down at startup,
+  # instead of just leaving one optional package missing. Every actual use
+  # of these optional packages (openxlsx/zip/writexl in R/data_download_raw.R)
+  # already checks requireNamespace()/degrades gracefully on its own, so the
+  # right failure mode here is "skip and continue", never "crash the app".
+  tryCatch({
+    repos <- getOption("repos")
+    if (is.null(repos) || !nzchar(repos[["CRAN"]]) || identical(repos[["CRAN"]], "@CRAN@"))
+      options(repos = c(CRAN = "https://cloud.r-project.org"))
+    install.packages(new_pkgs, quiet = TRUE)
+  }, error = function(e) {
+    cat("[SETUP] Could not install missing R package(s) (",
+        paste(new_pkgs, collapse = ", "), "): ", conditionMessage(e),
+        " -- continuing without them; any feature that needs one will ",
+        "fall back or report a clear error only when actually used.\n", sep = "")
+  })
+}
 
 # openxlsx/zip/writexl are deliberately NOT library()'d here -- every call
 # site for all three (R/data_download_raw.R) already uses fully-qualified
