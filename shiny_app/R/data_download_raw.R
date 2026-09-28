@@ -59,6 +59,26 @@ RAW_STATE_FOLDER <- "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/ra
 # scripts/fetch_sharepoint_csvs.py's _EXCEL_ROW_LIMIT are built around.
 RAW_DL_EXCEL_ROW_LIMIT <- 1048575L
 
+# A *practical* ceiling on top of the row limit above, for wide forms.
+# Discovered on form 4498 (629 columns): its 2023 year-partition alone is
+# 252,306 rows -- comfortably under RAW_DL_EXCEL_ROW_LIMIT, so the existing
+# row check never caught it -- but 252,306 x 629 = ~158.7 million cells.
+# That's not just slow to write (regardless of engine -- openxlsx or
+# writexl -- writing that many cells took long enough in production to
+# either disconnect the Shiny session or OOM-kill the whole worker), it
+# also produces a file that's painfully slow, and sometimes simply unable,
+# to open in Excel afterward -- i.e. even a "successful" write here isn't
+# actually a usable deliverable. 5 million cells is a conservative but
+# still generous ceiling: comfortably fast to write and to open, while
+# only kicking in for genuinely extreme row x column combinations like
+# this one. CSV and Parquet have no such practical ceiling and remain
+# available for exactly this case.
+RAW_DL_EXCEL_CELL_LIMIT <- 5000000
+
+.exceeds_excel_cell_limit <- function(df) {
+  (as.numeric(nrow(df)) * as.numeric(ncol(df))) > RAW_DL_EXCEL_CELL_LIMIT
+}
+
 sp_partition_folder <- function(form_id) {
   paste0(RAW_STATE_FOLDER, "/partitions/", form_id)
 }
@@ -245,15 +265,31 @@ build_xlsx_year_partitions_from_df <- function(df, form_id, work_dir,
   years <- substr(as.character(df[["_submission_time"]]), 1, 4)
   years[is.na(years) | !grepl("^[0-9]{4}$", years)] <- "0000"
   xlsx_paths <- character(0)
+  skipped_years <- character(0)
   for (yr in sort(unique(years))) {
     sub_df <- df[years == yr, , drop = FALSE]
+    if (.exceeds_excel_cell_limit(sub_df)) {
+      progress(paste0(
+        form_id, "_", yr, ": ", nrow(sub_df), " rows x ", ncol(sub_df), " cols (",
+        format(nrow(sub_df) * ncol(sub_df), big.mark = ","),
+        " cells) is too large for one Excel sheet -- skipping this year for .xlsx."
+      ))
+      skipped_years <- c(skipped_years, yr)
+      next
+    }
     progress(paste0("Writing ", form_id, "_", yr, ".xlsx (", nrow(sub_df), " rows)..."))
     xlsx_local <- file.path(work_dir, paste0(form_id, "_", yr, ".xlsx"))
     if (.write_xlsx_or_na(sub_df, xlsx_local, progress)) xlsx_paths <- c(xlsx_paths, xlsx_local)
   }
   if (!length(xlsx_paths))
     return(list(ok = FALSE, path = NULL,
-                message = paste0("Could not build any yearly .xlsx for form ", form_id, ".")))
+                message = paste0(
+                  "Could not build any yearly .xlsx for form ", form_id, ".",
+                  if (length(skipped_years))
+                    paste0(" Year(s) ", paste(skipped_years, collapse = ", "),
+                           " were too large for Excel -- try CSV or Parquet instead.")
+                  else ""
+                )))
   zip_path <- .zip_files(xlsx_paths, file.path(work_dir, paste0(form_id, "_xlsx_by_year.zip")), work_dir, progress)
   list(ok = TRUE, path = zip_path, message = NULL)
 }
@@ -264,8 +300,11 @@ build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
     df <- fetch_form_dataframe(token, drive_id, form_id, FALSE, work_dir, progress)
     if (is.null(df))
       return(list(ok = FALSE, path = NULL, message = paste0("Could not read data for form ", form_id, ".")))
-    if (nrow(df) > RAW_DL_EXCEL_ROW_LIMIT) {
-      progress(paste0(nrow(df), " rows exceeds Excel's limit -- splitting by year instead..."))
+    if (nrow(df) > RAW_DL_EXCEL_ROW_LIMIT || .exceeds_excel_cell_limit(df)) {
+      progress(paste0(
+        nrow(df), " rows x ", ncol(df), " cols exceeds Excel's practical limit -- ",
+        "splitting by year instead..."
+      ))
       return(build_xlsx_year_partitions_from_df(df, form_id, work_dir, progress))
     }
     progress(paste0("Writing ", form_id, ".xlsx (", nrow(df), " rows)..."))
@@ -285,6 +324,7 @@ build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
   if (!length(year_files))
     return(list(ok = FALSE, path = NULL, message = paste0("No year partitions found for form ", form_id, ".")))
   xlsx_paths <- character(0)
+  skipped_years <- character(0)
   for (nm in year_files) {
     progress(paste0("Downloading ", nm, "..."))
     local_pq <- file.path(work_dir, nm)
@@ -293,12 +333,43 @@ build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
     df <- tryCatch(as.data.frame(arrow::read_parquet(local_pq)), error = function(e) NULL)
     if (is.null(df)) next
     year <- sub(paste0("^", form_id, "_([0-9]{4})\\.parquet$"), "\\1", nm)
+    # A wide form (many columns) can have a single year-partition that's
+    # comfortably under Excel's ROW limit but still enormous in total cell
+    # count -- discovered on form 4498 (629 cols): its 2023 partition alone
+    # is 252,306 rows x 629 cols = ~158.7 million cells, which took long
+    # enough to write (with either xlsx engine) to disconnect the Shiny
+    # session or OOM-kill the whole worker in production, and would have
+    # produced a file barely usable in Excel even had it finished. Skip
+    # that year's .xlsx rather than hang/crash -- CSV and Parquet (this
+    # same year-partition, just a different format) have no such ceiling.
+    if (.exceeds_excel_cell_limit(df)) {
+      progress(paste0(
+        form_id, "_", year, ": ", nrow(df), " rows x ", ncol(df), " cols (",
+        format(nrow(df) * ncol(df), big.mark = ","),
+        " cells) is too large for one Excel sheet -- skipping this year for .xlsx."
+      ))
+      skipped_years <- c(skipped_years, year)
+      next
+    }
     progress(paste0("Writing ", form_id, "_", year, ".xlsx (", nrow(df), " rows)..."))
     xlsx_local <- file.path(work_dir, paste0(form_id, "_", year, ".xlsx"))
     if (.write_xlsx_or_na(df, xlsx_local, progress)) xlsx_paths <- c(xlsx_paths, xlsx_local)
   }
   if (!length(xlsx_paths))
-    return(list(ok = FALSE, path = NULL, message = paste0("Could not build any yearly .xlsx for form ", form_id, ".")))
+    return(list(ok = FALSE, path = NULL,
+                message = paste0(
+                  "Could not build any yearly .xlsx for form ", form_id, ".",
+                  if (length(skipped_years))
+                    paste0(" Year(s) ", paste(skipped_years, collapse = ", "),
+                           " were too large for Excel -- try CSV or Parquet instead.")
+                  else ""
+                )))
+  if (length(skipped_years))
+    progress(paste0(
+      "Note: year(s) ", paste(skipped_years, collapse = ", "),
+      " were too large for Excel and are not included in this zip -- ",
+      "use CSV or Parquet to get the full data for those years."
+    ))
   zip_path <- .zip_files(xlsx_paths, file.path(work_dir, paste0(form_id, "_xlsx_by_year.zip")), work_dir, progress)
   list(ok = TRUE, path = zip_path, message = NULL)
 }
