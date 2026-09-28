@@ -327,6 +327,48 @@ def upload_file(token, drive_id, local_path, remote_filename, folder_path=None):
 CLEAN_STATE_FOLDER = "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/clean_state"
 CLEAN_STATE_FILE = "Regional_IM_repository_cleaned.csv"
 
+# QC.csv and METADATA.xlsx are Build Repository (Step 2) outputs, written by
+# regional_im_repository_builder.R into data/final alongside the raw
+# repository file -- run_workflow.R's sp_backup_build_output() now backs
+# both up to this same build_state folder (right after a successful Build
+# Repository run), mirroring the raw parquet backup it already did.
+BUILD_STATE_FOLDER = "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/build_state"
+BUILD_STATE_QC_FILE = "Regional_IM_repository_QC.csv"
+BUILD_STATE_METADATA_FILE = "Regional_IM_repository_METADATA.xlsx"
+
+def recover_build_files_if_missing(token, drive_id):
+    """Downloads Regional_IM_repository_QC.csv and
+    Regional_IM_repository_METADATA.xlsx from SharePoint's build_state
+    folder into data/final/ if either isn't already there locally.
+
+    Both are marked "required" in FILE_MAPPINGS below, but on a fresh
+    Posit Connect Cloud container where the Shiny dashboard's "Upload
+    SharePoint" button is clicked on its own -- one where Build Repository
+    never ran in this same session -- neither file exists yet and there
+    was previously no way to recover them, so the upload step always
+    reported "[FAIL] REQUIRED file missing" for both even when the main
+    cleaned CSV uploaded fine. Soft-fails throughout, same as
+    recover_clean_output_if_missing() below: a miss here just means the
+    upload proceeds and reports the same failure as before this existed.
+    """
+    for fname in (BUILD_STATE_QC_FILE, BUILD_STATE_METADATA_FILE):
+        local_path = os.path.join(FINAL_DIR, fname)
+        if os.path.exists(local_path):
+            continue
+        try:
+            remote_path = f"{BUILD_STATE_FOLDER}/{fname}"
+            url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{remote_path}:/content"
+            response = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=180)
+            if response.status_code != 200:
+                continue
+            os.makedirs(FINAL_DIR, exist_ok=True)
+            with open(local_path, "wb") as f:
+                f.write(response.content)
+            print(f"  Recovered {fname} from SharePoint (no local Build Repository output existed yet).")
+        except requests.exceptions.RequestException:
+            continue
+
+
 def recover_clean_output_if_missing(token, drive_id):
     """Downloads Regional_IM_repository_cleaned.csv from SharePoint's
     clean_state folder into data/final/ if it isn't already there locally.
@@ -393,6 +435,7 @@ def upload_to_sharepoint():
     # usable already exists locally -- see recover_clean_output_if_missing()'s
     # own docstring above.
     recover_clean_output_if_missing(token, drive_id)
+    recover_build_files_if_missing(token, drive_id)
 
     # Create target folder(s) if they don't exist
     print("\n[3/5] Ensuring target folder exists...")

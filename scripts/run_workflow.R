@@ -595,11 +595,28 @@ sp_ensure_folder <- function(token, drive_id, folder_path) {
 
 SP_BUILD_STATE_FOLDER <- "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/build_state"
 SP_BUILD_STATE_FILE <- "Regional_IM_repository.parquet"
+# QC.csv and METADATA.xlsx are ALSO Build Repository (Step 2) outputs --
+# regional_im_repository_builder.R writes both straight into data/final
+# alongside the raw repository file. They weren't backed up here
+# originally (only the raw parquet was, since that's all Clean Geonames
+# needs to run standalone -- see sp_recover_build_output() below), but
+# upload_to_sharepoint.py's FILE_MAPPINGS marks both "required": on a
+# fresh Posit Connect Cloud container where "Upload SharePoint" is run on
+# its own (never through this launcher, so it can't rely on anything
+# local Build Repository just produced), there was no way to recover
+# them, and the whole upload step failed even though the important file
+# (the cleaned repository CSV) uploaded fine. Backing them up here too
+# closes that gap -- see recover_build_files_if_missing() in
+# upload_to_sharepoint.py for the matching recovery side.
+SP_BUILD_STATE_QC_FILE       <- "Regional_IM_repository_QC.csv"
+SP_BUILD_STATE_METADATA_FILE <- "Regional_IM_repository_METADATA.xlsx"
 
 sp_backup_build_output <- function(final_dir) {
-  local_path <- file.path(final_dir, SP_BUILD_STATE_FILE)
-  if (!file.exists(local_path)) return(invisible(NULL))
   if (!requireNamespace("httr2", quietly = TRUE)) return(invisible(NULL))
+
+  files_to_backup <- c(SP_BUILD_STATE_FILE, SP_BUILD_STATE_QC_FILE, SP_BUILD_STATE_METADATA_FILE)
+  files_to_backup <- files_to_backup[file.exists(file.path(final_dir, files_to_backup))]
+  if (!length(files_to_backup)) return(invisible(NULL))
 
   token <- sp_get_graph_token()
   if (is.null(token)) return(invisible(NULL))
@@ -613,23 +630,26 @@ sp_backup_build_output <- function(final_dir) {
     return(invisible(NULL))
   }
 
-  remote_path <- paste0(SP_BUILD_STATE_FOLDER, "/", SP_BUILD_STATE_FILE)
-  content_url <- sprintf(
-    "https://graph.microsoft.com/v1.0/drives/%s/root:/%s:/content",
-    drive_id, utils::URLencode(remote_path)
-  )
+  for (fname in files_to_backup) {
+    local_path <- file.path(final_dir, fname)
+    remote_path <- paste0(SP_BUILD_STATE_FOLDER, "/", fname)
+    content_url <- sprintf(
+      "https://graph.microsoft.com/v1.0/drives/%s/root:/%s:/content",
+      drive_id, utils::URLencode(remote_path)
+    )
 
-  tryCatch({
-    httr2::request(content_url) |>
-      httr2::req_auth_bearer_token(token) |>
-      httr2::req_method("PUT") |>
-      httr2::req_headers("Content-Type" = "application/octet-stream") |>
-      httr2::req_body_file(local_path) |>
-      httr2::req_perform()
-    log_info("Backed up {SP_BUILD_STATE_FILE} to SharePoint build_state (for standalone Clean Geonames runs).")
-  }, error = function(e) {
-    log_warn("Could not back up {SP_BUILD_STATE_FILE} to SharePoint: {e$message}")
-  })
+    tryCatch({
+      httr2::request(content_url) |>
+        httr2::req_auth_bearer_token(token) |>
+        httr2::req_method("PUT") |>
+        httr2::req_headers("Content-Type" = "application/octet-stream") |>
+        httr2::req_body_file(local_path) |>
+        httr2::req_perform()
+      log_info("Backed up {fname} to SharePoint build_state (for standalone Clean Geonames/Upload runs).")
+    }, error = function(e) {
+      log_warn("Could not back up {fname} to SharePoint: {e$message}")
+    })
+  }
 
   invisible(NULL)
 }
