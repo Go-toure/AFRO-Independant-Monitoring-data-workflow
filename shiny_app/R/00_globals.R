@@ -16,7 +16,7 @@
 
 pkgs_needed <- c("shiny","bslib","bsicons","DT","plotly","dplyr",
                  "readr","lubridate","arrow","shinyjs","scales","processx",
-                 "ellmer","shinychat","openxlsx","zip")
+                 "ellmer","shinychat","openxlsx","zip","writexl")
 new_pkgs <- pkgs_needed[!pkgs_needed %in% rownames(installed.packages())]
 if (length(new_pkgs) > 0) install.packages(new_pkgs, quiet = TRUE)
 
@@ -26,7 +26,7 @@ suppressPackageStartupMessages({
   library(readr);    library(lubridate); library(arrow)
   library(shinyjs);  library(scales)
   library(ellmer);   library(shinychat)
-  library(openxlsx); library(zip)
+  library(openxlsx); library(zip); library(writexl)
 })
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────

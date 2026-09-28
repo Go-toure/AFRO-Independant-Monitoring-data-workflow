@@ -195,7 +195,34 @@ build_csv_download <- function(token, drive_id, form_id, heavy, work_dir,
   list(ok = TRUE, path = zip_path, message = NULL)
 }
 
-.write_xlsx_or_na <- function(df, path) {
+# openxlsx builds the whole worksheet as an in-memory R structure before
+# writing it out, which is both slow and memory-heavy for a wide,
+# many-row sheet -- form 4498 in particular (629 columns) is exactly the
+# form that needed this same kind of engine swap on the Python side of
+# this project (scripts/fetch_sharepoint_csvs.py's _write_xlsx_year_partitions(),
+# benchmarked there at openpyxl's ~212 rows/sec vs. xlsxwriter's ~344
+# rows/sec). A single write.xlsx() call blocking for minutes on one of
+# form 4498's larger year partitions (a quarter-million rows is well
+# under Excel's row limit, but still slow to WRITE at that width) doesn't
+# just look slow here -- since it's happening inside a downloadHandler's
+# content(), which runs as one long synchronous call, R can't process
+# anything else meanwhile either, including the websocket heartbeat that
+# keeps the browser convinced the Shiny session is still alive. Long
+# enough, and the browser disconnects mid-download with no real error at
+# all, exactly the "eternity" symptom that write got fixed for already.
+# `writexl` wraps the same fast C library (libxlsxwriter) the Python side
+# now uses, so it gets the same speed-up here -- falling back to openxlsx
+# only if writexl isn't installed or itself fails for some reason.
+.write_xlsx_or_na <- function(df, path, progress = function(detail) invisible(NULL)) {
+  if (requireNamespace("writexl", quietly = TRUE)) {
+    ok <- tryCatch({ writexl::write_xlsx(df, path); TRUE },
+                   error = function(e) {
+                     message("[download] writexl xlsx write failed for ", path, ": ", conditionMessage(e))
+                     FALSE
+                   })
+    if (ok) return(TRUE)
+    progress("writexl failed -- falling back to the slower openxlsx engine...")
+  }
   tryCatch({ openxlsx::write.xlsx(df, path, overwrite = TRUE); TRUE },
            error = function(e) {
              message("[download] xlsx write failed for ", path, ": ", conditionMessage(e))
@@ -222,7 +249,7 @@ build_xlsx_year_partitions_from_df <- function(df, form_id, work_dir,
     sub_df <- df[years == yr, , drop = FALSE]
     progress(paste0("Writing ", form_id, "_", yr, ".xlsx (", nrow(sub_df), " rows)..."))
     xlsx_local <- file.path(work_dir, paste0(form_id, "_", yr, ".xlsx"))
-    if (.write_xlsx_or_na(sub_df, xlsx_local)) xlsx_paths <- c(xlsx_paths, xlsx_local)
+    if (.write_xlsx_or_na(sub_df, xlsx_local, progress)) xlsx_paths <- c(xlsx_paths, xlsx_local)
   }
   if (!length(xlsx_paths))
     return(list(ok = FALSE, path = NULL,
@@ -243,7 +270,7 @@ build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
     }
     progress(paste0("Writing ", form_id, ".xlsx (", nrow(df), " rows)..."))
     local <- file.path(work_dir, paste0(form_id, ".xlsx"))
-    if (!.write_xlsx_or_na(df, local))
+    if (!.write_xlsx_or_na(df, local, progress))
       return(list(ok = FALSE, path = NULL, message = paste0("Could not write ", form_id, ".xlsx.")))
     return(list(ok = TRUE, path = local, message = NULL))
   }
@@ -268,7 +295,7 @@ build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
     year <- sub(paste0("^", form_id, "_([0-9]{4})\\.parquet$"), "\\1", nm)
     progress(paste0("Writing ", form_id, "_", year, ".xlsx (", nrow(df), " rows)..."))
     xlsx_local <- file.path(work_dir, paste0(form_id, "_", year, ".xlsx"))
-    if (.write_xlsx_or_na(df, xlsx_local)) xlsx_paths <- c(xlsx_paths, xlsx_local)
+    if (.write_xlsx_or_na(df, xlsx_local, progress)) xlsx_paths <- c(xlsx_paths, xlsx_local)
   }
   if (!length(xlsx_paths))
     return(list(ok = FALSE, path = NULL, message = paste0("Could not build any yearly .xlsx for form ", form_id, ".")))
