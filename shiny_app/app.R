@@ -435,26 +435,6 @@ ui <- page_navbar(
     ),
 
     card(
-      card_header(hdr_icon("cloud-arrow-up-fill", "SharePoint Upload (manual/ad hoc)")),
-      card_body(
-        div(class="info-banner mb-3",
-          tags$b("Target:"), tags$code("7. SIA_Data / Data Repository"),
-          " — use this for a quick test/check, or a one-off push outside the full pipeline run above."),
-        layout_columns(
-          col_widths=c(6,6), gap="10px",
-          selectInput("sp_scope","Scope",
-                      c("Upload all files"  = "--all",
-                        "Test connection"   = "--test",
-                        "Check local files" = "--check")),
-          div(style="padding-top:24px;",
-            actionButton("btn_push_sp", hdr_icon("cloud-arrow-up-fill", "Push to SharePoint"),
-                         class="btn-warning w-100"))
-        ),
-        uiOutput("sp_badge_ui")
-      )
-    ),
-
-    card(
       card_header(hdr_icon("cloud-download-fill", "Download Raw Form Data")),
       card_body(
         div(class="info-banner mb-3",
@@ -2948,64 +2928,6 @@ server <- function(input, output, session) {
         s$label)
     })
     div(class="d-flex flex-wrap gap-2 p-1", pills)
-  })
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # SHAREPOINT MANUAL PUSH (relocated from the removed Reports tab; the
-  # queued "4. Upload SharePoint" pipeline step above is the full-pipeline
-  # version of this same upload -- this one is for a quick ad hoc
-  # test/check/push outside a full run, writing into the same Pipeline log.)
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  rv_sp_stat  <- reactiveVal(NULL)
-  rv_sp_scope <- reactiveVal(NULL)
-
-  observeEvent(input$btn_push_sp, {
-    rv_log(paste0(rv_log(), "\n[SharePoint] Pushing...\n"))
-    rv_sp_stat(NULL)
-    scope <- if (!is.null(input$sp_scope)) input$sp_scope else "--check"
-    rv_sp_scope(scope)
-    py <- file.path(WORKFLOW_DIR, "scripts", "upload_to_sharepoint.py")
-    if (!file.exists(py)) {
-      rv_log(paste0(rv_log(), "[ERROR] upload_to_sharepoint.py not found."))
-      rv_sp_stat("error"); return()
-    }
-    tryCatch({
-      # "python" here, not "python3" -- matches the one invocation already
-      # proven to work everywhere else in this project (run_workflow.R's
-      # fetch step, the lookup refresh script); "python3" isn't guaranteed
-      # to resolve in the plain Windows PATH a Shiny/RStudio R session sees,
-      # even when it works fine from a Git Bash prompt.
-      out    <- system2("python", args=c(shQuote(py), scope),
-                        stdout=TRUE, stderr=TRUE)
-      # system2() with stdout=TRUE only throws an R error if the process
-      # can't be launched at all (e.g. "python" missing from PATH) -- a
-      # script that runs to completion but reports failure just returns
-      # normally, so the actual outcome has to be read from the exit
-      # status and from the script's own [FAIL] markers.
-      status <- attr(out, "status")
-      if (is.null(status)) status <- 0L
-      failed <- status != 0L || any(grepl("\\[FAIL\\]", out))
-      rv_log(paste0(rv_log(), paste(out, collapse="\n")))
-      rv_sp_stat(if (failed) "error" else "ok")
-    }, error=function(e) {
-      rv_log(paste0(rv_log(), "[ERROR] ", e$message)); rv_sp_stat("error")
-    })
-  })
-
-  output$sp_badge_ui <- renderUI({
-    st <- rv_sp_stat(); if (is.null(st)) return(NULL)
-    scope <- rv_sp_scope()
-    ok_label <- switch(scope,
-      "--test"  = "Connection OK",
-      "--check" = "Local files check complete",
-      "Upload complete")
-    if (st == "ok")
-      div(class="alert alert-success p-2 mt-2 small",
-          tags$span(class="dot dot-ok"), ok_label)
-    else
-      div(class="alert alert-danger p-2 mt-2 small",
-          tags$span(class="dot dot-err"), "Error — check log")
   })
 
   # ═══════════════════════════════════════════════════════════════════════════
