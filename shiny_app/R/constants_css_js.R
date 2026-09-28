@@ -154,6 +154,29 @@ table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-alig
 }
 .form-select:focus,.form-control:focus{border-color:var(--blue)!important;box-shadow:0 0 0 3px rgba(0,92,151,.13)!important;}
 
+/* ─ Selectize (shiny's selectInput/selectizeInput widget) ─
+   selectize.js sets its own inline width on .selectize-control the first
+   time it initializes, computed from the container's rendered width at
+   that moment. A selectInput placed inside a nav_panel/card that is NOT
+   the active tab on page load (e.g. the Pipeline tab, which sits behind
+   Overview) is still display:none at that point, so selectize measures a
+   0/stale width and locks it in -- unlike a plain <select>, it never
+   recomputes on its own once the tab becomes visible, so two such widgets
+   side by side (as in the 'Download Raw Form Data' card's Form ID /
+   Format row) can end up overlapping instead of filling their own grid
+   column. Forcing width via CSS !important overrides whatever inline
+   width selectize computed, so this can't happen regardless of which tab
+   was active when the widget first initialized. (Same family of bug as
+   the plotly-resize-on-tab-change fix below, just needing a CSS fix here
+   since selectize doesn't recompute on a window resize event either.)   */
+.selectize-control{width:100%!important; box-sizing:border-box!important;}
+.selectize-control.single .selectize-input{
+  width:100%!important; box-sizing:border-box!important;
+  border-radius:10px!important; border:1.5px solid rgba(0,92,151,.18)!important;
+  font-size:.85rem!important; color:var(--dark)!important;
+}
+.selectize-dropdown{width:100%!important; box-sizing:border-box!important;}
+
 /* ─ Badges ───────────────────────────────────────────── */
 .badge{border-radius:8px!important;font-weight:700!important;letter-spacing:.03em!important;}
 
