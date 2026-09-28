@@ -163,9 +163,48 @@ fetch_form_dataframe <- function(token, drive_id, form_id, heavy, work_dir,
   dplyr::bind_rows(frames)
 }
 
+# A single file above this is skipped from the zip entirely rather than
+# attempted -- see the compression_level comment below for why bundling it
+# is the actual risk, not just writing it.
+RAW_DL_ZIP_FILE_SIZE_LIMIT <- 150 * 1024 * 1024  # 150 MB
+
 .zip_files <- function(paths, zip_path, work_dir, progress = function(detail) invisible(NULL)) {
+  # Found on form 4498's CSV path: its 2023 year-partition (629 cols x
+  # 252,306 rows) is well over a GB as plain-text CSV, and zip::zip()'s
+  # default compression_level (9 -- maximum DEFLATE) is CPU-heavy in a way
+  # that scales badly with input size. That single call ran long enough to
+  # disconnect the Shiny session / OOM-kill the worker -- the exact same
+  # failure mode already fixed on the xlsx-writing side, just one step
+  # later in the pipeline (zip-building instead of xlsx-writing). Two
+  # mitigations, same spirit as the xlsx cell-count fix: (1) use a fast
+  # compression level always, since level 9's CPU cost is what actually
+  # hurts for large inputs, not compression itself; (2) as a hard backstop,
+  # skip any single file over RAW_DL_ZIP_FILE_SIZE_LIMIT from the archive
+  # rather than let a version of this problem happen again for an even
+  # larger form/year in the future -- callers must handle a NULL return
+  # (nothing left worth zipping) instead of assuming a path always comes
+  # back.
+  sizes <- suppressWarnings(file.size(paths))
+  sizes[is.na(sizes)] <- 0
+  too_big <- sizes > RAW_DL_ZIP_FILE_SIZE_LIMIT
+  if (any(too_big)) {
+    for (i in which(too_big)) {
+      progress(paste0(
+        basename(paths[i]), " is ", round(sizes[i] / 1024 / 1024), " MB -- ",
+        "too large to bundle into this zip, skipping it."
+      ))
+    }
+    paths <- paths[!too_big]
+  }
+  if (!length(paths)) {
+    progress("Nothing left to zip after skipping oversized file(s).")
+    return(NULL)
+  }
   progress(paste0("Building zip archive (", length(paths), " file(s))..."))
-  zip::zip(zip_path, files = basename(paths), root = work_dir)
+  tryCatch(
+    zip::zip(zip_path, files = basename(paths), root = work_dir, compression_level = 1),
+    error = function(e) zip::zip(zip_path, files = basename(paths), root = work_dir)
+  )
   zip_path
 }
 
@@ -212,6 +251,10 @@ build_csv_download <- function(token, drive_id, form_id, heavy, work_dir,
     return(list(ok = FALSE, path = NULL,
                 message = paste0("Failed to download any year-partitioned CSV for form ", form_id, ".")))
   zip_path <- .zip_files(paths, file.path(work_dir, paste0(form_id, "_csv_by_year.zip")), work_dir, progress)
+  if (is.null(zip_path))
+    return(list(ok = FALSE, path = NULL,
+                message = paste0("Every year-partitioned CSV for form ", form_id,
+                                  " was too large to bundle into a zip.")))
   list(ok = TRUE, path = zip_path, message = NULL)
 }
 
@@ -291,6 +334,10 @@ build_xlsx_year_partitions_from_df <- function(df, form_id, work_dir,
                   else ""
                 )))
   zip_path <- .zip_files(xlsx_paths, file.path(work_dir, paste0(form_id, "_xlsx_by_year.zip")), work_dir, progress)
+  if (is.null(zip_path))
+    return(list(ok = FALSE, path = NULL,
+                message = paste0("Every yearly .xlsx for form ", form_id,
+                                  " was too large to bundle into a zip.")))
   list(ok = TRUE, path = zip_path, message = NULL)
 }
 
@@ -371,6 +418,10 @@ build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
       "use CSV or Parquet to get the full data for those years."
     ))
   zip_path <- .zip_files(xlsx_paths, file.path(work_dir, paste0(form_id, "_xlsx_by_year.zip")), work_dir, progress)
+  if (is.null(zip_path))
+    return(list(ok = FALSE, path = NULL,
+                message = paste0("Every yearly .xlsx for form ", form_id,
+                                  " was too large to bundle into a zip.")))
   list(ok = TRUE, path = zip_path, message = NULL)
 }
 
