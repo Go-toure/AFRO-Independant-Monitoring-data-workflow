@@ -20,13 +20,22 @@ pkgs_needed <- c("shiny","bslib","bsicons","DT","plotly","dplyr",
 new_pkgs <- pkgs_needed[!pkgs_needed %in% rownames(installed.packages())]
 if (length(new_pkgs) > 0) install.packages(new_pkgs, quiet = TRUE)
 
+# openxlsx/zip/writexl are deliberately NOT library()'d here -- every call
+# site for all three (R/data_download_raw.R) already uses fully-qualified
+# `pkg::fun()` syntax, which loads a package's namespace on demand without
+# attaching it, so skipping library() for them costs nothing functionally.
+# What it buys: these three packages' namespaces (and openxlsx's fairly
+# heavy dependency chain) no longer get loaded into every single worker's
+# memory at Shiny startup -- only the (rare) session that actually clicks
+# "Download Raw Form Data" as .xlsx pays that memory cost, lazily, instead
+# of every session paying it unconditionally. Still listed in pkgs_needed
+# above so install.packages() keeps ensuring they're present on disk.
 suppressPackageStartupMessages({
   library(shiny);    library(bslib);     library(bsicons)
   library(DT);       library(plotly);    library(dplyr)
   library(readr);    library(lubridate); library(arrow)
   library(shinyjs);  library(scales)
   library(ellmer);   library(shinychat)
-  library(openxlsx); library(zip); library(writexl)
 })
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
