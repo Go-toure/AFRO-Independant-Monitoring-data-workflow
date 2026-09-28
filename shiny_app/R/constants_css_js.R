@@ -200,7 +200,7 @@ table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-alig
 }
 
 /* ─ Log viewer ───────────────────────────────────────── */
-#log_pre,#rpt_console{
+#log_pre,#rpt_console,#dl_raw_log_pre{
   background:#0D1117!important; color:#C9D1D9!important;
   border:1px solid rgba(201,209,217,.15)!important; border-radius:12px!important;
   font-family:'JetBrains Mono','Fira Code','Courier New',monospace!important;
@@ -574,6 +574,38 @@ function registerCountUpHandler() {
 }
 registerCountUpHandler();
 
+// ── Download Raw Form Data: live log console ──────────────────────────────
+// shiny::withProgress()/incProgress() already gives the download button its
+// progress bar, but only ever shows ONE line (the latest 'detail') -- these
+// two custom messages drive a small scrolling <pre> log underneath it too,
+// exactly like the Pipeline tab's own #log_pre, so a slow heavy-form
+// download (several SharePoint round-trips plus zipping, per the timing
+// lessons learned from scripts/fetch_sharepoint_csvs.py earlier in this
+// project) shows every step as it happens instead of just sitting there.
+// Uses sendCustomMessage rather than a plain reactive output because a
+// downloadHandler's content() runs as one long synchronous call -- ordinary
+// reactive outputs only reach the browser on the NEXT flush, i.e. after
+// content() already returned, but custom messages are pushed to the
+// browser immediately, the same trick countUp's own delayed animation
+// messages above rely on.
+function registerDlRawLogHandlers() {
+  if (window.Shiny && typeof Shiny.addCustomMessageHandler === 'function') {
+    Shiny.addCustomMessageHandler('dlRawLogClear', function(d) {
+      var pre = document.getElementById('dl_raw_log_pre');
+      if (pre) pre.textContent = '';
+    });
+    Shiny.addCustomMessageHandler('dlRawLogLine', function(d) {
+      var pre = document.getElementById('dl_raw_log_pre');
+      if (!pre) return;
+      pre.textContent += (pre.textContent ? '\\n' : '') + d.text;
+      pre.scrollTop = pre.scrollHeight;
+    });
+  } else {
+    setTimeout(registerDlRawLogHandlers, 30);
+  }
+}
+registerDlRawLogHandlers();
+
 // ── Lightweight toast (never fails silently — always shows something) ────
 function showToast(msg, isError) {
   var t = document.createElement('div');
@@ -651,7 +683,7 @@ function captureExecKPI() {
 
 // Auto-scroll logs
 setInterval(function(){
-  ['log_pre','rpt_console'].forEach(function(id){
+  ['log_pre','rpt_console','dl_raw_log_pre'].forEach(function(id){
     var el=document.getElementById(id); if(el) el.scrollTop=el.scrollHeight;
   });
 }, 3500);

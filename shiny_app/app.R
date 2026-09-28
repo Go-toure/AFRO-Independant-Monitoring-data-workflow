@@ -458,7 +458,18 @@ ui <- page_navbar(
         ),
         div(class="d-grid",
           downloadButton("dl_raw_form", hdr_icon("download", "Download"), class="btn-outline-primary")),
-        uiOutput("dl_raw_status")
+        uiOutput("dl_raw_status"),
+        # Live step-by-step log for the download build (auth, resolve
+        # library, per-file download/zip, ...) -- filled via the
+        # dlRawLogLine/dlRawLogClear custom messages (R/constants_css_js.R)
+        # from inside the downloadHandler below, the same "push straight to
+        # the browser, don't wait for a reactive flush" trick countUp()
+        # already relies on, since content() runs as one long synchronous
+        # call. Styled like the Pipeline tab's own #log_pre, just shorter.
+        tags$pre(
+          id = "dl_raw_log_pre",
+          style = "height:110px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;margin-top:10px;"
+        )
       )
     )
   )
@@ -2979,7 +2990,29 @@ server <- function(input, output, session) {
       fmt     <- input$dl_raw_format
       req(form_id, fmt)
       rv_dl_raw_msg(NULL)
-      res <- build_form_download(form_id, fmt)
+
+      # A heavy-form download can mean several sequential SharePoint
+      # round-trips (one per year partition) plus a zip step -- with
+      # nothing shown while that runs, it looks exactly like the
+      # year-partitioned xlsx export "taking eternity" with zero progress
+      # output earlier in this project (see scripts/fetch_sharepoint_csvs.py's
+      # own history). withProgress()/incProgress() drive Shiny's built-in
+      # progress bar, and every incProgress() call also pushes a line to
+      # the #dl_raw_log_pre console below the button via the dlRawLogLine
+      # custom message (R/constants_css_js.R) -- sendCustomMessage reaches
+      # the browser immediately, unlike a plain reactive output, which
+      # would only flush once this whole content() call returns.
+      session$sendCustomMessage("dlRawLogClear", list())
+      withProgress(message = paste0("Building ", form_id, ".", fmt, " download..."), value = 0, {
+        progress_cb <- function(detail) {
+          incProgress(amount = 1 / 12, detail = detail)
+          session$sendCustomMessage("dlRawLogLine", list(
+            text = paste0("[", format(Sys.time(), "%H:%M:%S"), "] ", detail)
+          ))
+        }
+        res <- build_form_download(form_id, fmt, progress = progress_cb)
+      })
+
       if (!isTRUE(res$ok)) {
         rv_dl_raw_msg(res$message)
         showNotification(paste("Download failed:", res$message), type = "error", duration = 10)
