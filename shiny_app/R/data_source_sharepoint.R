@@ -59,6 +59,62 @@ sp_resolve_drive_id <- function(token) {
   match[[1]]$id
 }
 
+# ============================================================
+# GENERIC GRAPH LIST/DOWNLOAD (raw_state form-data downloads)
+# ============================================================
+# The two functions above (sp_get_graph_token / sp_resolve_drive_id) plus
+# these two give this app the same generic list/download building blocks
+# scripts/_sharepoint_client.py already provides on the Python side --
+# used by R/data_download_raw.R's "Download Raw Form Data" feature so it
+# never needs to shell out to Python just to read a folder or pull a file.
+# Same never-raise-to-the-caller contract as their Python counterparts:
+# list returns an empty list and download returns FALSE on any failure
+# (missing item, bad credentials, network error, ...), never an R error.
+
+# Every item (files + subfolders) directly inside folder_path. Empty list
+# if the folder doesn't exist, is empty, or on any error.
+sp_list_folder <- function(token, drive_id, folder_path) {
+  tryCatch({
+    url <- sprintf(
+      "https://graph.microsoft.com/v1.0/drives/%s/root:/%s:/children",
+      drive_id, utils::URLencode(folder_path)
+    )
+    items <- list()
+    repeat {
+      resp <- httr2::request(url) |>
+        httr2::req_auth_bearer_token(token) |>
+        httr2::req_perform()
+      body  <- httr2::resp_body_json(resp)
+      items <- c(items, body$value)
+      next_link <- body[["@odata.nextLink"]]
+      if (is.null(next_link)) break
+      url <- next_link
+    }
+    items
+  }, error = function(e) list())
+}
+
+# Downloads one file by its path (relative to the library root) to
+# local_path. Returns FALSE on any failure, including the file not
+# existing remotely.
+sp_download_file <- function(token, drive_id, remote_path, local_path) {
+  tryCatch({
+    url <- sprintf(
+      "https://graph.microsoft.com/v1.0/drives/%s/root:/%s:/content",
+      drive_id, utils::URLencode(remote_path)
+    )
+    resp <- httr2::request(url) |>
+      httr2::req_auth_bearer_token(token) |>
+      httr2::req_perform()
+    dir.create(dirname(local_path), recursive = TRUE, showWarnings = FALSE)
+    writeBin(httr2::resp_body_raw(resp), local_path)
+    TRUE
+  }, error = function(e) {
+    message("[sharepoint] download failed for ", remote_path, ": ", conditionMessage(e))
+    FALSE
+  })
+}
+
 # Downloads AFRO_Inside_HH_M.csv from SharePoint into `dest_path` (CLEANED_CSV
 # by default). Never throws -- returns TRUE/FALSE so load_im_data() can just
 # fall through to "no data" if this fails, same as a missing local file today.

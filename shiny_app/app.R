@@ -452,6 +452,25 @@ ui <- page_navbar(
         ),
         uiOutput("sp_badge_ui")
       )
+    ),
+
+    card(
+      card_header(hdr_icon("cloud-download-fill", "Download Raw Form Data")),
+      card_body(
+        div(class="info-banner mb-3",
+          tags$b("Source:"), tags$code("raw_state"),
+          " — pulls a form's raw data directly from SharePoint. Forms too large for one Excel sheet are automatically split into one file per year (zipped)."),
+        layout_columns(
+          col_widths = c(6, 6), gap = "10px",
+          selectInput("dl_raw_form_id", "Form ID", choices = NULL),
+          selectInput("dl_raw_format", "Format",
+                      c("CSV" = "csv", "Excel (.xlsx)" = "xlsx",
+                        "R data (.rds)" = "rds", "Parquet" = "parquet"))
+        ),
+        div(class="d-grid",
+          downloadButton("dl_raw_form", hdr_icon("download", "Download"), class="btn-outline-primary")),
+        uiOutput("dl_raw_status")
+      )
     )
   )
 )
@@ -2987,6 +3006,67 @@ server <- function(input, output, session) {
     else
       div(class="alert alert-danger p-2 mt-2 small",
           tags$span(class="dot dot-err"), "Error — check log")
+  })
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # DOWNLOAD RAW FORM DATA (Pipeline tab)
+  # ── R/data_download_raw.R holds all the actual SharePoint list/download/
+  # partition/zip logic (build_form_download()); this block only wires the
+  # "Form ID" dropdown and the downloadHandler to it. Populated independently
+  # of the "Load on startup" observe() above (which req()s the main cleaned
+  # dataset) so the dropdown still fills in even before/without that dataset,
+  # since raw_state forms are a separate SharePoint listing entirely.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  rv_dl_raw_msg <- reactiveVal(NULL)
+
+  observe({
+    ids <- tryCatch(list_available_form_ids(), error = function(e) character(0))
+    if (length(ids)) updateSelectInput(session, "dl_raw_form_id", choices = ids)
+  })
+
+  output$dl_raw_form <- downloadHandler(
+    filename = function() {
+      form_id <- input$dl_raw_form_id
+      fmt     <- input$dl_raw_format
+      ext     <- switch(fmt, parquet = "parquet", xlsx = "xlsx", rds = "rds", "csv")
+      req(form_id, fmt)
+      multi <- tryCatch({
+        if (!sharepoint_credentials_available()) {
+          FALSE
+        } else {
+          token    <- sp_get_graph_token()
+          drive_id <- sp_resolve_drive_id(token)
+          heavy    <- form_is_partitioned(token, drive_id, form_id)
+          heavy && fmt %in% c("csv", "xlsx")
+        }
+      }, error = function(e) FALSE)
+      if (isTRUE(multi)) paste0(form_id, "_", fmt, "_by_year.zip") else paste0(form_id, ".", ext)
+    },
+    content = function(file) {
+      form_id <- input$dl_raw_form_id
+      fmt     <- input$dl_raw_format
+      req(form_id, fmt)
+      rv_dl_raw_msg(NULL)
+      res <- build_form_download(form_id, fmt)
+      if (!isTRUE(res$ok)) {
+        rv_dl_raw_msg(res$message)
+        showNotification(paste("Download failed:", res$message), type = "error", duration = 10)
+        # downloadHandler must still produce a file even on failure -- an
+        # empty one signals "nothing here" rather than silently truncating
+        # whatever previous content the browser had, or crashing the handler.
+        writeLines(character(0), file)
+        return(invisible())
+      }
+      rv_dl_raw_msg(NULL)
+      file.copy(res$path, file, overwrite = TRUE)
+    }
+  )
+
+  output$dl_raw_status <- renderUI({
+    msg <- rv_dl_raw_msg(); if (is.null(msg)) return(NULL)
+    div(class="alert alert-danger p-2 mt-2 small",
+        tags$span(class="dot dot-err"), msg)
   })
 } # end server
 shinyApp(ui, server)
