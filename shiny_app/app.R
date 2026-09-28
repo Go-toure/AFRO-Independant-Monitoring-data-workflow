@@ -440,12 +440,21 @@ ui <- page_navbar(
         div(class="info-banner mb-3",
           tags$b("Source:"), tags$code("raw_state"),
           " — pulls a form's raw data directly from SharePoint. Forms too large for one Excel sheet are automatically split into one file per year (zipped)."),
-        layout_columns(
-          col_widths = c(6, 6), gap = "10px",
-          selectInput("dl_raw_form_id", "Form ID", choices = NULL),
-          selectInput("dl_raw_format", "Format",
-                      c("CSV" = "csv", "Excel (.xlsx)" = "xlsx",
-                        "R data (.rds)" = "rds", "Parquet" = "parquet"))
+        # Plain Bootstrap row/col (flexbox), not bslib's layout_columns()
+        # (CSS Grid) -- two selectize widgets side by side inside a
+        # layout_columns() grid cell were overlapping/overflowing their
+        # column (a known bslib-grid + selectize interaction issue,
+        # especially on a tab that isn't the one active at page load).
+        # A plain .row/.col-* pair is the same layout every other
+        # side-by-side filter row in this app already uses successfully.
+        div(class="row gx-3 gy-2 mb-3",
+          div(class="col-12 col-md-6",
+            selectInput("dl_raw_form_id", "Form ID", choices = NULL, width = "100%")),
+          div(class="col-12 col-md-6",
+            selectInput("dl_raw_format", "Format",
+                        c("CSV" = "csv", "Excel (.xlsx)" = "xlsx",
+                          "R data (.rds)" = "rds", "Parquet" = "parquet"),
+                        width = "100%"))
         ),
         div(class="d-grid",
           downloadButton("dl_raw_form", hdr_icon("download", "Download"), class="btn-outline-primary")),
