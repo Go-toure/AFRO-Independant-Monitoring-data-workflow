@@ -191,27 +191,34 @@ fetch_form_dataframe <- function(token, drive_id, form_id, heavy, work_dir,
   dplyr::bind_rows(frames)
 }
 
-# A single file above this is skipped from the zip entirely rather than
-# attempted -- see the compression_level comment below for why bundling it
-# is the actual risk, not just writing it.
-RAW_DL_ZIP_FILE_SIZE_LIMIT <- 150 * 1024 * 1024  # 150 MB
+# A genuine last-resort backstop only -- NOT a routine limit. A form like
+# 4498 legitimately has multiple-hundred-MB to low-GB CSVs per year, and
+# excluding those from the zip defeats the entire point of the download
+# (a user reported exactly this: a "successful" zip that silently dropped
+# 4 of 7 years is worse than useless -- it looks complete but isn't). This
+# only exists to stop something truly pathological (a corrupt/runaway
+# file, or a future form even larger than anything seen so far) from
+# taking the whole zip down; it should essentially never trigger for a
+# normal, if large, export.
+RAW_DL_ZIP_FILE_SIZE_LIMIT <- 3 * 1024 * 1024 * 1024  # 3 GB
 
 .zip_files <- function(paths, zip_path, work_dir, progress = function(detail) invisible(NULL)) {
-  # Found on form 4498's CSV path: its 2023 year-partition (629 cols x
-  # 252,306 rows) is well over a GB as plain-text CSV, and zip::zip()'s
-  # default compression_level (9 -- maximum DEFLATE) is CPU-heavy in a way
-  # that scales badly with input size. That single call ran long enough to
-  # disconnect the Shiny session / OOM-kill the worker -- the exact same
-  # failure mode already fixed on the xlsx-writing side, just one step
-  # later in the pipeline (zip-building instead of xlsx-writing). Two
-  # mitigations, same spirit as the xlsx cell-count fix: (1) use a fast
-  # compression level always, since level 9's CPU cost is what actually
-  # hurts for large inputs, not compression itself; (2) as a hard backstop,
-  # skip any single file over RAW_DL_ZIP_FILE_SIZE_LIMIT from the archive
-  # rather than let a version of this problem happen again for an even
-  # larger form/year in the future -- callers must handle a NULL return
-  # (nothing left worth zipping) instead of assuming a path always comes
-  # back.
+  # Found on form 4498's CSV path: its year-partitions run several hundred
+  # MB to over a GB each as plain-text CSV, and zip::zip()'s default
+  # compression_level (9 -- maximum DEFLATE) is CPU-heavy in a way that
+  # scales badly with input size -- that single call ran long enough to
+  # disconnect the Shiny session / OOM-kill the worker. The fix that
+  # actually matters for data completeness is using compression_level = 0
+  # (store -- no compression, just packaging) instead of any DEFLATE
+  # level: it's the fastest possible option, at the cost of a larger zip,
+  # which is the right trade for "give me all the data" over "make the
+  # download small." An earlier version of this function also tried a
+  # size-based exclusion at a much lower threshold as a second safety net
+  # -- that turned out to be actively harmful here, since it silently
+  # dropped the very years the download exists to deliver. It's kept now
+  # only as RAW_DL_ZIP_FILE_SIZE_LIMIT, a much higher genuine backstop
+  # (see its own comment) -- callers must still handle a NULL return
+  # (nothing left worth zipping) for that truly-extreme case.
   sizes <- suppressWarnings(file.size(paths))
   sizes[is.na(sizes)] <- 0
   too_big <- sizes > RAW_DL_ZIP_FILE_SIZE_LIMIT
@@ -219,7 +226,7 @@ RAW_DL_ZIP_FILE_SIZE_LIMIT <- 150 * 1024 * 1024  # 150 MB
     for (i in which(too_big)) {
       progress(paste0(
         basename(paths[i]), " is ", round(sizes[i] / 1024 / 1024), " MB -- ",
-        "too large to bundle into this zip, skipping it."
+        "too large to include even with store-only zipping, skipping it."
       ))
     }
     paths <- paths[!too_big]
@@ -228,9 +235,9 @@ RAW_DL_ZIP_FILE_SIZE_LIMIT <- 150 * 1024 * 1024  # 150 MB
     progress("Nothing left to zip after skipping oversized file(s).")
     return(NULL)
   }
-  progress(paste0("Building zip archive (", length(paths), " file(s))..."))
+  progress(paste0("Building zip archive (", length(paths), " file(s), store-only for speed)..."))
   tryCatch(
-    zip::zip(zip_path, files = basename(paths), root = work_dir, compression_level = 1),
+    zip::zip(zip_path, files = basename(paths), root = work_dir, compression_level = 0),
     error = function(e) zip::zip(zip_path, files = basename(paths), root = work_dir)
   )
   zip_path
