@@ -374,6 +374,82 @@ def _upload_large_file(token: str, drive_id: str, local_path: Path, remote_path:
         return False
 
 
+def prune_old_versions(token: str, drive_id: str, remote_path: str, keep_versions: int = 3) -> int:
+    """Deletes all but the most recent `keep_versions` HISTORICAL versions
+    of the file at remote_path (relative to the library root). Returns the
+    number of versions actually deleted (0 on nothing-to-prune or any
+    failure) -- never raises, same best-effort contract as every other
+    write-side call in this module.
+
+    Added 2026-09-29 after IT traced ~180GB of SharePoint storage growth
+    in 4 days back to this library's Document Version History: every time
+    this pipeline overwrites one of its own raw-state files (the combined
+    per-form Parquet, a heavy form's year-partition Parquet/CSV twins, the
+    migration completion marker...), SharePoint keeps the PREVIOUS content
+    as a full extra version rather than discarding it -- on top of the
+    current one, which is untouched either way (Graph's /versions listing
+    only ever returns historical versions, never the live one, so this is
+    safe to call even with keep_versions=0).
+
+    The library's own Versioning Settings apply to every folder in it,
+    including ones other people update by hand for unrelated work, so
+    tightening that library-wide setting isn't an option -- this targets
+    only the specific file just uploaded, immediately after each of this
+    pipeline's own upload_file() calls, without touching anyone else's
+    version history.
+
+    Resolves remote_path to its item id first (the /versions relationship
+    is only documented against an item id, not path-addressable the way
+    most of this module's other calls are), then lists and deletes from
+    oldest-kept-cutoff onward.
+    """
+    try:
+        item_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{remote_path}"
+        item_resp = requests.get(item_url, headers=_auth(token), timeout=30)
+        if item_resp.status_code == 404:
+            return 0
+        item_resp.raise_for_status()
+        item_id = item_resp.json()["id"]
+
+        versions_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/versions"
+        versions: List[Dict] = []
+        url = versions_url
+        while url:
+            r = requests.get(url, headers=_auth(token), timeout=60)
+            r.raise_for_status()
+            body = r.json()
+            versions.extend(body.get("value", []))
+            url = body.get("@odata.nextLink")
+
+        if len(versions) <= max(keep_versions, 0):
+            return 0
+
+        # Graph returns versions newest-first already, but sort explicitly
+        # by lastModifiedDateTime (descending) rather than relying on
+        # response order, in case that's ever not guaranteed.
+        versions.sort(key=lambda v: v.get("lastModifiedDateTime", ""), reverse=True)
+        to_delete = versions[max(keep_versions, 0):]
+
+        deleted = 0
+        for v in to_delete:
+            vid = v.get("id")
+            if not vid:
+                continue
+            del_url = f"{versions_url}/{vid}"
+            dr = _request_with_retry("DELETE", del_url, headers=_auth(token), timeout=30)
+            if dr.status_code in (204, 404):
+                deleted += 1
+            else:
+                _log_sp_failure("prune_old_versions:delete", f"{remote_path} (version {vid})", response=dr)
+        return deleted
+    except requests.exceptions.RequestException as e:
+        _log_sp_failure("prune_old_versions", remote_path, response=getattr(e, "response", None), exc=e)
+        return 0
+    except (KeyError, ValueError, TypeError) as e:
+        _log_sp_failure("prune_old_versions", remote_path, exc=e)
+        return 0
+
+
 def delete_item(token: str, drive_id: str, item_path: str) -> bool:
     """Delete an item (file, or a folder and everything under it) by its
     path, relative to the library root. Returns True once it's gone --

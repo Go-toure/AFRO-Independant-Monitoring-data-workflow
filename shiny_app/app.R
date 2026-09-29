@@ -439,7 +439,7 @@ ui <- page_navbar(
       card_body(
         div(class="info-banner mb-3",
           tags$b("Source:"), tags$code("raw_state"),
-          " — pulls a form's raw data directly from SharePoint. Forms too large for one Excel sheet are automatically split into one file per year (zipped)."),
+          " — pulls a form's raw data directly from SharePoint. Forms too large for one Excel sheet are automatically split into one file per year (zipped). Pick a specific Year to fetch just that year instead of every year for the form."),
         # Plain Bootstrap row/col (flexbox), not bslib's layout_columns()
         # (CSS Grid) -- two selectize widgets side by side inside a
         # layout_columns() grid cell were overlapping/overflowing their
@@ -448,9 +448,16 @@ ui <- page_navbar(
         # A plain .row/.col-* pair is the same layout every other
         # side-by-side filter row in this app already uses successfully.
         div(class="row gx-3 gy-2 mb-3",
-          div(class="col-12 col-md-6",
+          div(class="col-12 col-md-4",
             selectInput("dl_raw_form_id", "Form ID", choices = NULL, width = "100%")),
-          div(class="col-12 col-md-6",
+          div(class="col-12 col-md-4",
+            # Repopulated reactively (server-side) with that form's actual
+            # partition years the moment a Form ID is picked -- see the
+            # observeEvent(input$dl_raw_form_id, ...) block below. Stays at
+            # "All years" for a form that isn't year-partitioned, since
+            # there's only ever one combined file for those anyway.
+            selectInput("dl_raw_year", "Year", choices = c("All years" = ""), width = "100%")),
+          div(class="col-12 col-md-4",
             selectInput("dl_raw_format", "Format",
                         c("CSV" = "csv", "Excel (.xlsx)" = "xlsx",
                           "R data (.rds)" = "rds", "Parquet" = "parquet"),
@@ -2967,12 +2974,31 @@ server <- function(input, output, session) {
     if (length(ids)) updateSelectInput(session, "dl_raw_form_id", choices = ids)
   })
 
+  # Repopulate the "Year" dropdown with whatever years actually exist for
+  # the newly-picked form, every time Form ID changes -- list_partition_years()
+  # (R/data_download_raw.R) returns character(0) for a form that isn't
+  # year-partitioned, which collapses this back down to just "All years",
+  # the only sensible choice there (there's only ever one combined file for
+  # a non-heavy form, so there's nothing to pick a year out of).
+  observeEvent(input$dl_raw_form_id, {
+    form_id <- input$dl_raw_form_id
+    req(form_id)
+    years <- tryCatch(list_partition_years(form_id), error = function(e) character(0))
+    choices <- c("All years" = "")
+    if (length(years)) choices <- c(choices, setNames(years, years))
+    updateSelectInput(session, "dl_raw_year", choices = choices)
+  }, ignoreInit = FALSE)
+
   output$dl_raw_form <- downloadHandler(
     filename = function() {
       form_id <- input$dl_raw_form_id
       fmt     <- input$dl_raw_format
+      year    <- input$dl_raw_year
       ext     <- switch(fmt, parquet = "parquet", xlsx = "xlsx", rds = "rds", "csv")
       req(form_id, fmt)
+      # A specific year is always exactly one file -- never a zip, no need
+      # to check whether the form is "heavy" at all.
+      if (!is.null(year) && nzchar(year)) return(paste0(form_id, "_", year, ".", ext))
       multi <- tryCatch({
         if (!sharepoint_credentials_available()) {
           FALSE
@@ -2988,8 +3014,10 @@ server <- function(input, output, session) {
     content = function(file) {
       form_id <- input$dl_raw_form_id
       fmt     <- input$dl_raw_format
+      year    <- input$dl_raw_year
       req(form_id, fmt)
       rv_dl_raw_msg(NULL)
+      year_arg <- if (!is.null(year) && nzchar(year)) year else NULL
 
       # A heavy-form download can mean several sequential SharePoint
       # round-trips (one per year partition) plus a zip step -- with
@@ -3003,14 +3031,15 @@ server <- function(input, output, session) {
       # the browser immediately, unlike a plain reactive output, which
       # would only flush once this whole content() call returns.
       session$sendCustomMessage("dlRawLogClear", list())
-      withProgress(message = paste0("Building ", form_id, ".", fmt, " download..."), value = 0, {
+      dl_label <- if (!is.null(year_arg)) paste0(form_id, "_", year_arg, ".", fmt) else paste0(form_id, ".", fmt)
+      withProgress(message = paste0("Building ", dl_label, " download..."), value = 0, {
         progress_cb <- function(detail) {
           incProgress(amount = 1 / 12, detail = detail)
           session$sendCustomMessage("dlRawLogLine", list(
             text = paste0("[", format(Sys.time(), "%H:%M:%S"), "] ", detail)
           ))
         }
-        res <- build_form_download(form_id, fmt, progress = progress_cb)
+        res <- build_form_download(form_id, fmt, progress = progress_cb, year = year_arg)
       })
 
       if (!isTRUE(res$ok)) {

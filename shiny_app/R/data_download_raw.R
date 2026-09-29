@@ -150,6 +150,24 @@ form_is_partitioned <- function(token, drive_id, form_id) {
   sort(names[grepl(paste0("^", form_id, "_[0-9]{4}\\.parquet$"), names)])
 }
 
+# Character vector of year strings (e.g. c("2020","2021",...)) this form is
+# partitioned into, ascending -- or character(0) if the form isn't
+# partitioned (not "heavy"), SharePoint credentials aren't configured, or
+# anything else goes wrong. Never raises. Used to populate the "Year"
+# dropdown in the Download Raw Form Data UI reactively as soon as a form is
+# picked, so the selector only ever offers years that genuinely exist for
+# that form -- a non-heavy form (nothing to partition) naturally gets back
+# character(0), which the UI treats as "no year selector, only one file".
+list_partition_years <- function(form_id) {
+  if (!sharepoint_credentials_available()) return(character(0))
+  tryCatch({
+    token    <- sp_get_graph_token()
+    drive_id <- sp_resolve_drive_id(token)
+    files    <- .partition_year_files(token, drive_id, form_id)
+    sub(paste0("^", form_id, "_([0-9]{4})\\.parquet$"), "\\1", files)
+  }, error = function(e) character(0))
+}
+
 # Downloads either the single combined Parquet (normal form) or every
 # year-partition Parquet (heavy form) into work_dir and returns them all
 # read in as one combined data.frame (dplyr::bind_rows() across years, so
@@ -244,7 +262,24 @@ RAW_DL_ZIP_FILE_SIZE_LIMIT <- 3 * 1024 * 1024 * 1024  # 3 GB
 }
 
 build_parquet_download <- function(token, drive_id, form_id, heavy, work_dir,
-                                    progress = function(detail) invisible(NULL)) {
+                                    progress = function(detail) invisible(NULL), year = NULL) {
+  # A specific year was requested on a heavy (year-partitioned) form: the
+  # pipeline already keeps that year's own Parquet partition file, so this
+  # just fetches it directly -- no need to touch any other year, and no
+  # filtering/re-writing required since it's already exactly that year's
+  # data. Falls through to the combined-file path below for a non-heavy
+  # form even if a year was passed (nothing to partition there -- see
+  # list_partition_years()'s own comment).
+  if (!is.null(year) && heavy) {
+    nm     <- paste0(form_id, "_", year, ".parquet")
+    remote <- paste0(sp_partition_folder(form_id), "/", nm)
+    local  <- file.path(work_dir, nm)
+    progress(paste0("Downloading ", nm, "..."))
+    if (!sp_download_file(token, drive_id, remote, local))
+      return(list(ok = FALSE, path = NULL,
+                  message = paste0("No data found for form ", form_id, ", year ", year, ".")))
+    return(list(ok = TRUE, path = local, message = NULL))
+  }
   progress(paste0("Downloading ", form_id, ".parquet..."))
   remote <- paste0(RAW_STATE_FOLDER, "/", form_id, ".parquet")
   local  <- file.path(work_dir, paste0(form_id, ".parquet"))
@@ -255,7 +290,20 @@ build_parquet_download <- function(token, drive_id, form_id, heavy, work_dir,
 }
 
 build_csv_download <- function(token, drive_id, form_id, heavy, work_dir,
-                                progress = function(detail) invisible(NULL)) {
+                                progress = function(detail) invisible(NULL), year = NULL) {
+  # A specific year on a heavy form: fetch just that year's own CSV
+  # directly -- returned as a plain .csv, not a zip, since there's only
+  # ever one file involved. No need to list/download/zip every other year.
+  if (!is.null(year) && heavy) {
+    nm     <- paste0(form_id, "_", year, ".csv")
+    remote <- paste0(RAW_STATE_FOLDER, "/", nm)
+    local  <- file.path(work_dir, nm)
+    progress(paste0("Downloading ", nm, "..."))
+    if (!sp_download_file(token, drive_id, remote, local))
+      return(list(ok = FALSE, path = NULL,
+                  message = paste0("No CSV found for form ", form_id, ", year ", year, ".")))
+    return(list(ok = TRUE, path = local, message = NULL))
+  }
   if (!heavy) {
     progress(paste0("Downloading ", form_id, ".csv..."))
     remote <- paste0(RAW_STATE_FOLDER, "/", form_id, ".csv")
@@ -376,8 +424,85 @@ build_xlsx_year_partitions_from_df <- function(df, form_id, work_dir,
   list(ok = TRUE, path = zip_path, message = NULL)
 }
 
+# Builds one year-partition's .xlsx straight from its own Parquet file,
+# using the same cheap-metadata-first cell-limit check as the all-years
+# loop below -- pulled out into its own function so the single-year
+# fast path (a user picking one specific, possibly heavy, year) and the
+# all-years loop share exactly one implementation instead of two copies
+# that could quietly drift apart.
+#
+# Returns list(ok, path, skipped, message):
+#   ok=TRUE                -> path is the written .xlsx, message is NULL.
+#   ok=FALSE, skipped=TRUE -> this year genuinely doesn't fit in one Excel
+#                             sheet; message explains why (not a hard error).
+#   ok=FALSE, skipped=FALSE -> an actual download/read/write failure.
+.build_one_year_xlsx <- function(token, drive_id, form_id, year, work_dir,
+                                  progress = function(detail) invisible(NULL)) {
+  nm       <- paste0(form_id, "_", year, ".parquet")
+  local_pq <- file.path(work_dir, nm)
+  remote   <- paste0(sp_partition_folder(form_id), "/", nm)
+  progress(paste0("Downloading ", nm, "..."))
+  if (!sp_download_file(token, drive_id, remote, local_pq))
+    return(list(ok = FALSE, path = NULL, skipped = FALSE,
+                message = paste0("Could not download ", nm, " from SharePoint.")))
+
+  # Cheapest possible check first: read row/col counts off the Parquet
+  # file's own footer metadata, never decoding any actual column data (see
+  # .parquet_dims_cheap()'s own comment for why this matters --
+  # read_parquet(as_data_frame = FALSE) alone is NOT cheap). Skips an
+  # oversized year before the network/CPU cost of a full read at all.
+  cheap_dims <- .parquet_dims_cheap(local_pq)
+  if (!is.null(cheap_dims) && (cheap_dims["rows"] * cheap_dims["cols"]) > RAW_DL_EXCEL_CELL_LIMIT) {
+    msg <- paste0(
+      form_id, "_", year, ": ", cheap_dims["rows"], " rows x ", cheap_dims["cols"], " cols (",
+      format(cheap_dims["rows"] * cheap_dims["cols"], big.mark = ","),
+      " cells) is too large for one Excel sheet")
+    progress(paste0(msg, " -- skipping this year for .xlsx."))
+    return(list(ok = FALSE, path = NULL, skipped = TRUE, message = paste0(msg, ".")))
+  }
+
+  # Backstop for when the cheap metadata-only check above wasn't available
+  # (older/different arrow build, or any error) -- still correct, just pays
+  # the full read cost this one time instead of skipping it outright.
+  tbl <- tryCatch(arrow::read_parquet(local_pq, as_data_frame = FALSE), error = function(e) NULL)
+  if (is.null(tbl))
+    return(list(ok = FALSE, path = NULL, skipped = FALSE, message = paste0("Could not read ", nm, ".")))
+  if (.exceeds_excel_cell_limit(tbl)) {
+    msg <- paste0(
+      form_id, "_", year, ": ", nrow(tbl), " rows x ", ncol(tbl), " cols (",
+      format(as.numeric(nrow(tbl)) * ncol(tbl), big.mark = ","),
+      " cells) is too large for one Excel sheet")
+    progress(paste0(msg, " -- skipping this year for .xlsx."))
+    return(list(ok = FALSE, path = NULL, skipped = TRUE, message = paste0(msg, ".")))
+  }
+
+  df <- tryCatch(as.data.frame(tbl), error = function(e) NULL)
+  if (is.null(df))
+    return(list(ok = FALSE, path = NULL, skipped = FALSE, message = paste0("Could not read ", nm, ".")))
+  progress(paste0("Writing ", form_id, "_", year, ".xlsx (", nrow(df), " rows)..."))
+  xlsx_local <- file.path(work_dir, paste0(form_id, "_", year, ".xlsx"))
+  if (!.write_xlsx_or_na(df, xlsx_local, progress))
+    return(list(ok = FALSE, path = NULL, skipped = FALSE,
+                message = paste0("Could not write ", form_id, "_", year, ".xlsx.")))
+  list(ok = TRUE, path = xlsx_local, skipped = FALSE, message = NULL)
+}
+
 build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
-                                 progress = function(detail) invisible(NULL)) {
+                                 progress = function(detail) invisible(NULL), year = NULL) {
+  # A specific year requested on a heavy form: build just that one year's
+  # .xlsx and return it directly (no zip -- there's only ever one file).
+  # If that particular year is itself too large for Excel, this fails with
+  # a clear message naming CSV/Parquet as the alternative for THIS year,
+  # rather than the all-years "note" below (there's nothing else in this
+  # download to fall back on, unlike the all-years case).
+  if (!is.null(year) && heavy) {
+    r <- .build_one_year_xlsx(token, drive_id, form_id, year, work_dir, progress)
+    if (isTRUE(r$ok)) return(list(ok = TRUE, path = r$path, message = NULL))
+    if (isTRUE(r$skipped))
+      return(list(ok = FALSE, path = NULL,
+                  message = paste0(r$message, " Try CSV or Parquet for this year instead.")))
+    return(list(ok = FALSE, path = NULL, message = r$message))
+  }
   if (!heavy) {
     df <- fetch_form_dataframe(token, drive_id, form_id, FALSE, work_dir, progress)
     if (is.null(df))
@@ -395,12 +520,12 @@ build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
       return(list(ok = FALSE, path = NULL, message = paste0("Could not write ", form_id, ".xlsx.")))
     return(list(ok = TRUE, path = local, message = NULL))
   }
-  # Heavy form: one .xlsx per year, straight from the same year-partition
-  # Parquet files the pipeline itself already maintains -- each year's
-  # slice is comfortably under Excel's row limit for the same reason
-  # Fetch_im_data.py's own CSV year-partitioning relies on (new submissions
-  # almost always land in the current year, so no single year has ever
-  # approached the form's overall total).
+  # Heavy form, no specific year: one .xlsx per year, straight from the
+  # same year-partition Parquet files the pipeline itself already
+  # maintains -- each year's slice is comfortably under Excel's row limit
+  # for the same reason Fetch_im_data.py's own CSV year-partitioning
+  # relies on (new submissions almost always land in the current year, so
+  # no single year has ever approached the form's overall total).
   progress("Listing year partitions...")
   year_files <- .partition_year_files(token, drive_id, form_id)
   if (!length(year_files))
@@ -408,46 +533,15 @@ build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
   xlsx_paths <- character(0)
   skipped_years <- character(0)
   for (nm in year_files) {
-    progress(paste0("Downloading ", nm, "..."))
-    local_pq <- file.path(work_dir, nm)
-    remote   <- paste0(sp_partition_folder(form_id), "/", nm)
-    if (!sp_download_file(token, drive_id, remote, local_pq)) next
-    year <- sub(paste0("^", form_id, "_([0-9]{4})\\.parquet$"), "\\1", nm)
-    # Cheapest possible check first: read row/col counts off the Parquet
-    # file's own footer metadata, never decoding any actual column data
-    # (see .parquet_dims_cheap()'s own comment for why this matters --
-    # read_parquet(as_data_frame = FALSE) alone is NOT cheap). Skips an
-    # oversized year before the network/CPU cost of a full read at all.
-    cheap_dims <- .parquet_dims_cheap(local_pq)
-    if (!is.null(cheap_dims) && (cheap_dims["rows"] * cheap_dims["cols"]) > RAW_DL_EXCEL_CELL_LIMIT) {
-      progress(paste0(
-        form_id, "_", year, ": ", cheap_dims["rows"], " rows x ", cheap_dims["cols"], " cols (",
-        format(cheap_dims["rows"] * cheap_dims["cols"], big.mark = ","),
-        " cells) is too large for one Excel sheet -- skipping this year for .xlsx."
-      ))
-      skipped_years <- c(skipped_years, year)
-      next
+    yr <- sub(paste0("^", form_id, "_([0-9]{4})\\.parquet$"), "\\1", nm)
+    r  <- .build_one_year_xlsx(token, drive_id, form_id, yr, work_dir, progress)
+    if (isTRUE(r$ok)) {
+      xlsx_paths <- c(xlsx_paths, r$path)
+    } else if (isTRUE(r$skipped)) {
+      skipped_years <- c(skipped_years, yr)
     }
-    # Backstop for when the cheap metadata-only check above wasn't
-    # available (older/different arrow build, or any error) -- still
-    # correct, just pays the full read cost this one time instead of
-    # skipping it outright.
-    tbl <- tryCatch(arrow::read_parquet(local_pq, as_data_frame = FALSE), error = function(e) NULL)
-    if (is.null(tbl)) next
-    if (.exceeds_excel_cell_limit(tbl)) {
-      progress(paste0(
-        form_id, "_", year, ": ", nrow(tbl), " rows x ", ncol(tbl), " cols (",
-        format(as.numeric(nrow(tbl)) * ncol(tbl), big.mark = ","),
-        " cells) is too large for one Excel sheet -- skipping this year for .xlsx."
-      ))
-      skipped_years <- c(skipped_years, year)
-      next
-    }
-    df <- tryCatch(as.data.frame(tbl), error = function(e) NULL)
-    if (is.null(df)) next
-    progress(paste0("Writing ", form_id, "_", year, ".xlsx (", nrow(df), " rows)..."))
-    xlsx_local <- file.path(work_dir, paste0(form_id, "_", year, ".xlsx"))
-    if (.write_xlsx_or_na(df, xlsx_local, progress)) xlsx_paths <- c(xlsx_paths, xlsx_local)
+    # else: a real download/read/write failure for this year -- move on to
+    # the next one, same as the original loop's plain `next` on failure.
   }
   if (!length(xlsx_paths))
     return(list(ok = FALSE, path = NULL,
@@ -473,7 +567,29 @@ build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
 }
 
 build_rds_download <- function(token, drive_id, form_id, heavy, work_dir,
-                                progress = function(detail) invisible(NULL)) {
+                                progress = function(detail) invisible(NULL), year = NULL) {
+  # A specific year on a heavy form: read just that one year's own
+  # partition and save it directly -- skips fetch_form_dataframe()'s
+  # download-every-year-then-bind_rows() path entirely, since only one
+  # year's data is wanted here.
+  if (!is.null(year) && heavy) {
+    nm     <- paste0(form_id, "_", year, ".parquet")
+    remote <- paste0(sp_partition_folder(form_id), "/", nm)
+    local_pq <- file.path(work_dir, nm)
+    progress(paste0("Downloading ", nm, "..."))
+    if (!sp_download_file(token, drive_id, remote, local_pq))
+      return(list(ok = FALSE, path = NULL,
+                  message = paste0("No data found for form ", form_id, ", year ", year, ".")))
+    df <- tryCatch(as.data.frame(arrow::read_parquet(local_pq)), error = function(e) NULL)
+    if (is.null(df))
+      return(list(ok = FALSE, path = NULL, message = paste0("Could not read ", nm, ".")))
+    progress(paste0("Writing ", form_id, "_", year, ".rds (", nrow(df), " rows)..."))
+    out <- file.path(work_dir, paste0(form_id, "_", year, ".rds"))
+    ok <- tryCatch({ saveRDS(df, out); TRUE }, error = function(e) FALSE)
+    if (!ok)
+      return(list(ok = FALSE, path = NULL, message = paste0("Could not write ", form_id, "_", year, ".rds.")))
+    return(list(ok = TRUE, path = out, message = NULL))
+  }
   df <- fetch_form_dataframe(token, drive_id, form_id, heavy, work_dir, progress)
   if (is.null(df))
     return(list(ok = FALSE, path = NULL, message = paste0("Could not read data for form ", form_id, ".")))
@@ -497,8 +613,16 @@ build_rds_download <- function(token, drive_id, form_id, heavy, work_dir,
 # there looking hung the way the year-partitioned xlsx export in
 # scripts/fetch_sharepoint_csvs.py used to before it got the same
 # treatment earlier this project.
-build_form_download <- function(form_id, format, progress = function(detail) invisible(NULL)) {
+#
+# `year`: optional, e.g. "2024" -- when set on a heavy (year-partitioned)
+# form, fetches/builds only that one year's data instead of every year, and
+# returns a single plain file (never a zip, since there's only one file
+# involved). Ignored on a non-heavy form (nothing to partition there is
+# nothing lost by ignoring it -- see list_partition_years()'s own comment),
+# so it's always safe to pass through unconditionally from the UI.
+build_form_download <- function(form_id, format, progress = function(detail) invisible(NULL), year = NULL) {
   form_id <- as.character(form_id)
+  if (!is.null(year)) year <- as.character(year)
 
   if (!sharepoint_credentials_available())
     return(list(ok = FALSE, path = NULL, message = "SharePoint credentials are not configured."))
@@ -524,10 +648,10 @@ build_form_download <- function(form_id, format, progress = function(detail) inv
 
   result <- tryCatch({
     switch(format,
-      parquet = build_parquet_download(token, drive_id, form_id, heavy, work_dir, progress),
-      csv     = build_csv_download(token, drive_id, form_id, heavy, work_dir, progress),
-      xlsx    = build_xlsx_download(token, drive_id, form_id, heavy, work_dir, progress),
-      rds     = build_rds_download(token, drive_id, form_id, heavy, work_dir, progress),
+      parquet = build_parquet_download(token, drive_id, form_id, heavy, work_dir, progress, year),
+      csv     = build_csv_download(token, drive_id, form_id, heavy, work_dir, progress, year),
+      xlsx    = build_xlsx_download(token, drive_id, form_id, heavy, work_dir, progress, year),
+      rds     = build_rds_download(token, drive_id, form_id, heavy, work_dir, progress, year),
       list(ok = FALSE, path = NULL, message = paste0("Unsupported format: ", format))
     )
   }, error = function(e) list(ok = FALSE, path = NULL, message = conditionMessage(e)))

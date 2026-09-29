@@ -315,6 +315,19 @@ import _sharepoint_client as sp
 
 SP_RAW_FOLDER = "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/raw_state"
 
+# How many HISTORICAL versions of each raw-state file to keep on SharePoint
+# after every upload -- added 2026-09-29 once IT traced ~180GB of storage
+# growth in 4 days to this library's Document Version History quietly
+# keeping a full extra copy of every raw-state file each time this
+# pipeline overwrites it (the combined per-form Parquet, a heavy form's
+# year-partition Parquet/CSV twins, ...). See sp.prune_old_versions()'s own
+# docstring for the full reasoning and why this is scoped to just these
+# files rather than a library-wide setting change (other folders in the
+# same library are updated independently by other people for unrelated
+# work). 2 keeps one rollback step available (today's + yesterday's
+# content) without letting years of daily/incremental runs pile up.
+SP_RAW_VERSIONS_TO_KEEP = 2
+
 _sp_session = {"tried": False, "token": None, "drive_id": None, "folder_ready": False}
 
 
@@ -571,16 +584,27 @@ def upload_raw_to_sharepoint(form_id: int) -> None:
     if parquet_path.exists():
         parquet_mb = parquet_path.stat().st_size / (1024 * 1024)
         t_upload_start = time.time()
-        parquet_ok = sp.upload_file(token, drive_id, parquet_path, f"{SP_RAW_FOLDER}/{parquet_path.name}")
+        parquet_remote = f"{SP_RAW_FOLDER}/{parquet_path.name}"
+        parquet_ok = sp.upload_file(token, drive_id, parquet_path, parquet_remote)
         parquet_elapsed = time.time() - t_upload_start
         rate = parquet_mb / parquet_elapsed if parquet_elapsed > 0 else 0.0
         console(
             f"   [TIMING] Form {form_id} | Uploaded {parquet_path.name} ({parquet_mb:.1f} MB) "
             f"in {parquet_elapsed:.1f}s ({rate:.2f} MB/s) -- {'OK' if parquet_ok else 'FAILED'}"
         )
+        # See SP_RAW_VERSIONS_TO_KEEP's own comment: this is the file
+        # SharePoint's Document Version History was quietly keeping a full
+        # extra copy of on every one of this form's runs -- trim it right
+        # after the upload that just created the new version.
+        if parquet_ok:
+            sp.prune_old_versions(token, drive_id, parquet_remote, SP_RAW_VERSIONS_TO_KEEP)
         ok = parquet_ok and ok
     if meta_path.exists():
-        ok = sp.upload_file(token, drive_id, meta_path, f"{SP_RAW_FOLDER}/{meta_path.name}") and ok
+        meta_remote = f"{SP_RAW_FOLDER}/{meta_path.name}"
+        meta_ok = sp.upload_file(token, drive_id, meta_path, meta_remote)
+        if meta_ok:
+            sp.prune_old_versions(token, drive_id, meta_remote, SP_RAW_VERSIONS_TO_KEEP)
+        ok = meta_ok and ok
 
     if ok:
         detail(f"[sharepoint] Form {form_id} | raw state synced to SharePoint.")
@@ -610,7 +634,8 @@ def upload_raw_to_sharepoint(form_id: int) -> None:
     if csv_path is not None:
         csv_mb = csv_path.stat().st_size / (1024 * 1024)
         t_upload_start = time.time()
-        csv_ok = sp.upload_file(token, drive_id, csv_path, f"{SP_RAW_FOLDER}/{csv_path.name}")
+        csv_remote = f"{SP_RAW_FOLDER}/{csv_path.name}"
+        csv_ok = sp.upload_file(token, drive_id, csv_path, csv_remote)
         csv_upload_elapsed = time.time() - t_upload_start
         rate = csv_mb / csv_upload_elapsed if csv_upload_elapsed > 0 else 0.0
         console(
@@ -619,6 +644,7 @@ def upload_raw_to_sharepoint(form_id: int) -> None:
             f"-- {'OK' if csv_ok else 'FAILED'}"
         )
         if csv_ok:
+            sp.prune_old_versions(token, drive_id, csv_remote, SP_RAW_VERSIONS_TO_KEEP)
             detail(f"[sharepoint] Form {form_id} | CSV twin synced to SharePoint.")
         else:
             detail(f"[sharepoint] Form {form_id} | WARNING: CSV twin upload to SharePoint failed.")
@@ -1670,6 +1696,12 @@ def _upload_partitions_to_sharepoint(form_id: int) -> None:
     # for form 4498) synchronously, once per incremental run. Per-file
     # timing here mirrors the download side in
     # _recover_partitions_from_sharepoint().
+    # This loop -- re-uploading every year partition on essentially every
+    # incremental run, up to ~1.28GB total for form 4498 alone -- is the
+    # single biggest contributor to the SharePoint version-history growth
+    # SP_RAW_VERSIONS_TO_KEEP exists to control (see its own comment): each
+    # of these files can be updated on nearly every run, and without
+    # pruning, SharePoint keeps a full extra copy every single time.
     partition_files = sorted(partition_dir.glob(f"{form_id}_*.parquet"))
     ok = True
     upload_start = time.time()
@@ -1677,7 +1709,8 @@ def _upload_partitions_to_sharepoint(form_id: int) -> None:
     for p in partition_files:
         file_mb = p.stat().st_size / (1024 * 1024)
         t_file_start = time.time()
-        file_ok = sp.upload_file(token, drive_id, p, f"{remote_folder}/{p.name}")
+        remote_path = f"{remote_folder}/{p.name}"
+        file_ok = sp.upload_file(token, drive_id, p, remote_path)
         file_elapsed = time.time() - t_file_start
         rate = file_mb / file_elapsed if file_elapsed > 0 else 0.0
         total_bytes += p.stat().st_size
@@ -1685,6 +1718,8 @@ def _upload_partitions_to_sharepoint(form_id: int) -> None:
             f"   [TIMING] Form {form_id} | Uploaded {p.name} ({file_mb:.1f} MB) "
             f"in {file_elapsed:.1f}s ({rate:.2f} MB/s) -- {'OK' if file_ok else 'FAILED'}"
         )
+        if file_ok:
+            sp.prune_old_versions(token, drive_id, remote_path, SP_RAW_VERSIONS_TO_KEEP)
         ok = file_ok and ok
 
     total_elapsed = time.time() - upload_start
@@ -1697,7 +1732,11 @@ def _upload_partitions_to_sharepoint(form_id: int) -> None:
 
     marker_path = _migration_marker_path(form_id)
     if ok and marker_path.exists():
-        ok = sp.upload_file(token, drive_id, marker_path, f"{remote_folder}/{marker_path.name}") and ok
+        marker_remote = f"{remote_folder}/{marker_path.name}"
+        marker_ok = sp.upload_file(token, drive_id, marker_path, marker_remote)
+        if marker_ok:
+            sp.prune_old_versions(token, drive_id, marker_remote, SP_RAW_VERSIONS_TO_KEEP)
+        ok = marker_ok and ok
 
     if ok:
         detail(f"[sharepoint] Form {form_id} | {len(partition_files)} year partition(s) + completion marker synced to SharePoint.")
@@ -1747,7 +1786,8 @@ def _upload_csv_partitions_to_sharepoint(form_id: int) -> None:
     for p in csv_paths:
         file_mb = p.stat().st_size / (1024 * 1024)
         t_file_start = time.time()
-        file_ok = sp.upload_file(token, drive_id, p, f"{remote_folder}/{p.name}")
+        remote_path = f"{remote_folder}/{p.name}"
+        file_ok = sp.upload_file(token, drive_id, p, remote_path)
         file_elapsed = time.time() - t_file_start
         rate = file_mb / file_elapsed if file_elapsed > 0 else 0.0
         total_bytes += p.stat().st_size
@@ -1755,6 +1795,12 @@ def _upload_csv_partitions_to_sharepoint(form_id: int) -> None:
             f"   [TIMING] Form {form_id} | Uploaded CSV twin {p.name} ({file_mb:.1f} MB) "
             f"in {file_elapsed:.1f}s ({rate:.2f} MB/s) -- {'OK' if file_ok else 'FAILED'}"
         )
+        # See SP_RAW_VERSIONS_TO_KEEP's own comment -- these per-year CSV
+        # twins (hundreds of MB to 1GB+ each for form 4498) are rewritten
+        # on essentially every run, same growth risk as the Parquet
+        # partitions in _upload_partitions_to_sharepoint().
+        if file_ok:
+            sp.prune_old_versions(token, drive_id, remote_path, SP_RAW_VERSIONS_TO_KEEP)
         ok = file_ok and ok
 
     total_elapsed = time.time() - upload_start
