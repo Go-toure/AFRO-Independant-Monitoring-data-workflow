@@ -79,6 +79,34 @@ RAW_DL_EXCEL_CELL_LIMIT <- 5000000
   (as.numeric(nrow(df)) * as.numeric(ncol(df))) > RAW_DL_EXCEL_CELL_LIMIT
 }
 
+# Row/col counts straight off a Parquet file's own footer metadata --
+# WITHOUT decoding any of its actual column data. This turned out to
+# matter: arrow::read_parquet(path, as_data_frame = FALSE) still fully
+# reads and decompresses every column into an Arrow Table in memory --
+# as_data_frame only controls whether an ADDITIONAL R data.frame
+# conversion happens afterward, not how much of the file gets read. So
+# checking .exceeds_excel_cell_limit() on that Table (the earlier fix)
+# avoided the data.frame conversion cost, but not the much larger
+# read-and-decode cost that had already happened by the time the Table
+# came back -- which is exactly why form 4498 (822 columns, some years
+# 400k+ rows) kept disconnecting/OOM'ing even after that fix shipped.
+# ParquetFileReader's schema + row-count metadata, by contrast, comes
+# from the file's footer alone and is cheap regardless of file size.
+# Defensive: falls back to NULL (never raises) if this lower-level API
+# isn't available for some reason -- the caller then falls through to the
+# slower-but-always-correct read_parquet()-based check as a backstop, so
+# this is purely a performance optimization, never a correctness one.
+.parquet_dims_cheap <- function(path) {
+  tryCatch({
+    pf     <- arrow::ParquetFileReader$create(path)
+    ncols  <- length(pf$GetSchema())
+    nrows  <- pf$metadata$num_rows
+    if (is.null(nrows)) nrows <- pf$num_rows
+    if (is.null(nrows) || is.null(ncols) || !is.finite(nrows) || !is.finite(ncols)) stop("metadata unavailable")
+    c(rows = as.numeric(nrows), cols = as.numeric(ncols))
+  }, error = function(e) NULL)
+}
+
 sp_partition_folder <- function(form_id) {
   paste0(RAW_STATE_FOLDER, "/partitions/", form_id)
 }
@@ -378,18 +406,25 @@ build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
     remote   <- paste0(sp_partition_folder(form_id), "/", nm)
     if (!sp_download_file(token, drive_id, remote, local_pq)) next
     year <- sub(paste0("^", form_id, "_([0-9]{4})\\.parquet$"), "\\1", nm)
-    # Read as an Arrow Table first (as_data_frame = FALSE) -- NOT yet a
-    # base R data.frame. A Table's row/col counts come straight off its
-    # schema/metadata, so checking the cell limit here is cheap even for a
-    # huge file. Converting an 800+-column, 400k+-row Table into a base R
-    # data.frame (as.data.frame()) is itself a slow, memory-heavy
-    # operation -- discovered in production on form 4498 (whose column
-    # count has since grown to 822): even after the xlsx-WRITE step was
-    # correctly being skipped for oversized years, the app still
-    # disconnected/OOM'd, because every year's Parquet -- oversized or not
-    # -- was still being fully materialized into a data.frame before the
-    # cell-count check ever ran. Checking on the Table first means an
-    # oversized year gets skipped before ever paying that conversion cost.
+    # Cheapest possible check first: read row/col counts off the Parquet
+    # file's own footer metadata, never decoding any actual column data
+    # (see .parquet_dims_cheap()'s own comment for why this matters --
+    # read_parquet(as_data_frame = FALSE) alone is NOT cheap). Skips an
+    # oversized year before the network/CPU cost of a full read at all.
+    cheap_dims <- .parquet_dims_cheap(local_pq)
+    if (!is.null(cheap_dims) && (cheap_dims["rows"] * cheap_dims["cols"]) > RAW_DL_EXCEL_CELL_LIMIT) {
+      progress(paste0(
+        form_id, "_", year, ": ", cheap_dims["rows"], " rows x ", cheap_dims["cols"], " cols (",
+        format(cheap_dims["rows"] * cheap_dims["cols"], big.mark = ","),
+        " cells) is too large for one Excel sheet -- skipping this year for .xlsx."
+      ))
+      skipped_years <- c(skipped_years, year)
+      next
+    }
+    # Backstop for when the cheap metadata-only check above wasn't
+    # available (older/different arrow build, or any error) -- still
+    # correct, just pays the full read cost this one time instead of
+    # skipping it outright.
     tbl <- tryCatch(arrow::read_parquet(local_pq, as_data_frame = FALSE), error = function(e) NULL)
     if (is.null(tbl)) next
     if (.exceeds_excel_cell_limit(tbl)) {
