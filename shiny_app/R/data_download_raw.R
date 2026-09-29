@@ -377,27 +377,32 @@ build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
     local_pq <- file.path(work_dir, nm)
     remote   <- paste0(sp_partition_folder(form_id), "/", nm)
     if (!sp_download_file(token, drive_id, remote, local_pq)) next
-    df <- tryCatch(as.data.frame(arrow::read_parquet(local_pq)), error = function(e) NULL)
-    if (is.null(df)) next
     year <- sub(paste0("^", form_id, "_([0-9]{4})\\.parquet$"), "\\1", nm)
-    # A wide form (many columns) can have a single year-partition that's
-    # comfortably under Excel's ROW limit but still enormous in total cell
-    # count -- discovered on form 4498 (629 cols): its 2023 partition alone
-    # is 252,306 rows x 629 cols = ~158.7 million cells, which took long
-    # enough to write (with either xlsx engine) to disconnect the Shiny
-    # session or OOM-kill the whole worker in production, and would have
-    # produced a file barely usable in Excel even had it finished. Skip
-    # that year's .xlsx rather than hang/crash -- CSV and Parquet (this
-    # same year-partition, just a different format) have no such ceiling.
-    if (.exceeds_excel_cell_limit(df)) {
+    # Read as an Arrow Table first (as_data_frame = FALSE) -- NOT yet a
+    # base R data.frame. A Table's row/col counts come straight off its
+    # schema/metadata, so checking the cell limit here is cheap even for a
+    # huge file. Converting an 800+-column, 400k+-row Table into a base R
+    # data.frame (as.data.frame()) is itself a slow, memory-heavy
+    # operation -- discovered in production on form 4498 (whose column
+    # count has since grown to 822): even after the xlsx-WRITE step was
+    # correctly being skipped for oversized years, the app still
+    # disconnected/OOM'd, because every year's Parquet -- oversized or not
+    # -- was still being fully materialized into a data.frame before the
+    # cell-count check ever ran. Checking on the Table first means an
+    # oversized year gets skipped before ever paying that conversion cost.
+    tbl <- tryCatch(arrow::read_parquet(local_pq, as_data_frame = FALSE), error = function(e) NULL)
+    if (is.null(tbl)) next
+    if (.exceeds_excel_cell_limit(tbl)) {
       progress(paste0(
-        form_id, "_", year, ": ", nrow(df), " rows x ", ncol(df), " cols (",
-        format(nrow(df) * ncol(df), big.mark = ","),
+        form_id, "_", year, ": ", nrow(tbl), " rows x ", ncol(tbl), " cols (",
+        format(as.numeric(nrow(tbl)) * ncol(tbl), big.mark = ","),
         " cells) is too large for one Excel sheet -- skipping this year for .xlsx."
       ))
       skipped_years <- c(skipped_years, year)
       next
     }
+    df <- tryCatch(as.data.frame(tbl), error = function(e) NULL)
+    if (is.null(df)) next
     progress(paste0("Writing ", form_id, "_", year, ".xlsx (", nrow(df), " rows)..."))
     xlsx_local <- file.path(work_dir, paste0(form_id, "_", year, ".xlsx"))
     if (.write_xlsx_or_na(df, xlsx_local, progress)) xlsx_paths <- c(xlsx_paths, xlsx_local)
