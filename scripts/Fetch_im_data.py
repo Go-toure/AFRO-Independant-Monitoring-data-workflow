@@ -324,9 +324,18 @@ SP_RAW_FOLDER = "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/raw_st
 # docstring for the full reasoning and why this is scoped to just these
 # files rather than a library-wide setting change (other folders in the
 # same library are updated independently by other people for unrelated
-# work). 2 keeps one rollback step available (today's + yesterday's
-# content) without letting years of daily/incremental runs pile up.
-SP_RAW_VERSIONS_TO_KEEP = 2
+# work).
+#
+# Set to 1 on 2026-09-30: the pipeline has been running reliably and the
+# data it pushes is already trusted/correct, so a large rollback buffer
+# isn't needed -- but keeping exactly one historical version still leaves
+# one step back (the previous upload's content) if a run ever pushes bad
+# data, at effectively the same storage cost as keeping none (one extra
+# copy per file, not an unbounded pile of them). The file's own live
+# content is never touched by this either way -- see
+# prune_old_versions()'s docstring -- only older historical versions are
+# removed.
+SP_RAW_VERSIONS_TO_KEEP = 1
 
 _sp_session = {"tried": False, "token": None, "drive_id": None, "folder_ready": False}
 
