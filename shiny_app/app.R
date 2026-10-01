@@ -447,35 +447,38 @@ ui <- page_navbar(
         # especially on a tab that isn't the one active at page load).
         # A plain .row/.col-* pair is the same layout every other
         # side-by-side filter row in this app already uses successfully.
+        # All five filters share one row -- `col-md` with no number gives
+        # Bootstrap's equal-width flex columns, so they split the row evenly
+        # regardless of count, rather than needing fractions that divide the
+        # 12-column grid cleanly. Still stacks to one-per-line below `md`.
         div(class="row gx-3 gy-2 mb-3",
-          div(class="col-12 col-md-4",
+          div(class="col-12 col-md",
             selectInput("dl_raw_form_id", "Form ID", choices = NULL, width = "100%")),
-          div(class="col-12 col-md-4",
+          div(class="col-12 col-md",
             # Repopulated reactively (server-side) with that form's actual
             # partition years the moment a Form ID is picked -- see the
             # observeEvent(input$dl_raw_form_id, ...) block below. Stays at
             # "All years" for a form that isn't year-partitioned, since
             # there's only ever one combined file for those anyway.
             selectInput("dl_raw_year", "Year", choices = c("All years" = ""), width = "100%")),
-          div(class="col-12 col-md-4",
+          div(class="col-12 col-md",
             selectInput("dl_raw_format", "Format",
                         c("CSV" = "csv", "Excel (.xlsx)" = "xlsx",
                           "R data (.rds)" = "rds", "Parquet" = "parquet"),
-                        width = "100%"))
-        ),
-        # Response / Round Number: unlike Year, there's no cheap pre-existing
-        # file listing to populate a dropdown from (no form keeps a separate
-        # file per Response value or per round) -- these are always read out
-        # of whichever combined/year data gets loaded and matched
-        # case-insensitively (R/data_download_raw.R's .filter_df_by_field()),
-        # so a plain optional text box is the right widget here, not a
-        # selectize that would need an expensive eager data read just to
-        # populate its own suggestion list.
-        div(class="row gx-3 gy-2 mb-3",
-          div(class="col-12 col-md-6",
+                        width = "100%")),
+          # Response / Round Number: unlike Year, there's no cheap
+          # pre-existing file listing to populate a dropdown from (no form
+          # keeps a separate file per Response value or per round) -- these
+          # are always read out of whichever combined/year data gets loaded
+          # and matched case-insensitively
+          # (R/data_download_raw.R's .filter_df_by_field()), so a plain
+          # optional text box is the right widget here, not a selectize
+          # that would need an expensive eager data read just to populate
+          # its own suggestion list.
+          div(class="col-12 col-md",
             textInput("dl_raw_response", "Response (optional)", value = "",
                       placeholder = "e.g. Yes — leave blank for all", width = "100%")),
-          div(class="col-12 col-md-6",
+          div(class="col-12 col-md",
             textInput("dl_raw_round", "Round Number (optional)", value = "",
                       placeholder = "e.g. 3 — leave blank for all", width = "100%"))
         ),
