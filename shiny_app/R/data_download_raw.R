@@ -261,16 +261,155 @@ RAW_DL_ZIP_FILE_SIZE_LIMIT <- 3 * 1024 * 1024 * 1024  # 3 GB
   zip_path
 }
 
-build_parquet_download <- function(token, drive_id, form_id, heavy, work_dir,
-                                    progress = function(detail) invisible(NULL), year = NULL) {
-  # A specific year was requested on a heavy (year-partitioned) form: the
-  # pipeline already keeps that year's own Parquet partition file, so this
-  # just fetches it directly -- no need to touch any other year, and no
-  # filtering/re-writing required since it's already exactly that year's
-  # data. Falls through to the combined-file path below for a non-heavy
-  # form even if a year was passed (nothing to partition there -- see
-  # list_partition_years()'s own comment).
+# Filters a combined data.frame down to just the rows whose _submission_time
+# falls in the requested calendar year -- this is what lets a NON-heavy form
+# (nothing pre-partitioned by year on SharePoint, unlike a "heavy" form) still
+# serve a single-year download: read the one combined file it already has,
+# then slice it down to just that year in memory, rather than needing a real
+# per-year file to exist up front. Used by every build_*_download()'s new
+# `year`-set-but-`!heavy` branch below.
+#
+# Returns:
+#   NULL         -> this form has no _submission_time column at all, so there
+#                    is nothing to filter by year (distinguished from the next
+#                    case so callers can give a clear, different message for
+#                    each -- "can't filter this form" vs. "filtered correctly,
+#                    but nothing matched").
+#   a data.frame -> possibly zero-row, when _submission_time exists but no row
+#                    actually falls in the requested year.
+.filter_df_by_year <- function(df, year) {
+  if (!"_submission_time" %in% names(df)) return(NULL)
+  years <- substr(as.character(df[["_submission_time"]]), 1, 4)
+  df[!is.na(years) & years == as.character(year), , drop = FALSE]
+}
+
+# Case-insensitive column lookup: returns the actual column name in df that
+# matches any of `candidates` (tried in order), or NULL if none do. Needed
+# because raw ONA/Kobo exports aren't guaranteed to use one exact casing for
+# a given field across every form -- the cleaned/processed dataset elsewhere
+# in this app uses lowercase "response"/"roundnumber" (see app.R's Overview
+# and Explorer tabs), while a raw export's own question names more often
+# follow the form's XLSForm casing (e.g. "Response", "roundNumber") -- so
+# every candidate spelling actually seen in this codebase is tried.
+.find_column_ci <- function(df, candidates) {
+  nm <- names(df)
+  for (cand in candidates) {
+    hit <- nm[tolower(nm) == tolower(cand)]
+    if (length(hit)) return(hit[1])
+  }
+  NULL
+}
+
+# Filters df down to rows whose value in whichever column matches
+# `candidates` (case-insensitively) equals `value` (also compared
+# case-insensitively, after trimming whitespace on both sides) -- the Response
+# and roundNumber filters both go through this one generic implementation.
+# NULL means "this form has no such column at all" (vs. a zero-row
+# data.frame, which means the column exists but nothing matched `value`).
+.filter_df_by_field <- function(df, candidates, value) {
+  col <- .find_column_ci(df, candidates)
+  if (is.null(col)) return(NULL)
+  vals   <- trimws(as.character(df[[col]]))
+  target <- tolower(trimws(as.character(value)))
+  df[!is.na(vals) & tolower(vals) == target, , drop = FALSE]
+}
+
+# Applies whichever of (year, response, round_number) are non-NULL to df, in
+# sequence, each with its own clear failure message when the column it needs
+# doesn't exist on this form, or when it exists but nothing matches. Used by
+# every build_*_download()'s "something needs to be read and filtered"
+# branch -- i.e. whenever a non-heavy form has ANY filter set, or ANY form
+# has Response/roundNumber set (year alone on a heavy form instead uses a
+# cheaper direct per-year-file fast path that never needs this, since the
+# pipeline already keeps that exact slice as its own file -- see
+# .load_base_df_for_filtering()).
+#
+# Returns list(df = <filtered data.frame>, error = NULL) on success, or
+# list(df = NULL, error = <message>) on failure -- callers only need to check
+# `error`.
+.apply_raw_filters <- function(df, form_id, year = NULL, response = NULL, round_number = NULL) {
+  if (!is.null(year)) {
+    sub <- .filter_df_by_year(df, year)
+    if (is.null(sub))
+      return(list(df = NULL, error = paste0(
+        "Form ", form_id, " has no _submission_time column to filter by year.")))
+    df <- sub
+    if (!nrow(df))
+      return(list(df = NULL, error = paste0("No data found for form ", form_id, ", year ", year, ".")))
+  }
+  if (!is.null(response)) {
+    sub <- .filter_df_by_field(df, c("Response", "response"), response)
+    if (is.null(sub))
+      return(list(df = NULL, error = paste0("Form ", form_id, " has no Response column to filter by.")))
+    df <- sub
+    if (!nrow(df))
+      return(list(df = NULL, error = paste0(
+        "No data found for form ", form_id, " with Response = \"", response, "\"",
+        if (!is.null(year)) paste0(" (year ", year, ")") else "", ".")))
+  }
+  if (!is.null(round_number)) {
+    sub <- .filter_df_by_field(df, c("roundNumber", "roundnumber", "round_number", "Round Number", "RoundNumber"), round_number)
+    if (is.null(sub))
+      return(list(df = NULL, error = paste0("Form ", form_id, " has no roundNumber column to filter by.")))
+    df <- sub
+    if (!nrow(df))
+      return(list(df = NULL, error = paste0(
+        "No data found for form ", form_id, " with roundNumber = \"", round_number, "\".")))
+  }
+  list(df = df, error = NULL)
+}
+
+# Loads whatever base data a filtered download should start from: a heavy
+# form's own single year-partition file when a year was given (so later
+# filters only ever look at that one year's data -- cheaper, and avoids
+# downloading/combining every other year for nothing), or the full dataset
+# otherwise (every year combined for a heavy form, or the one combined file
+# for a non-heavy form, both via fetch_form_dataframe()).
+.load_base_df_for_filtering <- function(token, drive_id, form_id, heavy, year, work_dir, progress) {
   if (!is.null(year) && heavy) {
+    nm     <- paste0(form_id, "_", year, ".parquet")
+    remote <- paste0(sp_partition_folder(form_id), "/", nm)
+    local  <- file.path(work_dir, nm)
+    progress(paste0("Downloading ", nm, "..."))
+    if (!sp_download_file(token, drive_id, remote, local))
+      return(list(df = NULL, message = paste0("No data found for form ", form_id, ", year ", year, ".")))
+    df <- tryCatch(as.data.frame(arrow::read_parquet(local)), error = function(e) NULL)
+    if (is.null(df)) return(list(df = NULL, message = paste0("Could not read ", nm, ".")))
+    return(list(df = df, message = NULL))
+  }
+  df <- fetch_form_dataframe(token, drive_id, form_id, heavy, work_dir, progress)
+  if (is.null(df))
+    return(list(df = NULL, message = paste0("Could not read data for form ", form_id, ".")))
+  list(df = df, message = NULL)
+}
+
+# A safe filename stem reflecting whichever of (year, response, round_number)
+# were actually requested, e.g. "4498_2024_Yes_r3" -- used for the single
+# filtered output file whenever any filter needed the data read/sliced
+# in-memory rather than handed back as one of the pipeline's own
+# already-partitioned files verbatim.
+.filtered_file_stem <- function(form_id, year = NULL, response = NULL, round_number = NULL) {
+  clean <- function(x) gsub("[^A-Za-z0-9]+", "", as.character(x))
+  parts <- c(as.character(form_id))
+  if (!is.null(year))         parts <- c(parts, clean(year))
+  if (!is.null(response))     parts <- c(parts, clean(response))
+  if (!is.null(round_number)) parts <- c(parts, paste0("r", clean(round_number)))
+  paste(parts, collapse = "_")
+}
+
+build_parquet_download <- function(token, drive_id, form_id, heavy, work_dir,
+                                    progress = function(detail) invisible(NULL),
+                                    year = NULL, response = NULL, round_number = NULL) {
+  any_extra <- !is.null(response) || !is.null(round_number)
+
+  # Fast path: a specific year on a heavy (year-partitioned) form, with no
+  # other filter set -- the pipeline already keeps that year's own Parquet
+  # partition file, so this just fetches it directly with no read/rewrite at
+  # all. Falls through for a non-heavy form even if a year was passed
+  # (nothing to partition there -- see list_partition_years()'s own comment),
+  # and falls through whenever Response/roundNumber are also requested, since
+  # those need the data actually read in before they can be checked.
+  if (!is.null(year) && heavy && !any_extra) {
     nm     <- paste0(form_id, "_", year, ".parquet")
     remote <- paste0(sp_partition_folder(form_id), "/", nm)
     local  <- file.path(work_dir, nm)
@@ -280,6 +419,30 @@ build_parquet_download <- function(token, drive_id, form_id, heavy, work_dir,
                   message = paste0("No data found for form ", form_id, ", year ", year, ".")))
     return(list(ok = TRUE, path = local, message = NULL))
   }
+
+  # Any filter at all that the fast path above couldn't handle: load the
+  # narrowest base data available (just this year's partition when heavy,
+  # otherwise everything), apply whichever of year/response/round_number
+  # were asked for, and write out a single filtered Parquet.
+  if (!is.null(year) || any_extra) {
+    base <- .load_base_df_for_filtering(token, drive_id, form_id, heavy, year, work_dir, progress)
+    if (is.null(base$df)) return(list(ok = FALSE, path = NULL, message = base$message))
+    # year is already baked into base$df when heavy (see
+    # .load_base_df_for_filtering) -- re-applying it there is harmless
+    # (every row already matches) but unnecessary, so skip it in that case.
+    year_to_apply <- if (!is.null(year) && heavy) NULL else year
+    filt <- .apply_raw_filters(base$df, form_id, year = year_to_apply, response = response, round_number = round_number)
+    if (is.null(filt$df)) return(list(ok = FALSE, path = NULL, message = filt$error))
+    stem <- .filtered_file_stem(form_id, year, response, round_number)
+    progress(paste0("Writing ", stem, ".parquet (", nrow(filt$df), " rows)..."))
+    out <- file.path(work_dir, paste0(stem, ".parquet"))
+    ok <- tryCatch({ arrow::write_parquet(filt$df, out); TRUE }, error = function(e) FALSE)
+    if (!ok)
+      return(list(ok = FALSE, path = NULL, message = paste0("Could not write ", stem, ".parquet.")))
+    return(list(ok = TRUE, path = out, message = NULL))
+  }
+
+  # No filters at all -- the original combined-file path, unchanged.
   progress(paste0("Downloading ", form_id, ".parquet..."))
   remote <- paste0(RAW_STATE_FOLDER, "/", form_id, ".parquet")
   local  <- file.path(work_dir, paste0(form_id, ".parquet"))
@@ -290,11 +453,15 @@ build_parquet_download <- function(token, drive_id, form_id, heavy, work_dir,
 }
 
 build_csv_download <- function(token, drive_id, form_id, heavy, work_dir,
-                                progress = function(detail) invisible(NULL), year = NULL) {
-  # A specific year on a heavy form: fetch just that year's own CSV
-  # directly -- returned as a plain .csv, not a zip, since there's only
-  # ever one file involved. No need to list/download/zip every other year.
-  if (!is.null(year) && heavy) {
+                                progress = function(detail) invisible(NULL),
+                                year = NULL, response = NULL, round_number = NULL) {
+  any_extra <- !is.null(response) || !is.null(round_number)
+
+  # Fast path: a specific year on a heavy form, no other filter -- fetch just
+  # that year's own CSV directly, returned as a plain .csv (not a zip), since
+  # there's only ever one file involved. No need to list/download every other
+  # year. Falls through whenever Response/roundNumber are also requested.
+  if (!is.null(year) && heavy && !any_extra) {
     nm     <- paste0(form_id, "_", year, ".csv")
     remote <- paste0(RAW_STATE_FOLDER, "/", nm)
     local  <- file.path(work_dir, nm)
@@ -304,6 +471,26 @@ build_csv_download <- function(token, drive_id, form_id, heavy, work_dir,
                   message = paste0("No CSV found for form ", form_id, ", year ", year, ".")))
     return(list(ok = TRUE, path = local, message = NULL))
   }
+
+  # Any filter the fast path above couldn't handle: load the narrowest base
+  # data available via the same Parquet-backed helper the other formats use
+  # (reading from Parquet rather than CSV here avoids any risk of column-name
+  # mangling on fields like "_submission_time"), filter, write a single CSV.
+  if (!is.null(year) || any_extra) {
+    base <- .load_base_df_for_filtering(token, drive_id, form_id, heavy, year, work_dir, progress)
+    if (is.null(base$df)) return(list(ok = FALSE, path = NULL, message = base$message))
+    year_to_apply <- if (!is.null(year) && heavy) NULL else year
+    filt <- .apply_raw_filters(base$df, form_id, year = year_to_apply, response = response, round_number = round_number)
+    if (is.null(filt$df)) return(list(ok = FALSE, path = NULL, message = filt$error))
+    stem <- .filtered_file_stem(form_id, year, response, round_number)
+    progress(paste0("Writing ", stem, ".csv (", nrow(filt$df), " rows)..."))
+    out <- file.path(work_dir, paste0(stem, ".csv"))
+    ok <- tryCatch({ readr::write_csv(filt$df, out); TRUE }, error = function(e) FALSE)
+    if (!ok)
+      return(list(ok = FALSE, path = NULL, message = paste0("Could not write ", stem, ".csv.")))
+    return(list(ok = TRUE, path = out, message = NULL))
+  }
+
   if (!heavy) {
     progress(paste0("Downloading ", form_id, ".csv..."))
     remote <- paste0(RAW_STATE_FOLDER, "/", form_id, ".csv")
@@ -488,14 +675,19 @@ build_xlsx_year_partitions_from_df <- function(df, form_id, work_dir,
 }
 
 build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
-                                 progress = function(detail) invisible(NULL), year = NULL) {
-  # A specific year requested on a heavy form: build just that one year's
-  # .xlsx and return it directly (no zip -- there's only ever one file).
-  # If that particular year is itself too large for Excel, this fails with
-  # a clear message naming CSV/Parquet as the alternative for THIS year,
-  # rather than the all-years "note" below (there's nothing else in this
-  # download to fall back on, unlike the all-years case).
-  if (!is.null(year) && heavy) {
+                                 progress = function(detail) invisible(NULL),
+                                 year = NULL, response = NULL, round_number = NULL) {
+  any_extra <- !is.null(response) || !is.null(round_number)
+
+  # Fast path: a specific year requested on a heavy form, no other filter --
+  # build just that one year's .xlsx and return it directly (no zip -- only
+  # ever one file). If that particular year is itself too large for Excel,
+  # this fails with a clear message naming CSV/Parquet as the alternative for
+  # THIS year, rather than the all-years "note" below (there's nothing else
+  # in this download to fall back on, unlike the all-years case). Falls
+  # through whenever Response/roundNumber are also requested, since those
+  # need the data actually read in before they can be checked.
+  if (!is.null(year) && heavy && !any_extra) {
     r <- .build_one_year_xlsx(token, drive_id, form_id, year, work_dir, progress)
     if (isTRUE(r$ok)) return(list(ok = TRUE, path = r$path, message = NULL))
     if (isTRUE(r$skipped))
@@ -503,6 +695,34 @@ build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
                   message = paste0(r$message, " Try CSV or Parquet for this year instead.")))
     return(list(ok = FALSE, path = NULL, message = r$message))
   }
+
+  # Any filter the fast path above couldn't handle (a year on a non-heavy
+  # form, or Response/roundNumber on any form): load the narrowest base data
+  # available, filter, and THEN check Excel's row/cell limits -- a single
+  # year or Response/round slice could still in principle be too large for
+  # one sheet on a wide form, so this still needs the same check the
+  # all-years loop below uses, just against the already-filtered data.
+  if (!is.null(year) || any_extra) {
+    base <- .load_base_df_for_filtering(token, drive_id, form_id, heavy, year, work_dir, progress)
+    if (is.null(base$df)) return(list(ok = FALSE, path = NULL, message = base$message))
+    year_to_apply <- if (!is.null(year) && heavy) NULL else year
+    filt <- .apply_raw_filters(base$df, form_id, year = year_to_apply, response = response, round_number = round_number)
+    if (is.null(filt$df)) return(list(ok = FALSE, path = NULL, message = filt$error))
+    df   <- filt$df
+    stem <- .filtered_file_stem(form_id, year, response, round_number)
+    if (nrow(df) > RAW_DL_EXCEL_ROW_LIMIT || .exceeds_excel_cell_limit(df))
+      return(list(ok = FALSE, path = NULL,
+                  message = paste0(
+                    stem, ": ", nrow(df), " rows x ", ncol(df), " cols (",
+                    format(as.numeric(nrow(df)) * ncol(df), big.mark = ","),
+                    " cells) is too large for one Excel sheet. Try CSV or Parquet for this selection instead.")))
+    progress(paste0("Writing ", stem, ".xlsx (", nrow(df), " rows)..."))
+    out <- file.path(work_dir, paste0(stem, ".xlsx"))
+    if (!.write_xlsx_or_na(df, out, progress))
+      return(list(ok = FALSE, path = NULL, message = paste0("Could not write ", stem, ".xlsx.")))
+    return(list(ok = TRUE, path = out, message = NULL))
+  }
+
   if (!heavy) {
     df <- fetch_form_dataframe(token, drive_id, form_id, FALSE, work_dir, progress)
     if (is.null(df))
@@ -567,12 +787,15 @@ build_xlsx_download <- function(token, drive_id, form_id, heavy, work_dir,
 }
 
 build_rds_download <- function(token, drive_id, form_id, heavy, work_dir,
-                                progress = function(detail) invisible(NULL), year = NULL) {
-  # A specific year on a heavy form: read just that one year's own
-  # partition and save it directly -- skips fetch_form_dataframe()'s
-  # download-every-year-then-bind_rows() path entirely, since only one
-  # year's data is wanted here.
-  if (!is.null(year) && heavy) {
+                                progress = function(detail) invisible(NULL),
+                                year = NULL, response = NULL, round_number = NULL) {
+  any_extra <- !is.null(response) || !is.null(round_number)
+
+  # Fast path: a specific year on a heavy form, no other filter -- read just
+  # that one year's own partition and save it directly, skipping
+  # fetch_form_dataframe()'s download-every-year-then-bind_rows() path
+  # entirely. Falls through whenever Response/roundNumber are also requested.
+  if (!is.null(year) && heavy && !any_extra) {
     nm     <- paste0(form_id, "_", year, ".parquet")
     remote <- paste0(sp_partition_folder(form_id), "/", nm)
     local_pq <- file.path(work_dir, nm)
@@ -590,6 +813,23 @@ build_rds_download <- function(token, drive_id, form_id, heavy, work_dir,
       return(list(ok = FALSE, path = NULL, message = paste0("Could not write ", form_id, "_", year, ".rds.")))
     return(list(ok = TRUE, path = out, message = NULL))
   }
+
+  # Any filter the fast path above couldn't handle.
+  if (!is.null(year) || any_extra) {
+    base <- .load_base_df_for_filtering(token, drive_id, form_id, heavy, year, work_dir, progress)
+    if (is.null(base$df)) return(list(ok = FALSE, path = NULL, message = base$message))
+    year_to_apply <- if (!is.null(year) && heavy) NULL else year
+    filt <- .apply_raw_filters(base$df, form_id, year = year_to_apply, response = response, round_number = round_number)
+    if (is.null(filt$df)) return(list(ok = FALSE, path = NULL, message = filt$error))
+    stem <- .filtered_file_stem(form_id, year, response, round_number)
+    progress(paste0("Writing ", stem, ".rds (", nrow(filt$df), " rows)..."))
+    out <- file.path(work_dir, paste0(stem, ".rds"))
+    ok <- tryCatch({ saveRDS(filt$df, out); TRUE }, error = function(e) FALSE)
+    if (!ok)
+      return(list(ok = FALSE, path = NULL, message = paste0("Could not write ", stem, ".rds.")))
+    return(list(ok = TRUE, path = out, message = NULL))
+  }
+
   df <- fetch_form_dataframe(token, drive_id, form_id, heavy, work_dir, progress)
   if (is.null(df))
     return(list(ok = FALSE, path = NULL, message = paste0("Could not read data for form ", form_id, ".")))
@@ -615,14 +855,31 @@ build_rds_download <- function(token, drive_id, form_id, heavy, work_dir,
 # treatment earlier this project.
 #
 # `year`: optional, e.g. "2024" -- when set on a heavy (year-partitioned)
-# form, fetches/builds only that one year's data instead of every year, and
-# returns a single plain file (never a zip, since there's only one file
-# involved). Ignored on a non-heavy form (nothing to partition there is
-# nothing lost by ignoring it -- see list_partition_years()'s own comment),
-# so it's always safe to pass through unconditionally from the UI.
-build_form_download <- function(form_id, format, progress = function(detail) invisible(NULL), year = NULL) {
+# form with no other filter, fetches/builds only that one year's data via the
+# cheapest direct-file-copy path instead of every year. When set on a
+# non-heavy form, or combined with `response`/`round_number` on any form, the
+# data is read in and sliced down to match instead (see
+# .load_base_df_for_filtering()/.apply_raw_filters()) -- there's no real
+# per-year, per-Response, or per-round file sitting on SharePoint to fetch
+# directly in those cases. Any of the three always returns a single plain
+# file (never a zip, since there's only ever one result once filtered).
+#
+# `response`: optional, e.g. "Yes" -- filters to rows whose Response column
+# (matched case-insensitively) equals this value (also compared
+# case-insensitively). Gives a clear failure if the form has no such column.
+#
+# `round_number`: optional, e.g. "3" -- same idea, for the roundNumber
+# column.
+build_form_download <- function(form_id, format, progress = function(detail) invisible(NULL),
+                                 year = NULL, response = NULL, round_number = NULL) {
   form_id <- as.character(form_id)
-  if (!is.null(year)) year <- as.character(year)
+  # An empty string (a blank/untouched text input from the UI) means "no
+  # filter", same as NULL -- normalize both to NULL once, here, so none of
+  # the build_*_download() functions or helpers above need to re-check this.
+  .nz <- function(x) if (is.null(x) || !nzchar(trimws(as.character(x)))) NULL else as.character(x)
+  year         <- .nz(year)
+  response     <- .nz(response)
+  round_number <- .nz(round_number)
 
   if (!sharepoint_credentials_available())
     return(list(ok = FALSE, path = NULL, message = "SharePoint credentials are not configured."))
@@ -648,10 +905,10 @@ build_form_download <- function(form_id, format, progress = function(detail) inv
 
   result <- tryCatch({
     switch(format,
-      parquet = build_parquet_download(token, drive_id, form_id, heavy, work_dir, progress, year),
-      csv     = build_csv_download(token, drive_id, form_id, heavy, work_dir, progress, year),
-      xlsx    = build_xlsx_download(token, drive_id, form_id, heavy, work_dir, progress, year),
-      rds     = build_rds_download(token, drive_id, form_id, heavy, work_dir, progress, year),
+      parquet = build_parquet_download(token, drive_id, form_id, heavy, work_dir, progress, year, response, round_number),
+      csv     = build_csv_download(token, drive_id, form_id, heavy, work_dir, progress, year, response, round_number),
+      xlsx    = build_xlsx_download(token, drive_id, form_id, heavy, work_dir, progress, year, response, round_number),
+      rds     = build_rds_download(token, drive_id, form_id, heavy, work_dir, progress, year, response, round_number),
       list(ok = FALSE, path = NULL, message = paste0("Unsupported format: ", format))
     )
   }, error = function(e) list(ok = FALSE, path = NULL, message = conditionMessage(e)))

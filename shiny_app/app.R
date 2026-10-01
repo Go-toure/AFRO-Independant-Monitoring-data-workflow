@@ -439,7 +439,7 @@ ui <- page_navbar(
       card_body(
         div(class="info-banner mb-3",
           tags$b("Source:"), tags$code("raw_state"),
-          " — pulls a form's raw data directly from SharePoint. Forms too large for one Excel sheet are automatically split into one file per year (zipped). Pick a specific Year to fetch just that year instead of every year for the form."),
+          " — pulls a form's raw data directly from SharePoint. Forms too large for one Excel sheet are automatically split into one file per year (zipped). Pick a specific Year, Response, and/or Round Number to narrow the download down to just that slice instead of every record for the form — any of the three can be combined, and setting any of them always returns a single file (never a zip)."),
         # Plain Bootstrap row/col (flexbox), not bslib's layout_columns()
         # (CSS Grid) -- two selectize widgets side by side inside a
         # layout_columns() grid cell were overlapping/overflowing their
@@ -462,6 +462,22 @@ ui <- page_navbar(
                         c("CSV" = "csv", "Excel (.xlsx)" = "xlsx",
                           "R data (.rds)" = "rds", "Parquet" = "parquet"),
                         width = "100%"))
+        ),
+        # Response / Round Number: unlike Year, there's no cheap pre-existing
+        # file listing to populate a dropdown from (no form keeps a separate
+        # file per Response value or per round) -- these are always read out
+        # of whichever combined/year data gets loaded and matched
+        # case-insensitively (R/data_download_raw.R's .filter_df_by_field()),
+        # so a plain optional text box is the right widget here, not a
+        # selectize that would need an expensive eager data read just to
+        # populate its own suggestion list.
+        div(class="row gx-3 gy-2 mb-3",
+          div(class="col-12 col-md-6",
+            textInput("dl_raw_response", "Response (optional)", value = "",
+                      placeholder = "e.g. Yes — leave blank for all", width = "100%")),
+          div(class="col-12 col-md-6",
+            textInput("dl_raw_round", "Round Number (optional)", value = "",
+                      placeholder = "e.g. 3 — leave blank for all", width = "100%"))
         ),
         div(class="d-grid",
           downloadButton("dl_raw_form", hdr_icon("download", "Download"), class="btn-outline-primary")),
@@ -2991,14 +3007,22 @@ server <- function(input, output, session) {
 
   output$dl_raw_form <- downloadHandler(
     filename = function() {
-      form_id <- input$dl_raw_form_id
-      fmt     <- input$dl_raw_format
-      year    <- input$dl_raw_year
-      ext     <- switch(fmt, parquet = "parquet", xlsx = "xlsx", rds = "rds", "csv")
+      form_id  <- input$dl_raw_form_id
+      fmt      <- input$dl_raw_format
+      year     <- input$dl_raw_year
+      response <- input$dl_raw_response
+      round_nb <- input$dl_raw_round
+      ext      <- switch(fmt, parquet = "parquet", xlsx = "xlsx", rds = "rds", "csv")
       req(form_id, fmt)
-      # A specific year is always exactly one file -- never a zip, no need
-      # to check whether the form is "heavy" at all.
-      if (!is.null(year) && nzchar(year)) return(paste0(form_id, "_", year, ".", ext))
+      year_arg     <- if (!is.null(year) && nzchar(year)) year else NULL
+      response_arg <- if (!is.null(response) && nzchar(trimws(response))) trimws(response) else NULL
+      round_arg    <- if (!is.null(round_nb) && nzchar(trimws(round_nb))) trimws(round_nb) else NULL
+      # Any of year/Response/roundNumber being set always means exactly one
+      # resulting file -- never a zip, no need to check whether the form is
+      # "heavy" at all -- since each of those filters narrows down to at
+      # most one matching slice, not "one file per year".
+      if (!is.null(year_arg) || !is.null(response_arg) || !is.null(round_arg))
+        return(paste0(.filtered_file_stem(form_id, year_arg, response_arg, round_arg), ".", ext))
       multi <- tryCatch({
         if (!sharepoint_credentials_available()) {
           FALSE
@@ -3012,12 +3036,16 @@ server <- function(input, output, session) {
       if (isTRUE(multi)) paste0(form_id, "_", fmt, "_by_year.zip") else paste0(form_id, ".", ext)
     },
     content = function(file) {
-      form_id <- input$dl_raw_form_id
-      fmt     <- input$dl_raw_format
-      year    <- input$dl_raw_year
+      form_id  <- input$dl_raw_form_id
+      fmt      <- input$dl_raw_format
+      year     <- input$dl_raw_year
+      response <- input$dl_raw_response
+      round_nb <- input$dl_raw_round
       req(form_id, fmt)
       rv_dl_raw_msg(NULL)
-      year_arg <- if (!is.null(year) && nzchar(year)) year else NULL
+      year_arg     <- if (!is.null(year) && nzchar(year)) year else NULL
+      response_arg <- if (!is.null(response) && nzchar(trimws(response))) trimws(response) else NULL
+      round_arg    <- if (!is.null(round_nb) && nzchar(trimws(round_nb))) trimws(round_nb) else NULL
 
       # A heavy-form download can mean several sequential SharePoint
       # round-trips (one per year partition) plus a zip step -- with
@@ -3031,7 +3059,9 @@ server <- function(input, output, session) {
       # the browser immediately, unlike a plain reactive output, which
       # would only flush once this whole content() call returns.
       session$sendCustomMessage("dlRawLogClear", list())
-      dl_label <- if (!is.null(year_arg)) paste0(form_id, "_", year_arg, ".", fmt) else paste0(form_id, ".", fmt)
+      dl_label <- if (!is.null(year_arg) || !is.null(response_arg) || !is.null(round_arg))
+        paste0(.filtered_file_stem(form_id, year_arg, response_arg, round_arg), ".", fmt)
+      else paste0(form_id, ".", fmt)
       withProgress(message = paste0("Building ", dl_label, " download..."), value = 0, {
         progress_cb <- function(detail) {
           incProgress(amount = 1 / 12, detail = detail)
@@ -3039,7 +3069,8 @@ server <- function(input, output, session) {
             text = paste0("[", format(Sys.time(), "%H:%M:%S"), "] ", detail)
           ))
         }
-        res <- build_form_download(form_id, fmt, progress = progress_cb, year = year_arg)
+        res <- build_form_download(form_id, fmt, progress = progress_cb,
+                                    year = year_arg, response = response_arg, round_number = round_arg)
       })
 
       if (!isTRUE(res$ok)) {
