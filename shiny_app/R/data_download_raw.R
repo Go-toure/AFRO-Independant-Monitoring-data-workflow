@@ -209,25 +209,54 @@ list_partition_years <- function(form_id) {
 # .parquet_dims_cheap()'s own comment on what IS and ISN'T cheap about a
 # Parquet read) -- and the distinct years actually present are derived
 # from it.
-list_available_years <- function(form_id) {
-  if (!sharepoint_credentials_available()) return(character(0))
+# `progress` is the same optional `function(detail)` callback every
+# build_*_download() below already takes (see fetch_form_dataframe()'s own
+# comment) -- wired up in app.R's renderUI() for the "Year" dropdown to the
+# same visible #dl_raw_log_pre console the actual download build already
+# narrates, so switching Year/Form ID shows what this lookup is actually
+# doing (which file(s) it's reading, how many years it found) rather than
+# happening silently. Defaults to a no-op so this stays callable exactly as
+# before from a script, the R console, or a test that doesn't care about
+# progress reporting.
+list_available_years <- function(form_id, progress = function(detail) invisible(NULL)) {
+  if (!sharepoint_credentials_available()) {
+    progress("SharePoint credentials are not configured -- cannot look up years.")
+    return(character(0))
+  }
   tryCatch({
+    progress(paste0("Looking up available years for form ", form_id, "..."))
     token    <- sp_get_graph_token()
     drive_id <- sp_resolve_drive_id(token)
     if (form_is_partitioned(token, drive_id, form_id)) {
+      progress(paste0("Form ", form_id, " is year-partitioned -- reading its partition file list..."))
       files <- .partition_year_files(token, drive_id, form_id)
-      return(sort(sub(paste0("^", form_id, "_([0-9]{4})\\.parquet$"), "\\1", files)))
+      years <- sort(sub(paste0("^", form_id, "_([0-9]{4})\\.parquet$"), "\\1", files))
+      progress(paste0("Found ", length(years), " year(s)",
+                       if (length(years)) paste0(": ", paste(years, collapse = ", ")) else "", "."))
+      return(years)
     }
+    progress(paste0("Form ", form_id, " is not partitioned -- downloading its combined file to read actual years..."))
     remote <- paste0(RAW_STATE_FOLDER, "/", form_id, ".parquet")
     local  <- file.path(tempdir(), paste0(".years_probe_", form_id, "_", as.integer(Sys.time()), ".parquet"))
     on.exit(unlink(local), add = TRUE)
-    if (!sp_download_file(token, drive_id, remote, local)) return(character(0))
+    if (!sp_download_file(token, drive_id, remote, local)) {
+      progress(paste0("Could not download ", form_id, ".parquet -- no years to show."))
+      return(character(0))
+    }
+    progress("Reading the _submission_time column...")
     tbl <- arrow::read_parquet(local, col_select = "_submission_time", as_data_frame = TRUE)
-    if (!"_submission_time" %in% names(tbl)) return(character(0))
+    if (!"_submission_time" %in% names(tbl)) {
+      progress(paste0("Form ", form_id, " has no _submission_time column -- no years to show."))
+      return(character(0))
+    }
     years <- substr(as.character(tbl[["_submission_time"]]), 1, 4)
     years <- years[!is.na(years) & grepl("^[0-9]{4}$", years)]
-    sort(unique(years))
+    years <- sort(unique(years))
+    progress(paste0("Found ", length(years), " year(s)",
+                     if (length(years)) paste0(": ", paste(years, collapse = ", ")) else "", "."))
+    years
   }, error = function(e) {
+    progress(paste0("Year lookup failed: ", conditionMessage(e)))
     message("[download] list_available_years(", form_id, ") failed -- falling back to no pre-populated years: ",
             conditionMessage(e))
     character(0)
@@ -284,7 +313,8 @@ list_available_years <- function(form_id) {
 # never raises; callers (list_available_responses()/list_available_rounds())
 # are themselves already wrapped in their own tryCatch for anything this
 # doesn't already catch internally.
-.load_narrow_columns <- function(token, drive_id, form_id, heavy, year, cols) {
+.load_narrow_columns <- function(token, drive_id, form_id, heavy, year, cols,
+                                  progress = function(detail) invisible(NULL)) {
   needed <- unique(c(cols, if (!is.null(year)) "_submission_time" else NULL))
   if (heavy) {
     if (!is.null(year)) {
@@ -292,27 +322,43 @@ list_available_years <- function(form_id) {
       remote <- paste0(sp_partition_folder(form_id), "/", nm)
       local  <- file.path(tempdir(), paste0(".cols_probe_", form_id, "_", year, "_", as.integer(Sys.time()), ".parquet"))
       on.exit(unlink(local), add = TRUE)
-      if (!sp_download_file(token, drive_id, remote, local)) return(NULL)
+      progress(paste0("Downloading ", nm, "..."))
+      if (!sp_download_file(token, drive_id, remote, local)) {
+        progress(paste0("Could not download ", nm, "."))
+        return(NULL)
+      }
       return(.read_parquet_cols(local, needed))
     }
     year_files <- .partition_year_files(token, drive_id, form_id)
-    if (!length(year_files)) return(NULL)
+    if (!length(year_files)) {
+      progress(paste0("Form ", form_id, " has no year partitions."))
+      return(NULL)
+    }
     frames <- list()
     for (nm in year_files) {
       local  <- file.path(tempdir(), paste0(".cols_probe_", form_id, "_", nm, "_", as.integer(Sys.time()), ".parquet"))
       remote <- paste0(sp_partition_folder(form_id), "/", nm)
+      progress(paste0("Downloading ", nm, "..."))
       if (!sp_download_file(token, drive_id, remote, local)) next
       df <- .read_parquet_cols(local, needed)
       unlink(local)
       if (!is.null(df)) frames[[nm]] <- df
     }
-    if (!length(frames)) return(NULL)
+    if (!length(frames)) {
+      progress("Could not read any year partition.")
+      return(NULL)
+    }
+    progress(paste0("Combining ", length(frames), " year(s) of data..."))
     return(dplyr::bind_rows(frames))
   }
   remote <- paste0(RAW_STATE_FOLDER, "/", form_id, ".parquet")
   local  <- file.path(tempdir(), paste0(".cols_probe_", form_id, "_", as.integer(Sys.time()), ".parquet"))
   on.exit(unlink(local), add = TRUE)
-  if (!sp_download_file(token, drive_id, remote, local)) return(NULL)
+  progress(paste0("Downloading ", form_id, ".parquet..."))
+  if (!sp_download_file(token, drive_id, remote, local)) {
+    progress(paste0("Could not download ", form_id, ".parquet."))
+    return(NULL)
+  }
   .read_parquet_cols(local, needed)
 }
 
@@ -341,23 +387,46 @@ list_available_years <- function(form_id) {
 # no Response column, nothing matched, ...), with a log line only when the
 # lookup itself genuinely failed (same distinction list_partition_years()'s
 # own comment explains).
-list_available_responses <- function(form_id, year = NULL) {
-  if (!sharepoint_credentials_available()) return(character(0))
+# `progress`: same optional `function(detail)` callback as
+# list_available_years() above -- wired up in app.R's renderUI() for the
+# "Response" dropdown to the same visible #dl_raw_log_pre console, so
+# narrowing by Year (or just switching Form ID) shows what this lookup
+# actually read and how many rows survived each filtering step.
+list_available_responses <- function(form_id, year = NULL, progress = function(detail) invisible(NULL)) {
+  if (!sharepoint_credentials_available()) {
+    progress("SharePoint credentials are not configured -- cannot look up Response values.")
+    return(character(0))
+  }
   year <- if (!is.null(year) && nzchar(year) && year != "__ALL__") year else NULL
   tryCatch({
+    progress(paste0("Looking up Response values for form ", form_id,
+                     if (!is.null(year)) paste0(" (year ", year, ")") else " (all years)", "..."))
     token    <- sp_get_graph_token()
     drive_id <- sp_resolve_drive_id(token)
     heavy    <- form_is_partitioned(token, drive_id, form_id)
-    df <- .load_narrow_columns(token, drive_id, form_id, heavy, year, c("Response", "response"))
-    if (is.null(df)) return(character(0))
+    df <- .load_narrow_columns(token, drive_id, form_id, heavy, year, c("Response", "response"), progress)
+    if (is.null(df)) {
+      progress("No data available -- Response dropdown left at \"All\".")
+      return(character(0))
+    }
     if (!is.null(year)) {
       sub <- .filter_df_by_year(df, year)
-      if (!is.null(sub)) df <- sub
+      if (!is.null(sub)) {
+        df <- sub
+        progress(paste0("Narrowed to ", nrow(df), " row(s) for year ", year, "."))
+      }
     }
     col <- .find_column_ci(df, c("Response", "response"))
-    if (is.null(col)) return(character(0))
-    .sort_distinct_values(trimws(as.character(df[[col]])))
+    if (is.null(col)) {
+      progress(paste0("Form ", form_id, " has no Response column."))
+      return(character(0))
+    }
+    vals <- .sort_distinct_values(trimws(as.character(df[[col]])))
+    suffix <- if (length(vals) && length(vals) <= 15) paste0(": ", paste(vals, collapse = ", ")) else "."
+    progress(paste0("Found ", length(vals), " distinct Response value(s)", suffix))
+    vals
   }, error = function(e) {
+    progress(paste0("Response lookup failed: ", conditionMessage(e)))
     message("[download] list_available_responses(", form_id, ") failed -- falling back to no pre-populated responses: ",
             conditionMessage(e))
     character(0)
@@ -371,31 +440,63 @@ list_available_responses <- function(form_id, year = NULL) {
 # `year`/`response` of NULL, "", or the UI's "__ALL__" sentinel all mean "no
 # filter at that level," same convention as list_available_responses().
 # Never raises; character(0) on any failure, same logging convention.
-list_available_rounds <- function(form_id, year = NULL, response = NULL) {
-  if (!sharepoint_credentials_available()) return(character(0))
+# `progress`: same optional `function(detail)` callback as
+# list_available_years()/list_available_responses() above -- wired up in
+# app.R's renderUI() for the "Round Number" dropdown to the same visible
+# #dl_raw_log_pre console, so narrowing by Year and/or Response shows what
+# this lookup actually read and how many rows survived each step.
+list_available_rounds <- function(form_id, year = NULL, response = NULL,
+                                   progress = function(detail) invisible(NULL)) {
+  if (!sharepoint_credentials_available()) {
+    progress("SharePoint credentials are not configured -- cannot look up Round Number values.")
+    return(character(0))
+  }
   year     <- if (!is.null(year) && nzchar(year) && year != "__ALL__") year else NULL
   response <- if (!is.null(response) && nzchar(trimws(response)) && trimws(response) != "__ALL__") trimws(response) else NULL
   tryCatch({
+    progress(paste0(
+      "Looking up Round Number values for form ", form_id,
+      if (!is.null(year)) paste0(", year ", year) else "",
+      if (!is.null(response)) paste0(", Response = \"", response, "\"") else "",
+      "..."
+    ))
     token    <- sp_get_graph_token()
     drive_id <- sp_resolve_drive_id(token)
     heavy    <- form_is_partitioned(token, drive_id, form_id)
     cols <- c("roundNumber", "roundnumber", "round_number", "Round Number", "RoundNumber")
     if (!is.null(response)) cols <- c(cols, "Response", "response")
-    df <- .load_narrow_columns(token, drive_id, form_id, heavy, year, cols)
-    if (is.null(df)) return(character(0))
+    df <- .load_narrow_columns(token, drive_id, form_id, heavy, year, cols, progress)
+    if (is.null(df)) {
+      progress("No data available -- Round Number dropdown left at \"All\".")
+      return(character(0))
+    }
     if (!is.null(year)) {
       sub <- .filter_df_by_year(df, year)
-      if (!is.null(sub)) df <- sub
+      if (!is.null(sub)) {
+        df <- sub
+        progress(paste0("Narrowed to ", nrow(df), " row(s) for year ", year, "."))
+      }
     }
     if (!is.null(response)) {
       sub <- .filter_df_by_field(df, c("Response", "response"), response)
-      if (is.null(sub)) return(character(0))
+      if (is.null(sub)) {
+        progress(paste0("Form ", form_id, " has no Response column to narrow by."))
+        return(character(0))
+      }
       df <- sub
+      progress(paste0("Narrowed to ", nrow(df), " row(s) for Response = \"", response, "\"."))
     }
     col <- .find_column_ci(df, c("roundNumber", "roundnumber", "round_number", "Round Number", "RoundNumber"))
-    if (is.null(col)) return(character(0))
-    .sort_distinct_values(trimws(as.character(df[[col]])))
+    if (is.null(col)) {
+      progress(paste0("Form ", form_id, " has no Round Number column."))
+      return(character(0))
+    }
+    vals <- .sort_distinct_values(trimws(as.character(df[[col]])))
+    suffix <- if (length(vals) && length(vals) <= 15) paste0(": ", paste(vals, collapse = ", ")) else "."
+    progress(paste0("Found ", length(vals), " distinct Round Number value(s)", suffix))
+    vals
   }, error = function(e) {
+    progress(paste0("Round Number lookup failed: ", conditionMessage(e)))
     message("[download] list_available_rounds(", form_id, ") failed -- falling back to no pre-populated round numbers: ",
             conditionMessage(e))
     character(0)

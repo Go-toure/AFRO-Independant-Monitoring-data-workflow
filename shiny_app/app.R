@@ -3033,6 +3033,25 @@ server <- function(input, output, session) {
     if (length(ids)) updateSelectInput(session, "dl_raw_form_id", choices = ids)
   })
 
+  # Shared log line pusher for the #dl_raw_log_pre console -- the actual
+  # download build (downloadHandler's content(), below) already narrates
+  # every step through this exact message shape; this is the same thing
+  # reused for the Year/Response/Round Number lookups themselves (via
+  # R/data_download_raw.R's own `progress` parameter on
+  # list_available_years()/list_available_responses()/list_available_rounds()),
+  # so picking a filter shows what that lookup is actually doing (which
+  # file(s) it reads, how many rows survive each narrowing step, how many
+  # distinct values it found) instead of happening silently behind the
+  # "Refreshing…" indicator alone. Deliberately never clears the log itself
+  # -- only an actual download start does that (dlRawLogClear below) -- so
+  # switching Year then Response then Round Number leaves a readable trace
+  # of the whole cascade rather than wiping it at every step.
+  .dl_raw_log_progress <- function(detail) {
+    session$sendCustomMessage("dlRawLogLine", list(
+      text = paste0("[", format(Sys.time(), "%H:%M:%S"), "] ", detail)
+    ))
+  }
+
   # Year dropdown: a brand new selectizeInput() is built from scratch every
   # time Form ID changes, via renderUI() -- same rebuild-the-whole-widget
   # approach as Response/Round Number below (see their own comment for why:
@@ -3049,7 +3068,8 @@ server <- function(input, output, session) {
   output$dl_raw_year_ui <- renderUI({
     form_id <- input$dl_raw_form_id
     req(form_id)
-    years <- tryCatch(list_available_years(form_id), error = function(e) character(0))
+    years <- tryCatch(list_available_years(form_id, progress = .dl_raw_log_progress),
+                       error = function(e) character(0))
     choices <- c("All years" = "__ALL__")
     if (length(years)) choices <- c(choices, setNames(years, years))
     selectizeInput("dl_raw_year", "Year", choices = choices, selected = "__ALL__",
@@ -3077,7 +3097,8 @@ server <- function(input, output, session) {
     form_id <- input$dl_raw_form_id
     req(form_id)
     year      <- input$dl_raw_year
-    responses <- tryCatch(list_available_responses(form_id, year), error = function(e) character(0))
+    responses <- tryCatch(list_available_responses(form_id, year, progress = .dl_raw_log_progress),
+                           error = function(e) character(0))
     choices <- c("All" = "__ALL__")
     if (length(responses)) choices <- c(choices, setNames(responses, responses))
     selectizeInput("dl_raw_response", "Response", choices = choices, selected = "__ALL__",
@@ -3095,7 +3116,8 @@ server <- function(input, output, session) {
     req(form_id)
     year     <- input$dl_raw_year
     response <- input$dl_raw_response
-    rounds   <- tryCatch(list_available_rounds(form_id, year, response), error = function(e) character(0))
+    rounds   <- tryCatch(list_available_rounds(form_id, year, response, progress = .dl_raw_log_progress),
+                          error = function(e) character(0))
     choices <- c("All" = "__ALL__")
     if (length(rounds)) choices <- c(choices, setNames(rounds, rounds))
     selectizeInput("dl_raw_round", "Round Number", choices = choices, selected = "__ALL__",
@@ -3162,9 +3184,7 @@ server <- function(input, output, session) {
       withProgress(message = paste0("Building ", dl_label, " download..."), value = 0, {
         progress_cb <- function(detail) {
           incProgress(amount = 1 / 12, detail = detail)
-          session$sendCustomMessage("dlRawLogLine", list(
-            text = paste0("[", format(Sys.time(), "%H:%M:%S"), "] ", detail)
-          ))
+          .dl_raw_log_progress(detail)
         }
         res <- build_form_download(form_id, fmt, progress = progress_cb,
                                     year = year_arg, response = response_arg, round_number = round_arg)
