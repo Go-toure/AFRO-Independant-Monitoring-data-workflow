@@ -439,7 +439,7 @@ ui <- page_navbar(
       card_body(
         div(class="info-banner mb-3",
           tags$b("Source:"), tags$code("raw_state"),
-          " — pulls a form's raw data directly from SharePoint. Forms too large for one Excel sheet are automatically split into one file per year (zipped). Pick a specific Year, Response, and/or Round Number to narrow the download down to just that slice instead of every record for the form — any of the three can be combined, and setting any of them always returns a single file (never a zip)."),
+          " - pulls a form's raw data directly from SharePoint. Forms too large for one Excel sheet are automatically split into one file per year (zipped). Pick a specific Year, Response, and/or Round Number to narrow the download down to just that slice instead of every record for the form, any of the three can be combined, and setting any of them always returns a single file (never a zip)."),
         # Plain Bootstrap row/col (flexbox), not bslib's layout_columns()
         # (CSS Grid) -- two selectize widgets side by side inside a
         # layout_columns() grid cell were overlapping/overflowing their
