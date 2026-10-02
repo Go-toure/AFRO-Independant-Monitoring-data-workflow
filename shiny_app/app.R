@@ -457,10 +457,36 @@ ui <- page_navbar(
           div(class="col-12 col-md",
             # Repopulated reactively (server-side) with that form's actual
             # partition years the moment a Form ID is picked -- see the
-            # observeEvent(input$dl_raw_form_id, ...) block below. Stays at
-            # "All years" for a form that isn't year-partitioned, since
-            # there's only ever one combined file for those anyway.
-            selectInput("dl_raw_year", "Year", choices = c("All years" = ""), width = "100%")),
+            # observeEvent(input$dl_raw_form_id, ...) block below. A heavy
+            # (year-partitioned) form gets its real years as pick-from
+            # choices; a non-heavy form has no such file listing to offer,
+            # but build_form_download() can still filter it down to any
+            # year by reading its one combined file (R/data_download_raw.R's
+            # .load_base_df_for_filtering()/.apply_raw_filters()) -- so this
+            # is a selectize with create = TRUE rather than a plain
+            # selectInput, letting someone just type a year for a non-heavy
+            # form instead of being stuck with "All years" only.
+            #
+            # "All years" uses the sentinel value "__ALL__", never "" --
+            # an empty string doubles as jQuery/selectize's own "nothing is
+            # selected" value, and that overload is what caused the Year box
+            # to render completely blank (no text, no placeholder) once a
+            # Form ID was picked: the control believed "" was genuinely
+            # selected, which suppresses its placeholder, yet couldn't
+            # reliably look up and re-render "All years" as that item's
+            # label through every update cycle (observeEvent below fires on
+            # every Form ID change). Using a real, non-empty sentinel and
+            # always passing `selected` explicitly (here and in the
+            # observeEvent below) avoids relying on that ambiguous state
+            # altogether -- there's always one definite, labeled choice
+            # selected. create = TRUE still lets someone type any year for a
+            # non-heavy form (build_form_download() treats it the same as
+            # Response/roundNumber -- see .load_base_df_for_filtering()/
+            # .apply_raw_filters()).
+            selectizeInput("dl_raw_year", "Year",
+                           choices = c("All years" = "__ALL__"), selected = "__ALL__",
+                           width = "100%",
+                           options = list(create = TRUE, createOnBlur = TRUE))),
           div(class="col-12 col-md",
             selectInput("dl_raw_format", "Format",
                         c("CSV" = "csv", "Excel (.xlsx)" = "xlsx",
@@ -2993,19 +3019,25 @@ server <- function(input, output, session) {
     if (length(ids)) updateSelectInput(session, "dl_raw_form_id", choices = ids)
   })
 
-  # Repopulate the "Year" dropdown with whatever years actually exist for
-  # the newly-picked form, every time Form ID changes -- list_partition_years()
+  # Repopulate the "Year" choices with whatever years actually exist for the
+  # newly-picked form, every time Form ID changes -- list_partition_years()
   # (R/data_download_raw.R) returns character(0) for a form that isn't
-  # year-partitioned, which collapses this back down to just "All years",
-  # the only sensible choice there (there's only ever one combined file for
-  # a non-heavy form, so there's nothing to pick a year out of).
+  # year-partitioned, which collapses this back down to just "All years"
+  # (value "__ALL__", never "" -- see the UI definition's own comment on
+  # why). That's not a dead end, though: since dl_raw_year is a selectize
+  # with create = TRUE, someone can still type any year for a non-heavy
+  # form and build_form_download() will filter its one combined file down
+  # to it. `selected = "__ALL__"` is passed on every repopulation (not left
+  # out, and not character(0)) so switching Form ID always lands on a
+  # definite, labeled selection instead of an ambiguous "nothing selected"
+  # state.
   observeEvent(input$dl_raw_form_id, {
     form_id <- input$dl_raw_form_id
     req(form_id)
     years <- tryCatch(list_partition_years(form_id), error = function(e) character(0))
-    choices <- c("All years" = "")
+    choices <- c("All years" = "__ALL__")
     if (length(years)) choices <- c(choices, setNames(years, years))
-    updateSelectInput(session, "dl_raw_year", choices = choices)
+    updateSelectizeInput(session, "dl_raw_year", choices = choices, selected = "__ALL__")
   }, ignoreInit = FALSE)
 
   output$dl_raw_form <- downloadHandler(
@@ -3017,7 +3049,7 @@ server <- function(input, output, session) {
       round_nb <- input$dl_raw_round
       ext      <- switch(fmt, parquet = "parquet", xlsx = "xlsx", rds = "rds", "csv")
       req(form_id, fmt)
-      year_arg     <- if (!is.null(year) && nzchar(year)) year else NULL
+      year_arg     <- if (!is.null(year) && nzchar(year) && year != "__ALL__") year else NULL
       response_arg <- if (!is.null(response) && nzchar(trimws(response))) trimws(response) else NULL
       round_arg    <- if (!is.null(round_nb) && nzchar(trimws(round_nb))) trimws(round_nb) else NULL
       # Any of year/Response/roundNumber being set always means exactly one
@@ -3046,7 +3078,7 @@ server <- function(input, output, session) {
       round_nb <- input$dl_raw_round
       req(form_id, fmt)
       rv_dl_raw_msg(NULL)
-      year_arg     <- if (!is.null(year) && nzchar(year)) year else NULL
+      year_arg     <- if (!is.null(year) && nzchar(year) && year != "__ALL__") year else NULL
       response_arg <- if (!is.null(response) && nzchar(trimws(response))) trimws(response) else NULL
       round_arg    <- if (!is.null(round_nb) && nzchar(trimws(round_nb))) trimws(round_nb) else NULL
 
