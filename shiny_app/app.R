@@ -3033,6 +3033,47 @@ server <- function(input, output, session) {
     if (length(ids)) updateSelectInput(session, "dl_raw_form_id", choices = ids)
   })
 
+  # "Effective" Year/Response for the Response/Round Number cascade below --
+  # NOT the same thing as input$dl_raw_year/input$dl_raw_response directly.
+  # A real bug was found in production: Response and Round Number are each
+  # rebuilt from scratch via renderUI() (see their own comment for why), but
+  # reading input$dl_raw_year/input$dl_raw_response straight from those
+  # renderUI() bodies raced against Year's OWN renderUI() resetting itself
+  # on a Form ID switch -- Year's brand-new widget only reports its reset
+  # "__ALL__" value back to the server after a round trip to the browser,
+  # so for one reactive flush right after switching forms, Response's/Round
+  # Number's renderUI() could still read the PREVIOUS form's leftover Year/
+  # Response value (confirmed via the #dl_raw_log_pre log: switching from
+  # form 4445 to form 3550 briefly ran form 3550's Round Number lookup with
+  # Response = "CHD-2023-10-1_nOPV", a value that only ever existed on
+  # 4445). It self-corrected a few reactive ticks later, but along the way
+  # re-downloaded the same file several times and briefly showed a
+  # confusing "0 results" state.
+  #
+  # The fix: reset these two reactiveValues to "__ALL__" synchronously, in
+  # the very same reactive flush that Form ID changes in (via the
+  # priority = 1000 observer below, which always runs before any
+  # priority-0 renderUI() in that same flush) -- no round trip needed.
+  # Response's/Round Number's renderUI() blocks read FROM these
+  # reactiveValues instead of the raw inputs, so they can never see a value
+  # that belongs to a form other than the one currently selected. A second
+  # pair of observers keeps them in sync with whatever the user actually
+  # picks in the Year/Response widgets once those have settled.
+  rv_dl_filters <- reactiveValues(year = "__ALL__", response = "__ALL__")
+
+  observeEvent(input$dl_raw_form_id, {
+    rv_dl_filters$year     <- "__ALL__"
+    rv_dl_filters$response <- "__ALL__"
+  }, priority = 1000, ignoreInit = FALSE)
+
+  observeEvent(input$dl_raw_year, {
+    rv_dl_filters$year <- input$dl_raw_year
+  }, ignoreNULL = TRUE)
+
+  observeEvent(input$dl_raw_response, {
+    rv_dl_filters$response <- input$dl_raw_response
+  }, ignoreNULL = TRUE)
+
   # Shared log line pusher for the #dl_raw_log_pre console -- the actual
   # download build (downloadHandler's content(), below) already narrates
   # every step through this exact message shape; this is the same thing
@@ -3090,13 +3131,17 @@ server <- function(input, output, session) {
   # Response's choices are the real, distinct Response values for the
   # selected Form ID + Year (list_available_responses(),
   # R/data_download_raw.R). renderUI() automatically re-runs whenever any
-  # input it reads changes, so simply reading both input$dl_raw_form_id and
-  # input$dl_raw_year here is enough to make this cascade off either one --
-  # no separate observeEvent()/multi-dependency idiom needed.
+  # input/reactiveValue it reads changes, so simply reading both
+  # input$dl_raw_form_id and rv_dl_filters$year here is enough to make this
+  # cascade off either one -- no separate observeEvent()/multi-dependency
+  # idiom needed. Reads rv_dl_filters$year, NOT input$dl_raw_year directly
+  # -- see that reactiveValues' own comment for why (avoids a real race
+  # where this could briefly read a previous form's leftover Year value
+  # right after a Form ID switch).
   output$dl_raw_response_ui <- renderUI({
     form_id <- input$dl_raw_form_id
     req(form_id)
-    year      <- input$dl_raw_year
+    year      <- rv_dl_filters$year
     responses <- tryCatch(list_available_responses(form_id, year, progress = .dl_raw_log_progress),
                            error = function(e) character(0))
     choices <- c("All" = "__ALL__")
@@ -3107,15 +3152,17 @@ server <- function(input, output, session) {
 
   # Round Number's choices are the real, distinct roundNumber values for
   # the selected Form ID + Year + Response (list_available_rounds()),
-  # cascading one level further than Response -- reading input$dl_raw_response
+  # cascading one level further than Response -- reading rv_dl_filters$response
   # here means this also rebuilds (resetting to "All") whenever Response
   # changes, since a round number that existed under the previous Response
-  # value may not even exist under the new one.
+  # value may not even exist under the new one. Reads rv_dl_filters$year/
+  # $response, NOT the raw inputs directly -- same race-avoidance reason as
+  # Response's own renderUI() above.
   output$dl_raw_round_ui <- renderUI({
     form_id <- input$dl_raw_form_id
     req(form_id)
-    year     <- input$dl_raw_year
-    response <- input$dl_raw_response
+    year     <- rv_dl_filters$year
+    response <- rv_dl_filters$response
     rounds   <- tryCatch(list_available_rounds(form_id, year, response, progress = .dl_raw_log_progress),
                           error = function(e) character(0))
     choices <- c("All" = "__ALL__")
