@@ -455,24 +455,20 @@ ui <- page_navbar(
           div(class="col-12 col-md",
             selectInput("dl_raw_form_id", "Form ID", choices = NULL, width = "100%")),
           div(class="col-12 col-md",
-            # Deliberately identical for every form, regardless of whether
-            # it's year-partitioned ("heavy") on SharePoint or not -- it
-            # used to repopulate its choices from that form's real partition
-            # years (via an observeEvent(input$dl_raw_form_id, ...) calling
-            # list_partition_years()), but that made the field's behavior
-            # depend on a distinction the person downloading data has no
-            # reason to know or care about, and that lookup itself could
-            # silently fail closed (any Graph API hiccup collapses to the
-            # same "no years" result as a form that's genuinely not
-            # partitioned -- see list_partition_years()'s own comment in
-            # R/data_download_raw.R), which is indistinguishable from the
-            # UI and caused real confusion. Typing any year here now works
-            # exactly the same way for every form: build_form_download()
-            # reads whichever file(s) it needs and filters to that year
-            # (R/data_download_raw.R's .load_base_df_for_filtering()/
-            # .apply_raw_filters()), using the cheap direct per-year-file
-            # fetch under the hood when the form happens to be heavy --
-            # purely an internal performance detail, invisible here.
+            # Repopulated reactively (server-side) with that form's actual
+            # years the moment a Form ID is picked -- see the
+            # observeEvent(input$dl_raw_form_id, ...) block below, which
+            # calls R/data_download_raw.R's list_available_years(). That
+            # function deliberately works the same way for every form,
+            # heavy (year-partitioned) or not -- unlike the now-removed
+            # list_partition_years()-only version of this dropdown, it
+            # doesn't leave a non-heavy form stuck offering nothing but
+            # "All years" to pick from; it reads the real years out of that
+            # form's own combined file instead (cheaply -- see that
+            # function's own comment on why that's an acceptable cost only
+            # for a non-heavy form). create = TRUE still lets someone type a
+            # year outside the pre-populated list (e.g. one so new the
+            # lookup hasn't caught up with it yet).
             #
             # "All years" uses the sentinel value "__ALL__", never "" -- an
             # empty string doubles as jQuery/selectize's own "nothing is
@@ -3015,12 +3011,24 @@ server <- function(input, output, session) {
     if (length(ids)) updateSelectInput(session, "dl_raw_form_id", choices = ids)
   })
 
-  # No per-Form-ID repopulation of the "Year" choices any more -- it used to
-  # call list_partition_years() here and only offer real years for a heavy
-  # form, which made the field's behavior depend on partition status (see
-  # the UI definition's own comment, above, for why that was dropped).
-  # dl_raw_year's choices are now static, defined once in the UI, and work
-  # identically for every form.
+  # Repopulate the "Year" choices with whatever years actually exist for the
+  # newly-picked form, every time Form ID changes. Calls
+  # list_available_years() (R/data_download_raw.R), not the cheaper but
+  # heavy-only list_partition_years() -- that distinction is deliberately
+  # invisible here: every form, heavy or not, gets real years to pick from
+  # when they're known, and "All years" (value "__ALL__", never "" -- see
+  # the UI definition's own comment on why) is always offered too.
+  # `selected = "__ALL__"` is passed on every repopulation so switching
+  # Form ID always lands on a definite, labeled selection rather than an
+  # ambiguous "nothing selected" state.
+  observeEvent(input$dl_raw_form_id, {
+    form_id <- input$dl_raw_form_id
+    req(form_id)
+    years <- tryCatch(list_available_years(form_id), error = function(e) character(0))
+    choices <- c("All years" = "__ALL__")
+    if (length(years)) choices <- c(choices, setNames(years, years))
+    updateSelectizeInput(session, "dl_raw_year", choices = choices, selected = "__ALL__")
+  }, ignoreInit = FALSE)
 
   output$dl_raw_form <- downloadHandler(
     filename = function() {

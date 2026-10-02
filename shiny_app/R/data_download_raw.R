@@ -186,6 +186,54 @@ list_partition_years <- function(form_id) {
   })
 }
 
+# Character vector of year strings this form actually has data for,
+# ascending -- works the same way for every form, heavy (year-partitioned)
+# or not, which list_partition_years() above deliberately does NOT (it only
+# ever returns years for a heavy form, by design, since that's all it's
+# cheap to check for one). Used to populate the "Year" dropdown in the
+# Download Raw Form Data UI, so someone picking a form without necessarily
+# knowing which years it covers still sees real, pickable years rather
+# than having to guess and type one blind.
+#
+# For a heavy form, this is exactly list_partition_years()'s own cheap
+# filename-listing check (no data read at all). For a non-heavy form there
+# is no such shortcut file listing -- the pipeline only ever partitions a
+# form BY year once it crosses Fetch_im_data.py's own
+# _PARTITION_ROW_THRESHOLD (see that script), so a form landing in this
+# branch is, by that same construction, small enough that downloading its
+# one combined file is an acceptable cost here (never true of a heavy
+# form, which is exactly why the two branches below aren't symmetric).
+# `col_select` then reads back only the `_submission_time` column --
+# Arrow's columnar layout means that costs little beyond the download
+# itself even for a form with hundreds of columns (see
+# .parquet_dims_cheap()'s own comment on what IS and ISN'T cheap about a
+# Parquet read) -- and the distinct years actually present are derived
+# from it.
+list_available_years <- function(form_id) {
+  if (!sharepoint_credentials_available()) return(character(0))
+  tryCatch({
+    token    <- sp_get_graph_token()
+    drive_id <- sp_resolve_drive_id(token)
+    if (form_is_partitioned(token, drive_id, form_id)) {
+      files <- .partition_year_files(token, drive_id, form_id)
+      return(sort(sub(paste0("^", form_id, "_([0-9]{4})\\.parquet$"), "\\1", files)))
+    }
+    remote <- paste0(RAW_STATE_FOLDER, "/", form_id, ".parquet")
+    local  <- file.path(tempdir(), paste0(".years_probe_", form_id, "_", as.integer(Sys.time()), ".parquet"))
+    on.exit(unlink(local), add = TRUE)
+    if (!sp_download_file(token, drive_id, remote, local)) return(character(0))
+    tbl <- arrow::read_parquet(local, col_select = "_submission_time", as_data_frame = TRUE)
+    if (!"_submission_time" %in% names(tbl)) return(character(0))
+    years <- substr(as.character(tbl[["_submission_time"]]), 1, 4)
+    years <- years[!is.na(years) & grepl("^[0-9]{4}$", years)]
+    sort(unique(years))
+  }, error = function(e) {
+    message("[download] list_available_years(", form_id, ") failed -- falling back to no pre-populated years: ",
+            conditionMessage(e))
+    character(0)
+  })
+}
+
 # Downloads either the single combined Parquet (normal form) or every
 # year-partition Parquet (heavy form) into work_dir and returns them all
 # read in as one combined data.frame (dplyr::bind_rows() across years, so
