@@ -356,7 +356,7 @@ table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-alig
   transition:width 1.4s cubic-bezier(.4,0,.2,1);
 }
 
-/* ─ 2024 KPI card redesign (v2: neutral body, colored top accent only) ─ */
+/* ─ 2024 KPI card redesign (v3: flat neutral card, color = top border + chip only) ─ */
 .kpi2{
   border-radius:20px!important; padding:20px 22px 16px!important;
   color:var(--dark)!important; background:var(--card)!important;
@@ -365,24 +365,15 @@ table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-alig
   border-top:4px solid var(--kpi-accent,var(--blue))!important;
   transition:transform .3s cubic-bezier(.4,0,.2,1),
              box-shadow .3s cubic-bezier(.4,0,.2,1)!important;
-  /* the top shadow: a soft colored glow bleeding down from the accent
-     border, with a normal neutral drop-shadow for depth underneath */
-  box-shadow:0 -14px 26px -18px var(--kpi-accent,var(--blue)),
-             0 4px 20px rgba(16,24,40,.08)!important;
+  box-shadow:0 4px 20px rgba(16,24,40,.08)!important;
   display:flex!important; flex-direction:column!important;
   justify-content:space-between!important;
 }
 .kpi2:hover{
   transform:translateY(-5px) scale(1.012)!important;
-  box-shadow:0 -14px 30px -16px var(--kpi-accent,var(--blue)),
-             0 16px 40px rgba(16,24,40,.14)!important;
+  box-shadow:0 14px 34px rgba(16,24,40,.14)!important;
 }
-/* faint colored tint -- the only fill of color left on the card */
-.kpi2::before{
-  content:''; position:absolute; top:-40px; right:-40px;
-  width:140px; height:140px; border-radius:50%;
-  background:var(--kpi-accent,var(--blue)); opacity:.07; pointer-events:none;
-}
+.kpi2::before{ content:none; }
 .kpi2::after{ content:none; }
 /* icon chip -- carries the accent color so each card still reads at a glance */
 .kpi2-chip{
