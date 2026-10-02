@@ -523,6 +523,27 @@ table.dataTable tbody td{ font-variant-numeric:tabular-nums!important; }
 }
 .ai-panel-close:hover{ background:rgba(255,255,255,.15); color:#fff; }
 .ai-panel-body{ flex:1; overflow:auto; min-height:0; display:flex; flex-direction:column; }
+
+/* ─ Download Raw Form Data: cascading filter refresh indicator ────────── */
+/* Year/Response/Round Number (app.R) are each rendered via renderUI(), so
+   Shiny automatically adds its own 'recalculating' class to the wrapping
+   .shiny-html-output div the instant a filter change kicks off a fresh
+   SharePoint lookup for the next one -- these rules just make that
+   already-happening signal actually visible (a label + dimming) instead
+   of the barely-noticeable default opacity fade, so picking a Year/
+   Response doesn't look like nothing is happening while the next
+   dropdown's real values are being fetched live from SharePoint. */
+.dl-raw-cascade-field{ position:relative; }
+.dl-raw-cascade-field > .shiny-html-output.recalculating{
+  opacity:.35; transition:opacity .15s ease;
+}
+.dl-raw-cascade-field > .shiny-html-output.recalculating::after{
+  content:'Refreshing…';
+  position:absolute; top:-18px; left:0;
+  font-size:11px; font-weight:600; color:var(--blue);
+  background:#fff; padding:0 4px; border-radius:4px;
+  pointer-events:none; z-index:5;
+}
 "
 
 # ── CUSTOM JS ─────────────────────────────────────────────────────────────────

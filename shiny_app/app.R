@@ -454,10 +454,10 @@ ui <- page_navbar(
         div(class="row gx-3 gy-2 mb-3",
           div(class="col-12 col-md",
             selectInput("dl_raw_form_id", "Form ID", choices = NULL, width = "100%")),
-          div(class="col-12 col-md",
+          div(class="col-12 col-md dl-raw-cascade-field",
             # Repopulated reactively (server-side) with that form's actual
             # years the moment a Form ID is picked -- see the
-            # observeEvent(input$dl_raw_form_id, ...) block below, which
+            # output$dl_raw_year_ui <- renderUI({...}) block below, which
             # calls R/data_download_raw.R's list_available_years(). That
             # function deliberately works the same way for every form,
             # heavy (year-partitioned) or not -- unlike the now-removed
@@ -475,10 +475,17 @@ ui <- page_navbar(
             # selected" value, which caused the box to render completely
             # blank (no text, no placeholder) once a value changed. A real,
             # non-empty sentinel avoids that ambiguous state entirely.
-            selectizeInput("dl_raw_year", "Year",
-                           choices = c("All years" = "__ALL__"), selected = "__ALL__",
-                           width = "100%",
-                           options = list(create = TRUE, createOnBlur = TRUE))),
+            #
+            # Rendered via uiOutput()/renderUI(), same as Response/Round
+            # Number below, rather than a single long-lived selectizeInput()
+            # kept in sync with updateSelectizeInput() -- see those widgets'
+            # own comment for why (avoids any possibility of a previous
+            # form's leftover options surviving a switch), and it's what
+            # makes the "Refreshing…" cue (CSS, R/constants_css_js.R) show
+            # up here too: Shiny only adds its automatic 'recalculating'
+            # class to a renderUI()-backed output, not to a plain
+            # updateSelectizeInput()-driven one.
+            uiOutput("dl_raw_year_ui")),
           div(class="col-12 col-md",
             selectInput("dl_raw_format", "Format",
                         c("CSV" = "csv", "Excel (.xlsx)" = "xlsx",
@@ -512,8 +519,8 @@ ui <- page_navbar(
           # Response changes leaves no old DOM/JS state behind to leak into
           # the next form, at the cost of a very small amount of extra
           # render work each time (the same SharePoint lookup either way).
-          div(class="col-12 col-md", uiOutput("dl_raw_response_ui")),
-          div(class="col-12 col-md", uiOutput("dl_raw_round_ui"))
+          div(class="col-12 col-md dl-raw-cascade-field", uiOutput("dl_raw_response_ui")),
+          div(class="col-12 col-md dl-raw-cascade-field", uiOutput("dl_raw_round_ui"))
         ),
         div(class="d-grid",
           downloadButton("dl_raw_form", hdr_icon("download", "Download"), class="btn-outline-primary")),
@@ -3026,24 +3033,28 @@ server <- function(input, output, session) {
     if (length(ids)) updateSelectInput(session, "dl_raw_form_id", choices = ids)
   })
 
-  # Repopulate the "Year" choices with whatever years actually exist for the
-  # newly-picked form, every time Form ID changes. Calls
-  # list_available_years() (R/data_download_raw.R), not the cheaper but
-  # heavy-only list_partition_years() -- that distinction is deliberately
-  # invisible here: every form, heavy or not, gets real years to pick from
-  # when they're known, and "All years" (value "__ALL__", never "" -- see
-  # the UI definition's own comment on why) is always offered too.
-  # `selected = "__ALL__"` is passed on every repopulation so switching
-  # Form ID always lands on a definite, labeled selection rather than an
-  # ambiguous "nothing selected" state.
-  observeEvent(input$dl_raw_form_id, {
+  # Year dropdown: a brand new selectizeInput() is built from scratch every
+  # time Form ID changes, via renderUI() -- same rebuild-the-whole-widget
+  # approach as Response/Round Number below (see their own comment for why:
+  # it keeps a previous form's leftover options from ever surviving a
+  # switch), and it's what makes Shiny's automatic 'recalculating' class
+  # -- and so the "Refreshing…" cue in R/constants_css_js.R's CSS -- show up
+  # for Year too, which a plain updateSelectizeInput()-driven widget never
+  # gets. Calls list_available_years() (R/data_download_raw.R), not the
+  # cheaper but heavy-only list_partition_years() -- that distinction is
+  # deliberately invisible here: every form, heavy or not, gets real years
+  # to pick from when they're known, and "All years" (value "__ALL__",
+  # never "" -- see the UI definition's own comment on why) is always
+  # offered too.
+  output$dl_raw_year_ui <- renderUI({
     form_id <- input$dl_raw_form_id
     req(form_id)
     years <- tryCatch(list_available_years(form_id), error = function(e) character(0))
     choices <- c("All years" = "__ALL__")
     if (length(years)) choices <- c(choices, setNames(years, years))
-    updateSelectizeInput(session, "dl_raw_year", choices = choices, selected = "__ALL__")
-  }, ignoreInit = FALSE)
+    selectizeInput("dl_raw_year", "Year", choices = choices, selected = "__ALL__",
+                   width = "100%", options = list(create = TRUE, createOnBlur = TRUE))
+  })
 
   # Response / Round Number dropdowns: a brand new selectizeInput() is
   # built from scratch on every relevant change, via renderUI(), rather
@@ -3061,8 +3072,7 @@ server <- function(input, output, session) {
   # R/data_download_raw.R). renderUI() automatically re-runs whenever any
   # input it reads changes, so simply reading both input$dl_raw_form_id and
   # input$dl_raw_year here is enough to make this cascade off either one --
-  # no separate observeEvent()/multi-dependency idiom needed the way the
-  # Year dropdown's own observeEvent() (above) still uses.
+  # no separate observeEvent()/multi-dependency idiom needed.
   output$dl_raw_response_ui <- renderUI({
     form_id <- input$dl_raw_form_id
     req(form_id)
