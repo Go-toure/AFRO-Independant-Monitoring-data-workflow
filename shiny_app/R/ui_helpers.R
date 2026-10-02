@@ -12,17 +12,21 @@
 # ── UI COMPONENTS ─────────────────────────────────────────────────────────────
 kpi <- function(id, label, icon_chr, style, sub = "",
                 trend = NULL, bar_pct = NULL, compact = FALSE) {
-  # Map old style names → new gradient classes
-  grad <- switch(style,
-    "kpi-blue"   = "background:linear-gradient(140deg,#003F6B 0%,#005C97 55%,#1A7BBF 100%);",
-    "kpi-teal"   = "background:linear-gradient(140deg,#007B8A 0%,#00C9C8 100%);",
-    "kpi-green"  = "background:linear-gradient(140deg,#1A7A44 0%,#27AE60 55%,#2ECC71 100%);",
-    "kpi-orange" = "background:linear-gradient(140deg,#B8520A 0%,#E8730A 55%,#F39C12 100%);",
-    "kpi-purple" = "background:linear-gradient(140deg,#5D2A7A 0%,#8E44AD 55%,#9B59B6 100%);",
-    "kpi-red"    = "background:linear-gradient(140deg,#922B21 0%,#C0392B 55%,#E74C3C 100%);",
-    "background:linear-gradient(140deg,#003F6B,#005C97);"
+  # Map old style names → a single accent color. The card body itself stays
+  # neutral/white (see .kpi2 in constants_css_js.R) -- the accent only drives
+  # the top border, the top glow/"shadow", the icon chip, and the progress
+  # bar fill, so each card still reads at a glance without a full-color block.
+  accent <- switch(style,
+    "kpi-blue"   = "#005C97",
+    "kpi-teal"   = "#00908F",
+    "kpi-green"  = "#27AE60",
+    "kpi-orange" = "#E8730A",
+    "kpi-purple" = "#8E44AD",
+    "kpi-red"    = "#C0392B",
+    "#005C97"
   )
-  div(class = paste0("kpi2", if (compact) " kpi2-compact" else ""), style = grad,
+  div(class = paste0("kpi2", if (compact) " kpi2-compact" else ""),
+      style = paste0("--kpi-accent:", accent, ";"),
     # top row: chip + optional trend pill
     div(class = "kpi2-top",
       div(class = "kpi2-chip", icon_chr),

@@ -356,39 +356,41 @@ table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-alig
   transition:width 1.4s cubic-bezier(.4,0,.2,1);
 }
 
-/* ─ 2024 KPI card redesign ───────────────────────────── */
+/* ─ 2024 KPI card redesign (v2: neutral body, colored top accent only) ─ */
 .kpi2{
-  border-radius:20px!important; padding:20px 22px 16px!important; color:#fff!important;
+  border-radius:20px!important; padding:20px 22px 16px!important;
+  color:var(--dark)!important; background:var(--card)!important;
   position:relative!important; overflow:hidden!important; height:100%!important;
   min-height:148px!important;
+  border-top:4px solid var(--kpi-accent,var(--blue))!important;
   transition:transform .3s cubic-bezier(.4,0,.2,1),
              box-shadow .3s cubic-bezier(.4,0,.2,1)!important;
-  box-shadow:0 4px 24px rgba(0,0,0,.18)!important;
+  /* the top shadow: a soft colored glow bleeding down from the accent
+     border, with a normal neutral drop-shadow for depth underneath */
+  box-shadow:0 -14px 26px -18px var(--kpi-accent,var(--blue)),
+             0 4px 20px rgba(16,24,40,.08)!important;
   display:flex!important; flex-direction:column!important;
   justify-content:space-between!important;
 }
 .kpi2:hover{
   transform:translateY(-5px) scale(1.012)!important;
-  box-shadow:0 16px 44px rgba(0,0,0,.26)!important;
+  box-shadow:0 -14px 30px -16px var(--kpi-accent,var(--blue)),
+             0 16px 40px rgba(16,24,40,.14)!important;
 }
-/* decorative orbs */
+/* faint colored tint -- the only fill of color left on the card */
 .kpi2::before{
   content:''; position:absolute; top:-40px; right:-40px;
   width:140px; height:140px; border-radius:50%;
-  background:rgba(255,255,255,.10); pointer-events:none;
+  background:var(--kpi-accent,var(--blue)); opacity:.07; pointer-events:none;
 }
-.kpi2::after{
-  content:''; position:absolute; bottom:-55px; left:-20px;
-  width:120px; height:120px; border-radius:50%;
-  background:rgba(0,0,0,.08); pointer-events:none;
-}
-/* icon chip */
+.kpi2::after{ content:none; }
+/* icon chip -- carries the accent color so each card still reads at a glance */
 .kpi2-chip{
   display:inline-flex; align-items:center; justify-content:center;
   width:40px; height:40px; border-radius:12px;
-  background:rgba(255,255,255,.22); font-size:1.25rem; line-height:1;
+  background:var(--kpi-accent,var(--blue)); color:#fff; font-size:1.25rem; line-height:1;
   position:relative; z-index:1; flex-shrink:0;
-  backdrop-filter:blur(4px); -webkit-backdrop-filter:blur(4px);
+  box-shadow:0 4px 10px -2px var(--kpi-accent,var(--blue));
 }
 .kpi2-top{
   display:flex; align-items:flex-start;
@@ -396,25 +398,26 @@ table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-alig
 }
 .kpi2-trend{
   font-size:.65rem; font-weight:800; letter-spacing:.03em;
-  background:rgba(255,255,255,.18); border-radius:20px;
-  padding:3px 9px; backdrop-filter:blur(4px);
+  background:rgba(16,24,41,.06); color:var(--muted); border-radius:20px;
+  padding:3px 9px;
 }
 .kpi2-body{ position:relative; z-index:1; margin-top:10px; }
 .kpi2-val{
   font-size:2.2rem; font-weight:900; line-height:1.05;
   letter-spacing:-.035em; font-variant-numeric:tabular-nums;
+  color:var(--dark);
 }
 .kpi2-label{
   font-size:.67rem; font-weight:700; letter-spacing:.09em;
-  text-transform:uppercase; opacity:.75; margin-top:2px;
+  text-transform:uppercase; color:var(--muted); margin-top:2px;
 }
 /* thin progress strip at bottom */
 .kpi2-bar{
-  height:3px; border-radius:3px; background:rgba(255,255,255,.2);
+  height:3px; border-radius:3px; background:rgba(16,24,41,.08);
   margin-top:14px; overflow:hidden; position:relative; z-index:1;
 }
 .kpi2-bar-fill{
-  height:100%; border-radius:3px; background:rgba(255,255,255,.75);
+  height:100%; border-radius:3px; background:var(--kpi-accent,var(--blue));
   transition:width 1.6s cubic-bezier(.4,0,.2,1);
 }
 /* compact variant — used for the pinned top-of-dashboard KPI strip */
