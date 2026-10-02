@@ -158,6 +158,20 @@ form_is_partitioned <- function(token, drive_id, form_id) {
 # picked, so the selector only ever offers years that genuinely exist for
 # that form -- a non-heavy form (nothing to partition) naturally gets back
 # character(0), which the UI treats as "no year selector, only one file".
+#
+# A GENUINE "this form has no partitions" and a silent Graph API failure
+# (an expired token, a transient error, credentials misconfigured just for
+# this one call) both collapse to the exact same character(0) return --
+# that's deliberate, so a hiccup here never breaks the dropdown for
+# everyone. But that also means neither a user nor a developer could ever
+# tell the two apart from the UI alone, which came up directly after this
+# function first shipped (a form showing only "All years" was assumed to
+# be a bug before turning out to be correct behavior). The message() call
+# below writes to Connect Cloud's own application log (stderr) whenever
+# the LOOKUP ITSELF failed, so that distinction is now checkable after the
+# fact without needing to reproduce it live -- character(0) with NO log
+# line means "genuinely not partitioned"; character(0) WITH a log line
+# means something about the Graph API call failed for this form.
 list_partition_years <- function(form_id) {
   if (!sharepoint_credentials_available()) return(character(0))
   tryCatch({
@@ -165,7 +179,11 @@ list_partition_years <- function(form_id) {
     drive_id <- sp_resolve_drive_id(token)
     files    <- .partition_year_files(token, drive_id, form_id)
     sub(paste0("^", form_id, "_([0-9]{4})\\.parquet$"), "\\1", files)
-  }, error = function(e) character(0))
+  }, error = function(e) {
+    message("[download] list_partition_years(", form_id, ") failed -- treating as not partitioned: ",
+            conditionMessage(e))
+    character(0)
+  })
 }
 
 # Downloads either the single combined Parquet (normal form) or every
