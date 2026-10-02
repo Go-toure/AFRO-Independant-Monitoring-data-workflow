@@ -234,6 +234,174 @@ list_available_years <- function(form_id) {
   })
 }
 
+# Reads back only `cols` (whichever of them actually exist) from a single
+# Parquet file, as cheaply as the underlying column layout allows.
+#
+# `col_select` is given every *candidate* spelling of a field at once (e.g.
+# c("Response", "response")) because the actual casing used varies by form
+# (see .find_column_ci()'s own comment) -- but arrow::read_parquet()'s
+# col_select is tidyselect-based and, on the real arrow package, ERRORS if
+# any one of the names it's given doesn't exist in the file, rather than
+# silently ignoring it (unlike this project's own fake arrow test double,
+# which just intersects -- see /tmp/fakepkgs/arrow/R/arrow.R). Since a form
+# only ever has ONE of those candidate spellings, not all of them, that
+# first attempt fails close to every time in practice. The fallback below --
+# a full read, then subsetting in R -- still gets the right columns back
+# correctly; it just can't skip the decode cost the way a successful
+# col_select would. That fallback cost is never a regression versus the
+# status quo: it's exactly the same "download and fully read one file" cost
+# every Response/roundNumber filter already pays today via
+# .load_base_df_for_filtering() (one heavy-form year-partition, or one
+# non-heavy form's combined file) -- this is the same work, just also now
+# used to populate a dropdown ahead of time rather than only at download
+# time.
+.read_parquet_cols <- function(path, cols) {
+  tryCatch({
+    arrow::read_parquet(path, col_select = cols, as_data_frame = TRUE)
+  }, error = function(e) {
+    tryCatch({
+      df <- as.data.frame(arrow::read_parquet(path))
+      df[, intersect(cols, names(df)), drop = FALSE]
+    }, error = function(e2) NULL)
+  })
+}
+
+# Loads just `cols` (plus "_submission_time" too, automatically, whenever
+# `year` is set -- needed to filter down to that year afterward) for a
+# form, from whichever file(s) actually hold its data, mirroring
+# .load_base_df_for_filtering()'s own heavy/year branching:
+#   - heavy form, year given  -> that one year-partition file only.
+#   - heavy form, no year     -> every year-partition file, combined
+#                                (dplyr::bind_rows(), same as
+#                                fetch_form_dataframe()'s own heavy-form
+#                                combine, just narrower columns).
+#   - non-heavy form          -> the one combined file (year, if given, is
+#                                applied afterward by the caller via
+#                                .filter_df_by_year(), same as
+#                                list_available_years()'s own non-heavy
+#                                branch).
+# Returns NULL on total failure (nothing could be downloaded/read) --
+# never raises; callers (list_available_responses()/list_available_rounds())
+# are themselves already wrapped in their own tryCatch for anything this
+# doesn't already catch internally.
+.load_narrow_columns <- function(token, drive_id, form_id, heavy, year, cols) {
+  needed <- unique(c(cols, if (!is.null(year)) "_submission_time" else NULL))
+  if (heavy) {
+    if (!is.null(year)) {
+      nm     <- paste0(form_id, "_", year, ".parquet")
+      remote <- paste0(sp_partition_folder(form_id), "/", nm)
+      local  <- file.path(tempdir(), paste0(".cols_probe_", form_id, "_", year, "_", as.integer(Sys.time()), ".parquet"))
+      on.exit(unlink(local), add = TRUE)
+      if (!sp_download_file(token, drive_id, remote, local)) return(NULL)
+      return(.read_parquet_cols(local, needed))
+    }
+    year_files <- .partition_year_files(token, drive_id, form_id)
+    if (!length(year_files)) return(NULL)
+    frames <- list()
+    for (nm in year_files) {
+      local  <- file.path(tempdir(), paste0(".cols_probe_", form_id, "_", nm, "_", as.integer(Sys.time()), ".parquet"))
+      remote <- paste0(sp_partition_folder(form_id), "/", nm)
+      if (!sp_download_file(token, drive_id, remote, local)) next
+      df <- .read_parquet_cols(local, needed)
+      unlink(local)
+      if (!is.null(df)) frames[[nm]] <- df
+    }
+    if (!length(frames)) return(NULL)
+    return(dplyr::bind_rows(frames))
+  }
+  remote <- paste0(RAW_STATE_FOLDER, "/", form_id, ".parquet")
+  local  <- file.path(tempdir(), paste0(".cols_probe_", form_id, "_", as.integer(Sys.time()), ".parquet"))
+  on.exit(unlink(local), add = TRUE)
+  if (!sp_download_file(token, drive_id, remote, local)) return(NULL)
+  .read_parquet_cols(local, needed)
+}
+
+# Sorts distinct, non-blank values the way a human expects: numerically when
+# every value looks like a plain number (so roundNumber choices like
+# "1","2","10" come back in that order, not "1","10","2"), otherwise a plain
+# lexical sort (for Response values like "Yes"/"No"). Always drops NA/blank
+# entries first -- those were never real choices for the dropdown.
+.sort_distinct_values <- function(vals) {
+  vals <- unique(vals[!is.na(vals) & nzchar(vals)])
+  if (!length(vals)) return(character(0))
+  if (all(grepl("^-?[0-9]+(\\.[0-9]+)?$", vals))) {
+    return(vals[order(as.numeric(vals))])
+  }
+  sort(vals)
+}
+
+# Character vector of distinct Response values actually present for this
+# form, optionally narrowed down to just `year` first -- used to populate
+# the "Response" dropdown in the Download Raw Form Data UI reactively as
+# Form ID/Year change, the same way list_available_years() populates
+# "Year". `year` of NULL, "", or the UI's "All years" sentinel "__ALL__" all
+# mean "every year" here, matching how the Year dropdown's own value flows
+# into the rest of this file elsewhere (see app.R's downloadHandler).
+# Never raises; character(0) on any failure (no credentials, no such form,
+# no Response column, nothing matched, ...), with a log line only when the
+# lookup itself genuinely failed (same distinction list_partition_years()'s
+# own comment explains).
+list_available_responses <- function(form_id, year = NULL) {
+  if (!sharepoint_credentials_available()) return(character(0))
+  year <- if (!is.null(year) && nzchar(year) && year != "__ALL__") year else NULL
+  tryCatch({
+    token    <- sp_get_graph_token()
+    drive_id <- sp_resolve_drive_id(token)
+    heavy    <- form_is_partitioned(token, drive_id, form_id)
+    df <- .load_narrow_columns(token, drive_id, form_id, heavy, year, c("Response", "response"))
+    if (is.null(df)) return(character(0))
+    if (!is.null(year)) {
+      sub <- .filter_df_by_year(df, year)
+      if (!is.null(sub)) df <- sub
+    }
+    col <- .find_column_ci(df, c("Response", "response"))
+    if (is.null(col)) return(character(0))
+    .sort_distinct_values(trimws(as.character(df[[col]])))
+  }, error = function(e) {
+    message("[download] list_available_responses(", form_id, ") failed -- falling back to no pre-populated responses: ",
+            conditionMessage(e))
+    character(0)
+  })
+}
+
+# Character vector of distinct roundNumber values actually present for this
+# form, optionally narrowed down to `year` and/or `response` first -- the
+# "Round Number" dropdown's counterpart to list_available_responses() above,
+# cascading one level further (Form ID -> Year -> Response -> Round Number).
+# `year`/`response` of NULL, "", or the UI's "__ALL__" sentinel all mean "no
+# filter at that level," same convention as list_available_responses().
+# Never raises; character(0) on any failure, same logging convention.
+list_available_rounds <- function(form_id, year = NULL, response = NULL) {
+  if (!sharepoint_credentials_available()) return(character(0))
+  year     <- if (!is.null(year) && nzchar(year) && year != "__ALL__") year else NULL
+  response <- if (!is.null(response) && nzchar(trimws(response)) && trimws(response) != "__ALL__") trimws(response) else NULL
+  tryCatch({
+    token    <- sp_get_graph_token()
+    drive_id <- sp_resolve_drive_id(token)
+    heavy    <- form_is_partitioned(token, drive_id, form_id)
+    cols <- c("roundNumber", "roundnumber", "round_number", "Round Number", "RoundNumber")
+    if (!is.null(response)) cols <- c(cols, "Response", "response")
+    df <- .load_narrow_columns(token, drive_id, form_id, heavy, year, cols)
+    if (is.null(df)) return(character(0))
+    if (!is.null(year)) {
+      sub <- .filter_df_by_year(df, year)
+      if (!is.null(sub)) df <- sub
+    }
+    if (!is.null(response)) {
+      sub <- .filter_df_by_field(df, c("Response", "response"), response)
+      if (is.null(sub)) return(character(0))
+      df <- sub
+    }
+    col <- .find_column_ci(df, c("roundNumber", "roundnumber", "round_number", "Round Number", "RoundNumber"))
+    if (is.null(col)) return(character(0))
+    .sort_distinct_values(trimws(as.character(df[[col]])))
+  }, error = function(e) {
+    message("[download] list_available_rounds(", form_id, ") failed -- falling back to no pre-populated round numbers: ",
+            conditionMessage(e))
+    character(0)
+  })
+}
+
 # Downloads either the single combined Parquet (normal form) or every
 # year-partition Parquet (heavy form) into work_dir and returns them all
 # read in as one combined data.frame (dplyr::bind_rows() across years, so

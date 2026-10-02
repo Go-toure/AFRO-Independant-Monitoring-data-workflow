@@ -484,21 +484,33 @@ ui <- page_navbar(
                         c("CSV" = "csv", "Excel (.xlsx)" = "xlsx",
                           "R data (.rds)" = "rds", "Parquet" = "parquet"),
                         width = "100%")),
-          # Response / Round Number: unlike Year, there's no cheap
-          # pre-existing file listing to populate a dropdown from (no form
-          # keeps a separate file per Response value or per round) -- these
-          # are always read out of whichever combined/year data gets loaded
-          # and matched case-insensitively
-          # (R/data_download_raw.R's .filter_df_by_field()), so a plain
-          # optional text box is the right widget here, not a selectize
-          # that would need an expensive eager data read just to populate
-          # its own suggestion list.
+          # Response / Round Number: cascading selectizeInputs, same
+          # "__ALL__" sentinel pattern as Year above (never "" -- see that
+          # widget's own comment on why an empty string is the wrong choice
+          # here). Response's choices are the real, distinct Response values
+          # for the selected Form ID + Year (R/data_download_raw.R's
+          # list_available_responses()); Round Number's choices are the
+          # real, distinct roundNumber values for the selected Form ID +
+          # Year + Response (list_available_rounds()) -- each level reads
+          # only the narrow set of columns it needs
+          # (.load_narrow_columns()/.read_parquet_cols()), matched
+          # case-insensitively (.find_column_ci()/.filter_df_by_field()),
+          # rather than eagerly loading every column of a form just to
+          # populate a dropdown. Both are populated/repopulated in the
+          # server block below, mirroring the Year dropdown's own
+          # observeEvent(). create = TRUE still lets someone type a value
+          # outside the pre-populated list (e.g. one so new the lookup
+          # hasn't caught up with it yet).
           div(class="col-12 col-md",
-            textInput("dl_raw_response", "Response (optional)", value = "",
-                      placeholder = "e.g. Yes — leave blank for all", width = "100%")),
+            selectizeInput("dl_raw_response", "Response",
+                           choices = c("All" = "__ALL__"), selected = "__ALL__",
+                           width = "100%",
+                           options = list(create = TRUE, createOnBlur = TRUE))),
           div(class="col-12 col-md",
-            textInput("dl_raw_round", "Round Number (optional)", value = "",
-                      placeholder = "e.g. 3 — leave blank for all", width = "100%"))
+            selectizeInput("dl_raw_round", "Round Number",
+                           choices = c("All" = "__ALL__"), selected = "__ALL__",
+                           width = "100%",
+                           options = list(create = TRUE, createOnBlur = TRUE)))
         ),
         div(class="d-grid",
           downloadButton("dl_raw_form", hdr_icon("download", "Download"), class="btn-outline-primary")),
@@ -3030,6 +3042,42 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "dl_raw_year", choices = choices, selected = "__ALL__")
   }, ignoreInit = FALSE)
 
+  # Repopulate "Response" choices whenever Form ID or Year changes -- the
+  # real, distinct Response values for that slice
+  # (list_available_responses(), R/data_download_raw.R), same "__ALL__"
+  # sentinel + explicit `selected` pattern as Year's own observeEvent()
+  # above. `{ input$dl_raw_form_id; input$dl_raw_year }` is Shiny's
+  # multi-dependency idiom -- touching both reactive values inside the
+  # braced block means this observer fires on a change to either one, not
+  # just the first.
+  observeEvent({ input$dl_raw_form_id; input$dl_raw_year }, {
+    form_id <- input$dl_raw_form_id
+    req(form_id)
+    year      <- input$dl_raw_year
+    responses <- tryCatch(list_available_responses(form_id, year), error = function(e) character(0))
+    choices <- c("All" = "__ALL__")
+    if (length(responses)) choices <- c(choices, setNames(responses, responses))
+    updateSelectizeInput(session, "dl_raw_response", choices = choices, selected = "__ALL__")
+  }, ignoreInit = FALSE)
+
+  # Repopulate "Round Number" choices whenever Form ID, Year, or Response
+  # changes -- the real, distinct roundNumber values for that slice
+  # (list_available_rounds()), cascading one level further than Response.
+  # Resetting to "__ALL__" here whenever Response changes is deliberate: a
+  # round number picked under the previous Response value may not even
+  # exist under the new one, so starting back at "All" avoids silently
+  # keeping a now-meaningless selection.
+  observeEvent({ input$dl_raw_form_id; input$dl_raw_year; input$dl_raw_response }, {
+    form_id <- input$dl_raw_form_id
+    req(form_id)
+    year     <- input$dl_raw_year
+    response <- input$dl_raw_response
+    rounds   <- tryCatch(list_available_rounds(form_id, year, response), error = function(e) character(0))
+    choices <- c("All" = "__ALL__")
+    if (length(rounds)) choices <- c(choices, setNames(rounds, rounds))
+    updateSelectizeInput(session, "dl_raw_round", choices = choices, selected = "__ALL__")
+  }, ignoreInit = FALSE)
+
   output$dl_raw_form <- downloadHandler(
     filename = function() {
       form_id  <- input$dl_raw_form_id
@@ -3040,8 +3088,8 @@ server <- function(input, output, session) {
       ext      <- switch(fmt, parquet = "parquet", xlsx = "xlsx", rds = "rds", "csv")
       req(form_id, fmt)
       year_arg     <- if (!is.null(year) && nzchar(year) && year != "__ALL__") year else NULL
-      response_arg <- if (!is.null(response) && nzchar(trimws(response))) trimws(response) else NULL
-      round_arg    <- if (!is.null(round_nb) && nzchar(trimws(round_nb))) trimws(round_nb) else NULL
+      response_arg <- if (!is.null(response) && nzchar(trimws(response)) && trimws(response) != "__ALL__") trimws(response) else NULL
+      round_arg    <- if (!is.null(round_nb) && nzchar(trimws(round_nb)) && trimws(round_nb) != "__ALL__") trimws(round_nb) else NULL
       # Any of year/Response/roundNumber being set always means exactly one
       # resulting file -- never a zip, no need to check whether the form is
       # "heavy" at all -- since each of those filters narrows down to at
@@ -3069,8 +3117,8 @@ server <- function(input, output, session) {
       req(form_id, fmt)
       rv_dl_raw_msg(NULL)
       year_arg     <- if (!is.null(year) && nzchar(year) && year != "__ALL__") year else NULL
-      response_arg <- if (!is.null(response) && nzchar(trimws(response))) trimws(response) else NULL
-      round_arg    <- if (!is.null(round_nb) && nzchar(trimws(round_nb))) trimws(round_nb) else NULL
+      response_arg <- if (!is.null(response) && nzchar(trimws(response)) && trimws(response) != "__ALL__") trimws(response) else NULL
+      round_arg    <- if (!is.null(round_nb) && nzchar(trimws(round_nb)) && trimws(round_nb) != "__ALL__") trimws(round_nb) else NULL
 
       # A heavy-form download can mean several sequential SharePoint
       # round-trips (one per year partition) plus a zip step -- with
