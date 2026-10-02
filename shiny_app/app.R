@@ -496,21 +496,24 @@ ui <- page_navbar(
           # (.load_narrow_columns()/.read_parquet_cols()), matched
           # case-insensitively (.find_column_ci()/.filter_df_by_field()),
           # rather than eagerly loading every column of a form just to
-          # populate a dropdown. Both are populated/repopulated in the
-          # server block below, mirroring the Year dropdown's own
-          # observeEvent(). create = TRUE still lets someone type a value
-          # outside the pre-populated list (e.g. one so new the lookup
-          # hasn't caught up with it yet).
-          div(class="col-12 col-md",
-            selectizeInput("dl_raw_response", "Response",
-                           choices = c("All" = "__ALL__"), selected = "__ALL__",
-                           width = "100%",
-                           options = list(create = TRUE, createOnBlur = TRUE))),
-          div(class="col-12 col-md",
-            selectizeInput("dl_raw_round", "Round Number",
-                           choices = c("All" = "__ALL__"), selected = "__ALL__",
-                           width = "100%",
-                           options = list(create = TRUE, createOnBlur = TRUE)))
+          # populate a dropdown.
+          #
+          # Rendered via uiOutput()/renderUI() (server block below) rather
+          # than a single long-lived selectizeInput() updated in place with
+          # updateSelectizeInput() -- a real cross-form mix-up was observed
+          # in production with the update-in-place approach (switching Form
+          # ID after browsing a different form could leave a previous
+          # form's Response options still showing in the dropdown alongside
+          # the new form's, a known category of staleness with
+          # updateSelectizeInput()+create=TRUE not fully clearing a
+          # selectize widget's rendered option list). Rebuilding the whole
+          # widget from scratch -- a brand new <select> element and a brand
+          # new selectize.js instance -- every time Form ID, Year, or
+          # Response changes leaves no old DOM/JS state behind to leak into
+          # the next form, at the cost of a very small amount of extra
+          # render work each time (the same SharePoint lookup either way).
+          div(class="col-12 col-md", uiOutput("dl_raw_response_ui")),
+          div(class="col-12 col-md", uiOutput("dl_raw_round_ui"))
         ),
         div(class="d-grid",
           downloadButton("dl_raw_form", hdr_icon("download", "Download"), class="btn-outline-primary")),
@@ -3042,32 +3045,42 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "dl_raw_year", choices = choices, selected = "__ALL__")
   }, ignoreInit = FALSE)
 
-  # Repopulate "Response" choices whenever Form ID or Year changes -- the
-  # real, distinct Response values for that slice
-  # (list_available_responses(), R/data_download_raw.R), same "__ALL__"
-  # sentinel + explicit `selected` pattern as Year's own observeEvent()
-  # above. `{ input$dl_raw_form_id; input$dl_raw_year }` is Shiny's
-  # multi-dependency idiom -- touching both reactive values inside the
-  # braced block means this observer fires on a change to either one, not
-  # just the first.
-  observeEvent({ input$dl_raw_form_id; input$dl_raw_year }, {
+  # Response / Round Number dropdowns: a brand new selectizeInput() is
+  # built from scratch on every relevant change, via renderUI(), rather
+  # than one long-lived widget kept in sync with updateSelectizeInput() --
+  # see the UI definition's own comment for why (a real cross-form mix-up
+  # was observed in production with the update-in-place approach). Each
+  # render tears down the previous <select> + selectize.js instance
+  # entirely and replaces it with a fresh one carrying only the choices
+  # this exact lookup just returned, so there is no previous form's (or
+  # previous year's) leftover option sitting in the DOM to ever show up
+  # again.
+
+  # Response's choices are the real, distinct Response values for the
+  # selected Form ID + Year (list_available_responses(),
+  # R/data_download_raw.R). renderUI() automatically re-runs whenever any
+  # input it reads changes, so simply reading both input$dl_raw_form_id and
+  # input$dl_raw_year here is enough to make this cascade off either one --
+  # no separate observeEvent()/multi-dependency idiom needed the way the
+  # Year dropdown's own observeEvent() (above) still uses.
+  output$dl_raw_response_ui <- renderUI({
     form_id <- input$dl_raw_form_id
     req(form_id)
     year      <- input$dl_raw_year
     responses <- tryCatch(list_available_responses(form_id, year), error = function(e) character(0))
     choices <- c("All" = "__ALL__")
     if (length(responses)) choices <- c(choices, setNames(responses, responses))
-    updateSelectizeInput(session, "dl_raw_response", choices = choices, selected = "__ALL__")
-  }, ignoreInit = FALSE)
+    selectizeInput("dl_raw_response", "Response", choices = choices, selected = "__ALL__",
+                   width = "100%", options = list(create = TRUE, createOnBlur = TRUE))
+  })
 
-  # Repopulate "Round Number" choices whenever Form ID, Year, or Response
-  # changes -- the real, distinct roundNumber values for that slice
-  # (list_available_rounds()), cascading one level further than Response.
-  # Resetting to "__ALL__" here whenever Response changes is deliberate: a
-  # round number picked under the previous Response value may not even
-  # exist under the new one, so starting back at "All" avoids silently
-  # keeping a now-meaningless selection.
-  observeEvent({ input$dl_raw_form_id; input$dl_raw_year; input$dl_raw_response }, {
+  # Round Number's choices are the real, distinct roundNumber values for
+  # the selected Form ID + Year + Response (list_available_rounds()),
+  # cascading one level further than Response -- reading input$dl_raw_response
+  # here means this also rebuilds (resetting to "All") whenever Response
+  # changes, since a round number that existed under the previous Response
+  # value may not even exist under the new one.
+  output$dl_raw_round_ui <- renderUI({
     form_id <- input$dl_raw_form_id
     req(form_id)
     year     <- input$dl_raw_year
@@ -3075,8 +3088,9 @@ server <- function(input, output, session) {
     rounds   <- tryCatch(list_available_rounds(form_id, year, response), error = function(e) character(0))
     choices <- c("All" = "__ALL__")
     if (length(rounds)) choices <- c(choices, setNames(rounds, rounds))
-    updateSelectizeInput(session, "dl_raw_round", choices = choices, selected = "__ALL__")
-  }, ignoreInit = FALSE)
+    selectizeInput("dl_raw_round", "Round Number", choices = choices, selected = "__ALL__",
+                   width = "100%", options = list(create = TRUE, createOnBlur = TRUE))
+  })
 
   output$dl_raw_form <- downloadHandler(
     filename = function() {
