@@ -764,22 +764,23 @@ server <- function(input, output, session) {
     }
 
     div(class="fade-up", style=paste0(
-          "border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,92,151,.10);",
-          "margin-bottom:1rem;background:",soft_grey,";"),
-      div(style=paste0("background:",dark_blue,";padding:14px 20px;color:#fff;",
+          "border-radius:16px;overflow:hidden;box-shadow:0 4px 20px rgba(16,24,40,.08);",
+          "border-top:4px solid ",dark_blue,";margin-bottom:1rem;background:",soft_grey,";"),
+      div(style=paste0("background:#fff;padding:14px 20px;color:",dark_blue,";",
+                       "border-bottom:1px solid rgba(16,24,40,.08);",
                        "display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;"),
         div(
           div(style="font-size:1.05rem;font-weight:800;letter-spacing:.02em;",
               "AFRO REGIONAL INDEPENDENT MONITORING INTELLIGENCE"),
-          div(style="font-size:.78rem;opacity:.85;margin-top:2px;",
+          div(style="font-size:.78rem;color:#6C7A8D;margin-top:2px;",
               paste0("Generated: ", format(Sys.Date(), "%d %b %Y"), "  |  Live filtered snapshot"))
         ),
         div(style="display:flex;gap:6px;height:fit-content;",
           tags$button(type="button", onclick="captureExecKPI()",
-            style="background:transparent;border:1px solid rgba(255,255,255,.55);color:#fff;font-size:.7rem;padding:2px 10px;border-radius:6px;cursor:pointer;",
+            style=paste0("background:transparent;border:1px solid ",dark_blue,";color:",dark_blue,";font-size:.7rem;padding:2px 10px;border-radius:6px;cursor:pointer;"),
             bs_icon("camera-fill", class="me-1"), "PNG"),
           downloadButton("dl_exec_snapshot", tagList(bs_icon("download", class="me-1"), "CSV"),
-            style="background:transparent;border:1px solid rgba(255,255,255,.55);color:#fff;font-size:.7rem;padding:2px 10px;border-radius:6px;height:fit-content;")
+            style=paste0("background:transparent;border:1px solid ",dark_blue,";color:",dark_blue,";font-size:.7rem;padding:2px 10px;border-radius:6px;height:fit-content;"))
         )
       ),
       div(style="padding:18px 20px;",

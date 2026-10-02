@@ -297,37 +297,30 @@ table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-alig
   padding-bottom:7px!important;border-bottom:1px solid rgba(255,255,255,.09)!important;
 }
 
-/* ─ Context hero banner ──────────────────────────────── */
+/* ─ Context hero banner (flat: neutral body, colored top accent only) ─ */
 .hero-ctx{
-  background:linear-gradient(125deg,#002E4F 0%,#005C97 55%,#1369A8 100%);
-  border-radius:16px;padding:18px 26px;color:#fff;margin-bottom:18px;
-  box-shadow:0 10px 40px rgba(0,63,107,.28);position:relative;overflow:hidden;
+  background:var(--card);color:var(--dark);
+  border-radius:16px;padding:18px 26px;margin-bottom:18px;
+  border-top:4px solid var(--blue);
+  box-shadow:0 4px 20px rgba(16,24,40,.08);position:relative;overflow:hidden;
 }
-.hero-ctx::before{
-  content:'';position:absolute;top:-55px;right:-55px;
-  width:210px;height:210px;border-radius:50%;background:rgba(255,255,255,.05);
-  pointer-events:none;
-}
-.hero-ctx::after{
-  content:'';position:absolute;bottom:-80px;right:120px;
-  width:170px;height:170px;border-radius:50%;background:rgba(0,201,200,.07);
-  pointer-events:none;
-}
-.hero-ctx-title{font-size:1.05rem;font-weight:800;letter-spacing:-.02em;line-height:1.2;}
-.hero-ctx-sub  {font-size:.75rem;color:rgba(255,255,255,.62);margin-top:5px;font-weight:500;}
+.hero-ctx::before{ content:none; }
+.hero-ctx::after{ content:none; }
+.hero-ctx-title{font-size:1.05rem;font-weight:800;letter-spacing:-.02em;line-height:1.2;color:var(--dark);}
+.hero-ctx-sub  {font-size:.75rem;color:var(--muted);margin-top:5px;font-weight:500;}
 .hero-stats{display:flex;align-items:center;gap:0;}
 .hero-stat{
   text-align:center;padding:0 20px;
-  border-left:1px solid rgba(255,255,255,.15);
+  border-left:1px solid rgba(16,24,40,.09);
 }
 .hero-stat:first-child{border-left:none;}
 .hero-stat-val{
-  font-size:1.55rem;font-weight:900;
+  font-size:1.55rem;font-weight:900;color:var(--blue);
   font-variant-numeric:tabular-nums;letter-spacing:-.02em;
 }
 .hero-stat-lbl{
   font-size:.59rem;font-weight:700;text-transform:uppercase;
-  letter-spacing:.09em;color:rgba(255,255,255,.52);margin-top:1px;
+  letter-spacing:.09em;color:var(--muted);margin-top:1px;
 }
 
 /* ─ Card header: colored top accent border ───────────── */
