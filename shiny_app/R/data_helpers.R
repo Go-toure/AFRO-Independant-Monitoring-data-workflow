@@ -56,16 +56,25 @@ get_log_lines <- function(n = 500) {
 
 last_run_info <- function() {
   fls <- sort(list.files(LOGS_DIR, pattern="^workflow_.*\\.log$", full.names=TRUE))
-  if (!length(fls)) return(list(time="Never", status="idle", log=""))
-  latest <- tail(fls, 1)
-  lns    <- tryCatch(readLines(latest), error=function(e) character(0))
-  list(
-    time   = format(file.mtime(latest), "%Y-%m-%d  %H:%M"),
-    status = if (any(grepl("WORKFLOW COMPLETED", lns))) "ok"
-             else if (any(grepl("ERROR|failed", lns, ignore.case=TRUE))) "error"
-             else "warn",
-    log    = paste(tail(lns, 500), collapse="\n")
-  )
+  if (length(fls)) {
+    latest <- tail(fls, 1)
+    lns    <- tryCatch(readLines(latest), error=function(e) character(0))
+    return(list(
+      time   = format(file.mtime(latest), "%Y-%m-%d  %H:%M"),
+      status = if (any(grepl("WORKFLOW COMPLETED", lns))) "ok"
+               else if (any(grepl("ERROR|failed", lns, ignore.case=TRUE))) "error"
+               else "warn",
+      log    = paste(tail(lns, 500), collapse="\n")
+    ))
+  }
+  # No local workflow_*.log (the normal case on Posit Connect Cloud -- the
+  # nightly pipeline runs on the user's own machine via scripts/run_workflow.R,
+  # never on Connect Cloud itself, so LOGS_DIR is always empty there). Fall
+  # back to the SharePoint copy's own last-modified time: see
+  # sharepoint_last_pipeline_run() in R/data_source_sharepoint.R.
+  sp_info <- tryCatch(sharepoint_last_pipeline_run(), error = function(e) NULL)
+  if (!is.null(sp_info)) return(sp_info)
+  list(time="Never", status="idle", log="")
 }
 
 # String concatenation helper

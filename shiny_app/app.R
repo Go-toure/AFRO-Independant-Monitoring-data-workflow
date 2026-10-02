@@ -1083,14 +1083,21 @@ server <- function(input, output, session) {
     }
   }, ignoreNULL=TRUE)
 
+  # last_run_info() can now hit the SharePoint Graph API (on Posit Connect
+  # Cloud, where there's no local workflow_*.log -- see R/data_helpers.R).
+  # It has no reactive dependencies, so wrapping it in reactive() computes it
+  # once per session and shares that one result between the two blocks below
+  # instead of each triggering its own separate round of Graph calls.
+  last_run_info_r <- reactive({ last_run_info() })
+
   output$v_run <- renderText({
-    info <- last_run_info()
+    info <- last_run_info_r()
     updateTextInput(session, "v_run_placeholder", value=info$time)
     info$time
   })
 
   observe({
-    info <- last_run_info()
+    info <- last_run_info_r()
     shinyjs::html("v_run", info$time)
   })
 

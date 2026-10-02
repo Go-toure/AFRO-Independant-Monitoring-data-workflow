@@ -115,6 +115,52 @@ sp_download_file <- function(token, drive_id, remote_path, local_path) {
   })
 }
 
+# Metadata only (no file content) for one item -- used to read its
+# lastModifiedDateTime without downloading the file itself. Returns NULL on
+# any failure (missing item, bad credentials, network error, ...).
+sp_get_item_metadata <- function(token, drive_id, remote_path) {
+  tryCatch({
+    url <- sprintf(
+      "https://graph.microsoft.com/v1.0/drives/%s/root:/%s",
+      drive_id, utils::URLencode(remote_path)
+    )
+    httr2::request(url) |>
+      httr2::req_auth_bearer_token(token) |>
+      httr2::req_perform() |>
+      httr2::resp_body_json()
+  }, error = function(e) NULL)
+}
+
+# "Last Pipeline Run" as seen from Posit Connect Cloud. Connect Cloud never
+# runs scripts/run_workflow.R itself, so there is no local workflow_*.log for
+# last_run_info() (R/data_helpers.R) to read there -- it's always empty.
+# The best available signal in that environment is when AFRO_Inside_HH_M.csv
+# on SharePoint was itself last modified: scripts/upload_to_sharepoint.py
+# overwrites that file at the end of every successful nightly run, so its
+# lastModifiedDateTime effectively IS the last pipeline run time. Returns
+# NULL (never a partial/garbage result) if credentials are missing, any
+# Graph call fails, or the timestamp can't be parsed -- callers should treat
+# NULL the same as "unknown" and fall back accordingly.
+sharepoint_last_pipeline_run <- function() {
+  if (!sharepoint_credentials_available()) return(NULL)
+  tryCatch({
+    token     <- sp_get_graph_token()
+    drive_id  <- sp_resolve_drive_id(token)
+    item_path <- paste(SP_TARGET_FOLDER, SP_REMOTE_CSV, sep = "/")
+    meta <- sp_get_item_metadata(token, drive_id, item_path)
+    ts <- meta$lastModifiedDateTime
+    if (is.null(ts) || !nzchar(ts)) return(NULL)
+    ts   <- sub("\\.\\d+Z$", "Z", ts)  # drop fractional seconds, if any
+    when <- as.POSIXct(ts, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+    if (is.na(when)) return(NULL)
+    list(
+      time   = paste0(format(when, "%Y-%m-%d  %H:%M", tz = "UTC"), " UTC"),
+      status = "ok",
+      log    = ""
+    )
+  }, error = function(e) NULL)
+}
+
 # Downloads AFRO_Inside_HH_M.csv from SharePoint into `dest_path` (CLEANED_CSV
 # by default). Never throws -- returns TRUE/FALSE so load_im_data() can just
 # fall through to "no data" if this fails, same as a missing local file today.
