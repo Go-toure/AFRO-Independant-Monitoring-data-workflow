@@ -388,6 +388,25 @@ table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-alig
   height:100%; border-radius:3px; background:var(--kpi-accent,var(--blue));
   transition:width 1.6s cubic-bezier(.4,0,.2,1);
 }
+/* circular gauge -- alternative to .kpi2-val for a percentage-vs-target
+   metric (Coverage Rate, Caregiver Awareness). pathLength=100 on both
+   circles means stroke-dasharray/-dashoffset are plain 0-100 percentages,
+   no circumference math needed. Rotated -90deg so the fill starts at 12
+   oclock, like a clock face, instead of SVG's default 3 oclock start. */
+.kpi2-ring-wrap{
+  position:relative; width:72px; height:72px; margin:6px auto 0;
+}
+.kpi2-ring-svg{ width:100%; height:100%; display:block; transform:rotate(-90deg); }
+.kpi2-ring-track{ fill:none; stroke:rgba(16,24,41,.08); stroke-width:10; }
+.kpi2-ring-fill{
+  fill:none; stroke:var(--kpi-accent,var(--blue)); stroke-width:10;
+  stroke-linecap:round; transition:stroke-dashoffset 1.6s cubic-bezier(.4,0,.2,1);
+}
+.kpi2-ring-val{
+  position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  font-size:.92rem; font-weight:900; color:var(--dark);
+  font-variant-numeric:tabular-nums; letter-spacing:-.02em;
+}
 /* compact variant — used for the pinned top-of-dashboard KPI strip */
 .kpi2-compact{
   border-radius:14px!important; padding:12px 14px 10px!important;
@@ -540,16 +559,18 @@ function registerCountUpHandler() {
     Shiny.addCustomMessageHandler('countUp', function(d) {
       setTimeout(function(){
         countUp(d.id, d.v, d.ms||1200, d.pct||false);
-        // If this is a metric with a progress bar, animate the bar fill
+        // If this is a metric with a progress bar or ring, animate its fill
         if (d.bar_max) {
           var pct = Math.min(d.v / d.bar_max * 100, 100);
-          // find the kpi2-bar-fill inside the same kpi2 card
+          // find the kpi2-bar-fill / kpi2-ring-fill inside the same kpi2 card
           var el = document.getElementById(d.id);
           if (el) {
             var card = el.closest('.kpi2');
             if (card) {
               var fill = card.querySelector('.kpi2-bar-fill');
               if (fill) setTimeout(function(){ fill.style.width = pct + '%'; }, 200);
+              var ringFill = card.querySelector('.kpi2-ring-fill');
+              if (ringFill) setTimeout(function(){ ringFill.style.strokeDashoffset = (100 - pct); }, 200);
             }
           }
         }

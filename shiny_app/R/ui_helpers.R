@@ -11,10 +11,10 @@
 
 # ── UI COMPONENTS ─────────────────────────────────────────────────────────────
 kpi <- function(id, label, icon_chr = NULL, style, sub = "",
-                trend = NULL, bar_pct = NULL, compact = FALSE) {
+                trend = NULL, bar_pct = NULL, compact = FALSE, ring = FALSE) {
   # Map old style names → a single accent color. The card body itself stays
   # neutral/white (see .kpi2 in constants_css_js.R) -- the accent only drives
-  # the top border and the progress bar fill, so each card still reads at a
+  # the top border and the progress indicator, so each card still reads at a
   # glance without a full-color block, an icon badge, or a trend pill (icon_chr
   # and trend are accepted for backward compatibility with existing call
   # sites but are no longer rendered -- matches the plainer reference look:
@@ -28,17 +28,38 @@ kpi <- function(id, label, icon_chr = NULL, style, sub = "",
     "kpi-red"    = "#C0392B",
     "#005C97"
   )
+  # ring = TRUE swaps the flat big number for a circular gauge (percentage
+  # text centered inside a ring) -- same id, so the existing countUp() JS
+  # (R/constants_css_js.R) keeps animating the live number into it unchanged.
+  # The ring's fill is driven by the same countUp 'bar_max' message that used
+  # to animate .kpi2-bar-fill's width -- see registerCountUpHandler(), which
+  # now also looks for .kpi2-ring-fill and animates its stroke-dashoffset.
+  value_block <- if (ring) {
+    div(class = "kpi2-ring-wrap",
+      tags$svg(viewBox = "0 0 100 100", class = "kpi2-ring-svg",
+        tags$circle(class = "kpi2-ring-track", cx = "50", cy = "50", r = "40",
+                    pathLength = "100"),
+        tags$circle(class = "kpi2-ring-fill", cx = "50", cy = "50", r = "40",
+                    pathLength = "100",
+                    style = "stroke-dasharray:100;stroke-dashoffset:100;")
+      ),
+      div(class = "kpi2-ring-val", id = id, "—")
+    )
+  } else {
+    div(class = "kpi2-val", id = id, "—")
+  }
   div(class = paste0("kpi2", if (compact) " kpi2-compact" else ""),
       style = paste0("--kpi-accent:", accent, ";"),
     div(class = "kpi2-label", label),
     div(class = "kpi2-body",
-      div(class = "kpi2-val", id = id, "—"),
+      value_block,
       if (nchar(sub) > 0)
         div(style = paste0("font-size:", if (compact) ".58rem" else ".67rem",
-                            ";color:var(--muted);margin-top:3px;position:relative;z-index:1;"), sub)
+                            ";color:var(--muted);margin-top:3px;position:relative;z-index:1;",
+                            if (ring) "text-align:center;" else ""), sub)
     ),
-    # thin progress bar
-    if (!is.null(bar_pct))
+    # thin progress bar -- skipped when ring = TRUE, the ring already shows it
+    if (!is.null(bar_pct) && !ring)
       div(class = "kpi2-bar",
         div(class = "kpi2-bar-fill",
             style = paste0("width:", min(bar_pct * 100, 100), "%;")))

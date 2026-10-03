@@ -129,9 +129,9 @@ ui <- page_navbar(
         div(class="row row-cols-2 row-cols-md-4 row-cols-xl-8 g-2 mb-3",
           div(class="col", div(class="fade-up d1", kpi("v_records",   "Total Records",      bs_icon("clipboard-data-fill"),"kpi-blue",  "filtered",   trend="live", compact=TRUE))),
           div(class="col", div(class="fade-up d2", kpi("v_hh",        "Households Visited", bs_icon("house-fill"),"kpi-teal",  "HH reached", trend=NULL, compact=TRUE))),
-          div(class="col", div(class="fade-up d3", kpi("v_cv",        "Coverage Rate",      bs_icon("check-circle-fill"),"kpi-green", "vs 90% target", trend="target 90%", bar_pct=0.0, compact=TRUE))),
+          div(class="col", div(class="fade-up d3", kpi("v_cv",        "Coverage Rate",      bs_icon("check-circle-fill"),"kpi-green", "vs 90% target", trend="target 90%", bar_pct=0.0, compact=TRUE, ring=TRUE))),
           div(class="col", div(class="fade-up d4", kpi("v_missed",    "Missed Children",    bs_icon("person-fill"),"kpi-red",   "", trend=NULL, compact=TRUE))),
-          div(class="col", div(class="fade-up d1", kpi("v_awareness", "Caregiver Awareness",bs_icon("megaphone-fill"),"kpi-orange","SM",       trend="target 80%", bar_pct=0.0, compact=TRUE))),
+          div(class="col", div(class="fade-up d1", kpi("v_awareness", "Caregiver Awareness",bs_icon("megaphone-fill"),"kpi-orange","SM",       trend="target 80%", bar_pct=0.0, compact=TRUE, ring=TRUE))),
           div(class="col", div(class="fade-up d2", kpi("v_risk_crit", "Critical Districts", bs_icon("exclamation-circle-fill"),"kpi-purple","risk ≥70", trend=NULL, compact=TRUE))),
           div(class="col", div(class="fade-up d3", kpi("v_countries", "Countries",          bs_icon("globe-europe-africa"),"kpi-teal",  "in scope", trend=NULL, compact=TRUE))),
           div(class="col", div(class="fade-up d4", kpi("v_run",       "Last Pipeline Run",  bs_icon("clock-history"),"kpi-blue",  "",         trend=NULL, compact=TRUE)))
@@ -439,7 +439,7 @@ ui <- page_navbar(
       card_body(
         div(class="info-banner mb-3",
           tags$b("Source:"), tags$code("raw_state"),
-          " - pulls a form's raw data directly from SharePoint. Forms too large for one Excel sheet are automatically split into one file per year (zipped). Pick a specific Year, Response, and/or Round Number to narrow the download down to just that slice instead of every record for the form, any of the three can be combined, and setting any of them always returns a single file (never a zip)."),
+          " — pulls a form's raw data directly from SharePoint. Forms too large for one Excel sheet are automatically split into one file per year (zipped). Pick a specific Year, Response, and/or Round Number to narrow the download down to just that slice instead of every record for the form — any of the three can be combined, and setting any of them always returns a single file (never a zip)."),
         # Plain Bootstrap row/col (flexbox), not bslib's layout_columns()
         # (CSS Grid) -- two selectize widgets side by side inside a
         # layout_columns() grid cell were overlapping/overflowing their
