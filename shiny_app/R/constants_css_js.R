@@ -394,12 +394,12 @@ table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-alig
    no circumference math needed. Rotated -90deg so the fill starts at 12
    oclock, like a clock face, instead of SVG's default 3 oclock start. */
 .kpi2-ring-wrap{
-  position:relative; width:72px; height:72px; margin:6px auto 0;
+  position:relative; width:72px; height:72px; margin:4px auto 0;
 }
 .kpi2-ring-svg{ width:100%; height:100%; display:block; transform:rotate(-90deg); }
-.kpi2-ring-track{ fill:none; stroke:rgba(16,24,41,.08); stroke-width:10; }
+.kpi2-ring-track{ fill:none; stroke:rgba(16,24,41,.08); stroke-width:8; }
 .kpi2-ring-fill{
-  fill:none; stroke:var(--kpi-accent,var(--blue)); stroke-width:10;
+  fill:none; stroke:var(--kpi-accent,var(--blue)); stroke-width:8;
   stroke-linecap:round; transition:stroke-dashoffset 1.6s cubic-bezier(.4,0,.2,1);
 }
 .kpi2-ring-val{
@@ -416,6 +416,13 @@ table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-alig
 .kpi2-compact .kpi2-val{ font-size:1.3rem!important; letter-spacing:-.02em!important; }
 .kpi2-compact .kpi2-label{ font-size:.58rem!important; }
 .kpi2-compact .kpi2-bar{ margin-top:8px!important; }
+/* shrink the ring to match the compact card's natural height -- otherwise
+   its taller content stretches the whole row (Bootstrap equal-heights
+   columns), making every card in that row look oversized next to flat ones */
+.kpi2-compact .kpi2-ring-wrap{
+  width:54px!important; height:54px!important; margin:2px auto 0!important;
+}
+.kpi2-compact .kpi2-ring-val{ font-size:.62rem!important; }
 
 /* ─ Dot-grid page background ─────────────────────────── */
 body::before{
