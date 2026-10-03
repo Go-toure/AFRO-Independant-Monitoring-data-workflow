@@ -10,12 +10,15 @@
 # ============================================================
 
 # ── UI COMPONENTS ─────────────────────────────────────────────────────────────
-kpi <- function(id, label, icon_chr, style, sub = "",
+kpi <- function(id, label, icon_chr = NULL, style, sub = "",
                 trend = NULL, bar_pct = NULL, compact = FALSE) {
   # Map old style names → a single accent color. The card body itself stays
   # neutral/white (see .kpi2 in constants_css_js.R) -- the accent only drives
-  # the top border, the top glow/"shadow", the icon chip, and the progress
-  # bar fill, so each card still reads at a glance without a full-color block.
+  # the top border and the progress bar fill, so each card still reads at a
+  # glance without a full-color block, an icon badge, or a trend pill (icon_chr
+  # and trend are accepted for backward compatibility with existing call
+  # sites but are no longer rendered -- matches the plainer reference look:
+  # label, value, caption, nothing else).
   accent <- switch(style,
     "kpi-blue"   = "#005C97",
     "kpi-teal"   = "#00908F",
@@ -27,19 +30,12 @@ kpi <- function(id, label, icon_chr, style, sub = "",
   )
   div(class = paste0("kpi2", if (compact) " kpi2-compact" else ""),
       style = paste0("--kpi-accent:", accent, ";"),
-    # top row: chip + optional trend pill
-    div(class = "kpi2-top",
-      div(class = "kpi2-chip", icon_chr),
-      if (!is.null(trend))
-        div(class = "kpi2-trend", trend)
-    ),
-    # main value + label
+    div(class = "kpi2-label", label),
     div(class = "kpi2-body",
       div(class = "kpi2-val", id = id, "—"),
-      div(class = "kpi2-label", label),
       if (nchar(sub) > 0)
         div(style = paste0("font-size:", if (compact) ".58rem" else ".67rem",
-                            ";opacity:.68;margin-top:3px;position:relative;z-index:1;"), sub)
+                            ";color:var(--muted);margin-top:3px;position:relative;z-index:1;"), sub)
     ),
     # thin progress bar
     if (!is.null(bar_pct))

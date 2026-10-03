@@ -368,32 +368,16 @@ table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-alig
 }
 .kpi2::before{ content:none; }
 .kpi2::after{ content:none; }
-/* icon chip -- carries the accent color so each card still reads at a glance */
-.kpi2-chip{
-  display:inline-flex; align-items:center; justify-content:center;
-  width:40px; height:40px; border-radius:12px;
-  background:var(--kpi-accent,var(--blue)); color:#fff; font-size:1.25rem; line-height:1;
-  position:relative; z-index:1; flex-shrink:0;
-  box-shadow:0 4px 10px -2px var(--kpi-accent,var(--blue));
+/* label sits first, on its own -- no icon badge, no trend pill */
+.kpi2-label{
+  font-size:.67rem; font-weight:700; letter-spacing:.09em;
+  text-transform:uppercase; color:var(--muted); position:relative; z-index:1;
 }
-.kpi2-top{
-  display:flex; align-items:flex-start;
-  justify-content:space-between; position:relative; z-index:1;
-}
-.kpi2-trend{
-  font-size:.65rem; font-weight:800; letter-spacing:.03em;
-  background:rgba(16,24,41,.06); color:var(--muted); border-radius:20px;
-  padding:3px 9px;
-}
-.kpi2-body{ position:relative; z-index:1; margin-top:10px; }
+.kpi2-body{ position:relative; z-index:1; margin-top:8px; }
 .kpi2-val{
   font-size:2.2rem; font-weight:900; line-height:1.05;
   letter-spacing:-.035em; font-variant-numeric:tabular-nums;
   color:var(--dark);
-}
-.kpi2-label{
-  font-size:.67rem; font-weight:700; letter-spacing:.09em;
-  text-transform:uppercase; color:var(--muted); margin-top:2px;
 }
 /* thin progress strip at bottom */
 .kpi2-bar{
@@ -409,11 +393,6 @@ table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-alig
   border-radius:14px!important; padding:12px 14px 10px!important;
   min-height:96px!important;
 }
-.kpi2-compact .kpi2-chip{
-  width:28px!important; height:28px!important; border-radius:8px!important;
-  font-size:.9rem!important;
-}
-.kpi2-compact .kpi2-trend{ font-size:.55rem!important; padding:2px 7px!important; }
 .kpi2-compact .kpi2-body{ margin-top:6px!important; }
 .kpi2-compact .kpi2-val{ font-size:1.3rem!important; letter-spacing:-.02em!important; }
 .kpi2-compact .kpi2-label{ font-size:.58rem!important; }
