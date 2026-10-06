@@ -1978,8 +1978,8 @@ def _clear_stale_partitions(form_id: int) -> None:
 
     token, drive_id = _get_sp_session()
     if token:
-        if sp.delete_item(token, drive_id, _sp_partition_folder(form_id)):
-            detail(f"[sharepoint] Form {form_id} | Cleared stale partition folder on SharePoint (if any existed).")
+        if sp.delete_item(token, drive_id, _sp_partition_folder(form_id), permanent=True):
+            detail(f"[sharepoint] Form {form_id} | Cleared stale partition folder on SharePoint (if any existed; permanent delete, no recycle bin).")
         else:
             detail(f"[sharepoint] Form {form_id} | WARNING: could not clear stale partition folder on SharePoint.")
 

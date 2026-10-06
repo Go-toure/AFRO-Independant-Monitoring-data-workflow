@@ -450,17 +450,51 @@ def prune_old_versions(token: str, drive_id: str, remote_path: str, keep_version
         return 0
 
 
-def delete_item(token: str, drive_id: str, item_path: str) -> bool:
+def delete_item(token: str, drive_id: str, item_path: str, permanent: bool = False) -> bool:
     """Delete an item (file, or a folder and everything under it) by its
     path, relative to the library root. Returns True once it's gone --
     including when it was already absent, so a caller doesn't need to
     check existence first -- and False only on a real failure. Never
-    raises. Deleting through Graph goes to SharePoint's own recycle bin
-    the same as deleting it by hand in the browser, so this is
-    recoverable, not a permanent destroy."""
+    raises.
+
+    permanent=False (default): a normal Graph DELETE. The item goes to
+    SharePoint's recycle bin, same as deleting it by hand in the browser,
+    so it is recoverable -- but it also keeps counting against the storage
+    quota until someone empties the bin.
+
+    permanent=True: Graph driveItem permanentDelete, which skips the
+    recycle bin entirely, so this pipeline never leaves anything behind in
+    a bin that only an admin can empty. NOT recoverable -- use it only for
+    data the pipeline itself regenerates (e.g. stale partition folders).
+    If permanentDelete can't be used (the item id can't be resolved, or
+    Graph refuses the call), this logs why and falls back to the normal
+    recoverable DELETE rather than leaving the stale item in place."""
     try:
-        url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{item_path}"
-        r = _request_with_retry("DELETE", url, headers=_auth(token), timeout=60)
+        item_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{item_path}"
+        if permanent:
+            g = _request_with_retry("GET", item_url + "?$select=id",
+                                    headers=_auth(token), timeout=60)
+            if g.status_code == 404:
+                return True
+            item_id = None
+            if g.status_code == 200:
+                try:
+                    item_id = (g.json() or {}).get("id")
+                except ValueError:
+                    item_id = None
+            if item_id:
+                p = _request_with_retry(
+                    "POST",
+                    f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/permanentDelete",
+                    headers=_auth(token), timeout=60)
+                if p.status_code in (200, 204, 404):
+                    return True
+                _log_sp_failure("delete_item:permanentDelete (falling back to recycle-bin delete)",
+                                item_path, response=p)
+            else:
+                _log_sp_failure("delete_item:resolve id (falling back to recycle-bin delete)",
+                                item_path, response=g)
+        r = _request_with_retry("DELETE", item_url, headers=_auth(token), timeout=60)
         if r.status_code in (204, 404):
             return True
         r.raise_for_status()
