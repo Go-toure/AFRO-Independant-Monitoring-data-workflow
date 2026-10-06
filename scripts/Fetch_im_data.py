@@ -3571,6 +3571,21 @@ def main() -> None:
     console("➡️  Next step: run regional_im_repository_builder.R")
     console("")
 
+    report_sharepoint_bin_usage()
+
+
+def report_sharepoint_bin_usage() -> None:
+    """Read-only SharePoint recycle bin measurement, printed at the end of a run.
+
+    Never deletes anything and never fails the pipeline: any problem (missing
+    credentials, missing Graph permission, network) is logged and skipped.
+    """
+    try:
+        import sharepoint_bin_report
+        sharepoint_bin_report.run_report(print_fn=console)
+    except Exception as e:
+        detail(f"[sharepoint-bin] check skipped: {type(e).__name__}: {e}")
+
 
 if __name__ == "__main__":
     main()

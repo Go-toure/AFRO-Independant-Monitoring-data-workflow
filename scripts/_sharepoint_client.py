@@ -468,3 +468,122 @@ def delete_item(token: str, drive_id: str, item_path: str) -> bool:
     except requests.exceptions.RequestException as e:
         _log_sp_failure("delete_item", item_path, response=getattr(e, "response", None), exc=e)
         return False
+
+
+def get_site_id(token: str) -> Optional[str]:
+    """Resolve the Graph id of this workflow's SharePoint site (the same
+    site get_drive_id() resolves the library under). None on any failure."""
+    try:
+        r = requests.get(
+            f"https://graph.microsoft.com/v1.0/sites/{SP_HOSTNAME}:{SP_SITE_PATH}",
+            headers=_auth(token), timeout=60,
+        )
+        r.raise_for_status()
+        return r.json().get("id")
+    except requests.exceptions.RequestException:
+        return None
+
+
+def _norm_location(s: str) -> str:
+    """Lower-cased, URL-decoded, forward-slash form of a SharePoint path, so
+    a folder marker matches regardless of %20 vs space or slash direction."""
+    from urllib.parse import unquote
+    return unquote(s or "").replace("\\", "/").lower()
+
+
+def measure_recycle_bin(
+    token: str,
+    folder_marker: str,
+    max_pages: int = 40,
+    page_size: int = 200,
+) -> Dict:
+    """READ-ONLY. Measures what is sitting in this site's recycle bin, and
+    how much of it was deleted from under `folder_marker` (a path fragment
+    such as '.../Cloud-Independant-Monitoring/raw_state'). Never deletes,
+    restores or modifies anything, and never raises.
+
+    Why this exists: prune_old_versions() removes old file versions through
+    Graph, but deleted versions normally land in SharePoint's recycle bin
+    and keep counting against the storage quota until the bin is emptied
+    (or ages out). This reports how much storage is parked there from this
+    pipeline's own folder versus the rest of the (shared) site, so the
+    real size of the problem is known before any purge is built.
+
+    Uses the Graph BETA endpoint GET /sites/{id}/recycleBin/items -- it is
+    not in v1.0, so it can change or need a permission this app
+    registration lacks (typically 403). That is reported in the returned
+    dict, not raised.
+
+    Returns a dict. Always has "ok" (bool). On failure: "status" (HTTP code
+    or None) and "error". On success: mine_items / mine_bytes (deleted from
+    under folder_marker), all_items / all_bytes (whole site bin),
+    oldest_mine / newest_mine (deletedDateTime), top_names (up to 5
+    [name, items, bytes] under the marker, largest first), sample_locations
+    (a few distinct deletedFromLocation values, to check the marker matches
+    the real format), pages, truncated (True if max_pages was hit, so the
+    totals are a lower bound).
+    """
+    marker = _norm_location(folder_marker)
+    try:
+        site_id = get_site_id(token)
+        if not site_id:
+            return {"ok": False, "status": None, "error": "could not resolve the SharePoint site id"}
+
+        url = f"https://graph.microsoft.com/beta/sites/{site_id}/recycleBin/items?$top={page_size}"
+        mine_items = mine_bytes = all_items = all_bytes = pages = 0
+        oldest = newest = None
+        by_name: Dict[str, List[int]] = {}
+        mine_locs: List[str] = []
+        other_locs: List[str] = []
+        truncated = False
+
+        while url:
+            if pages >= max_pages:
+                truncated = True
+                break
+            r = _request_with_retry("GET", url, headers=_auth(token), timeout=60)
+            if r.status_code != 200:
+                _log_sp_failure("measure_recycle_bin", "recycleBin/items", response=r)
+                return {"ok": False, "status": r.status_code,
+                        "error": (r.text or "")[:200].replace("\n", " ")}
+            pages += 1
+            body = r.json()
+            for it in body.get("value", []):
+                size = int(it.get("size") or 0)
+                loc = it.get("deletedFromLocation") or ""
+                all_items += 1
+                all_bytes += size
+                if marker and marker in _norm_location(loc):
+                    mine_items += 1
+                    mine_bytes += size
+                    when = it.get("deletedDateTime") or ""
+                    if when:
+                        oldest = when if oldest is None or when < oldest else oldest
+                        newest = when if newest is None or when > newest else newest
+                    agg = by_name.setdefault(it.get("name") or "(unnamed)", [0, 0])
+                    agg[0] += 1
+                    agg[1] += size
+                    if loc and loc not in mine_locs and len(mine_locs) < 3:
+                        mine_locs.append(loc)
+                elif loc and loc not in other_locs and len(other_locs) < 3:
+                    other_locs.append(loc)
+            url = body.get("@odata.nextLink")
+
+        top = sorted(by_name.items(), key=lambda kv: kv[1][1], reverse=True)[:5]
+        return {
+            "ok": True,
+            "mine_items": mine_items, "mine_bytes": mine_bytes,
+            "all_items": all_items, "all_bytes": all_bytes,
+            "oldest_mine": oldest, "newest_mine": newest,
+            "top_names": [[n, v[0], v[1]] for n, v in top],
+            # When nothing matched, show where the other items came from so the
+            # marker can be corrected; otherwise show where the matches came from.
+            "sample_locations": mine_locs if mine_items else other_locs,
+            "pages": pages, "truncated": truncated,
+        }
+    except requests.exceptions.RequestException as e:
+        _log_sp_failure("measure_recycle_bin", "recycleBin/items",
+                        response=getattr(e, "response", None), exc=e)
+        return {"ok": False, "status": None, "error": f"{type(e).__name__}: {e}"}
+    except (KeyError, ValueError, TypeError) as e:
+        return {"ok": False, "status": None, "error": f"unexpected response shape: {e}"}
