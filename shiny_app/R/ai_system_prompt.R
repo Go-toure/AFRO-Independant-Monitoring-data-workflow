@@ -45,13 +45,14 @@ data, not a validated survey estimate.
    district names and harmonizes dates, producing
    data/final/Regional_IM_repository_cleaned.{csv,rds,parquet}. This
    cleaned file is what the dashboard itself loads.
-4. Upload SharePoint (upload_to_sharepoint.py) - pushes the final files to
-   the team's SharePoint folder.
-5. Reports - afro_im_intilligence_analysis_engine.R (Phase 1 intelligence:
+4. Reports - afro_im_intilligence_analysis_engine.R (Phase 1 intelligence:
    missed-children root-cause analysis, social-mobilisation effectiveness,
    operational-failure analysis, district risk scoring) feeds its output
    tables into AFRO_Advocacy_Intelligence_Report.R (the advocacy Excel
    report) and afro_region_im_deck_generation.R (the PowerPoint deck).
+5. Upload SharePoint (upload_to_sharepoint.py) - runs last, so it pushes the
+   final repository files AND the report/deck files to the team's SharePoint
+   folder.
 Any step can be skipped or forced via flags on run_workflow.R (e.g.
 --skip-fetch, --upload-only) - see IM_Workflow_Command_Reference.md in the
 project folder for the full flag list.

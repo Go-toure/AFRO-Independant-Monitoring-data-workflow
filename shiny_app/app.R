@@ -409,8 +409,8 @@ ui <- page_navbar(
             actionButton("run_fetch",  hdr_icon("cloud-download-fill",       "1. Fetch Data"),        class="btn-outline-primary"),
             actionButton("run_build",  hdr_icon("database-fill-gear",        "2. Build Repository"),  class="btn-outline-primary"),
             actionButton("run_clean",  hdr_icon("eraser-fill",               "3. Clean Geonames"),    class="btn-outline-primary"),
-            actionButton("run_upload", hdr_icon("cloud-arrow-up-fill",       "4. Upload SharePoint"), class="btn-outline-primary"),
-            actionButton("run_rpts",   hdr_icon("file-earmark-bar-graph-fill","5. Generate Reports & Deck"), class="btn-outline-primary"),
+            actionButton("run_rpts",   hdr_icon("file-earmark-bar-graph-fill","4. Generate Reports & Deck"), class="btn-outline-primary"),
+            actionButton("run_upload", hdr_icon("cloud-arrow-up-fill",       "5. Upload SharePoint"), class="btn-outline-primary"),
             tags$hr(style="border-color:rgba(0,0,0,.08);margin:4px 0;"),
             actionButton("btn_rl_data", hdr_icon("arrow-repeat", "Reload Data"),  class="btn-outline-success btn-sm"),
             actionButton("btn_rl_log",  hdr_icon("arrow-repeat", "Refresh Log"),  class="btn-outline-secondary btn-sm")
@@ -2731,6 +2731,10 @@ server <- function(input, output, session) {
   rv_steps <- reactiveVal(rep("pending", 6L))
   rv_proc  <- reactiveVal(NULL)   # list(proc, step_idx, lf, pos)
   rv_queue <- reactiveVal(integer(0))
+  # TRUE when a report step (4 = Intelligence Engine, 5 = Report + Deck) failed
+  # but Upload SharePoint (6) was still run afterwards -- see the failure branch
+  # below. Keeps the final status "error" even though the last step succeeded.
+  rv_soft_error <- reactiveVal(FALSE)
 
   # Stop button only makes sense while something is actually running.
   observe({
@@ -2772,6 +2776,10 @@ server <- function(input, output, session) {
   # and as run_workflow.R's own source()-based steps already do). Every
   # subprocess call below matches that same plain "Rscript scriptname.R"
   # invocation on purpose.
+  # Order matters: Upload SharePoint runs LAST so the Intelligence Report, Word
+  # brief, Deck and Phase 1 workbook (all written by steps 4-5) exist by the time
+  # upload_to_sharepoint.py looks for them -- when it ran as step 4 it always
+  # reported them missing and skipped them.
   STEPS <- list(
     list(n=1L, label="Fetch Data",        icon="cloud-download-fill",
          cmd="Rscript",
@@ -2785,20 +2793,20 @@ server <- function(input, output, session) {
          cmd="Rscript",
          args=c(file.path(WORKFLOW_DIR,"scripts","run_workflow.R"),
                 "--skip-fetch","--skip-build","--skip-upload","--skip-reports")),
-    list(n=4L, label="Upload SharePoint", icon="cloud-arrow-up-fill",
-         cmd=PYTHON_CMD,
-         args=c(file.path(WORKFLOW_DIR,"scripts","upload_to_sharepoint.py"),
-                "--base-dir", WORKFLOW_DIR, "--all")),
-    list(n=5L, label="Intelligence Engine", icon="cpu-fill",
+    list(n=4L, label="Intelligence Engine", icon="cpu-fill",
          cmd="Rscript",
          args=c(file.path(WORKFLOW_DIR,"scripts","afro_im_intilligence_analysis_engine.R"))),
-    list(n=6L, label="Generate Report + Deck",  icon="file-earmark-bar-graph-fill",
+    list(n=5L, label="Generate Report + Deck",  icon="file-earmark-bar-graph-fill",
          cmd="Rscript",
          # Runs the Advocacy Report and the PowerPoint deck as ONE step
          # (scripts/generate_reports_and_deck.R sources both in
          # sequence) instead of two separate pills/subprocesses -- see
          # that wrapper's own header comment for why.
-         args=c(file.path(WORKFLOW_DIR,"scripts","generate_reports_and_deck.R")))
+         args=c(file.path(WORKFLOW_DIR,"scripts","generate_reports_and_deck.R"))),
+    list(n=6L, label="Upload SharePoint", icon="cloud-arrow-up-fill",
+         cmd=PYTHON_CMD,
+         args=c(file.path(WORKFLOW_DIR,"scripts","upload_to_sharepoint.py"),
+                "--base-dir", WORKFLOW_DIR, "--all"))
   )
 
   # Launch one step as a background process --------------------------------
@@ -2912,17 +2920,36 @@ server <- function(input, output, session) {
         rv_log(paste0(isolate(rv_log()),
                       "\n[ERROR] Step ", step_idx,
                       " failed (exit code: ", exit_code, ")"))
-        rv_stat("error"); rv_proc(NULL); rv_queue(integer(0))
+        q_left <- isolate(rv_queue())
+        if (step_idx %in% c(4L, 5L) && 6L %in% q_left) {
+          # Upload SharePoint now runs AFTER the report steps. A failed report
+          # must not stop the freshly built repository files from being
+          # published, so skip the remaining report step(s) and still upload.
+          rv_soft_error(TRUE)
+          rv_log(paste0(isolate(rv_log()),
+                        "\n[WARN] Report step failed -- still running Upload SharePoint ",
+                        "so the repository files are published.\n"))
+          rv_proc(NULL); rv_queue(integer(0))
+          launch_step(6L)
+        } else {
+          rv_stat("error"); rv_proc(NULL); rv_queue(integer(0))
+        }
       } else {
         rv_log(paste0(isolate(rv_log()),
                       "\n[OK] Step ", step_idx, " complete\n"))
         rv_proc(NULL)
         q <- isolate(rv_queue())
         if (length(q) == 0L) {
-          rv_stat("ok")
           rv$data <- load_im_data()
-          showNotification("Pipeline complete — data refreshed.",
-                           type="message", duration=6)
+          if (isolate(rv_soft_error())) {
+            rv_stat("error")
+            showNotification("Pipeline finished, but a report step failed. The repository was uploaded and the data refreshed - see the log.",
+                             type="warning", duration=10)
+          } else {
+            rv_stat("ok")
+            showNotification("Pipeline complete — data refreshed.",
+                             type="message", duration=6)
+          }
         } else {
           rv_queue(q[-1L]); launch_step(q[1L])
         }
@@ -2934,6 +2961,7 @@ server <- function(input, output, session) {
   step_start <- function(clear_log = TRUE, header = NULL) {
     rv_steps(rep("pending", 6L))
     rv_queue(integer(0L))
+    rv_soft_error(FALSE)
     reset_log_pos()   # start reading workflow log from current EOF
     if (clear_log) {
       msg <- if (!is.null(header)) paste0(header, "\n") else
@@ -2955,13 +2983,13 @@ server <- function(input, output, session) {
     launch_step(3L)
   })
   observeEvent(input$run_upload, {
-    step_start(header = "[4] UPLOAD SHAREPOINT\n")
-    launch_step(4L)
+    step_start(header = "[5] UPLOAD SHAREPOINT\n")
+    launch_step(6L)
   })
   observeEvent(input$run_rpts, {
-    step_start(header = "[5-6] GENERATE REPORTS (Intelligence Engine + Advocacy Report + Deck)\n")
-    rv_queue(6L)
-    launch_step(5L)
+    step_start(header = "[4] GENERATE REPORTS (Intelligence Engine + Advocacy Report + Deck)\n")
+    rv_queue(5L)
+    launch_step(4L)
   })
   observeEvent(input$run_all, {
     step_start(header = paste0("▶  FULL PIPELINE STARTED\n── ",
