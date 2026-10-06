@@ -85,11 +85,18 @@ def _log_sp_failure(
         pass
 
 
+# Statuses worth retrying on an idempotent-or-safe Graph call: 429 (throttled)
+# plus the "SharePoint is briefly unavailable" 5xx family (observed 2026-10-06:
+# an HTTP 503 HTML error page mid-upload cost one form its CSV twin for a run).
+_TRANSIENT_STATUSES = (429, 502, 503, 504)
+
+
 def _request_with_retry(
     method: str,
     url: str,
     max_attempts: int = 4,
     retry_delays: Optional[List[int]] = None,
+    retry_statuses: tuple = (429,),
     **kwargs,
 ) -> "requests.Response":
     """requests.request(), retrying up to max_attempts times on a 429
@@ -116,7 +123,7 @@ def _request_with_retry(
 
     response = requests.request(method, url, **kwargs)
     for attempt in range(1, max_attempts):
-        if response.status_code != 429:
+        if response.status_code not in retry_statuses:
             return response
 
         retry_after = response.headers.get("Retry-After")
@@ -126,7 +133,8 @@ def _request_with_retry(
             delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
 
         print(
-            f"   [sharepoint] Rate limited (429) on {method} {url.split('?')[0]} -- "
+            f"   [sharepoint] {'Rate limited' if response.status_code == 429 else 'Temporary error'} "
+            f"({response.status_code}) on {method} {url.split('?')[0]} -- "
             f"waiting {delay}s (attempt {attempt}/{max_attempts - 1})...",
             flush=True,
         )
@@ -311,11 +319,47 @@ def upload_file(token: str, drive_id: str, local_path: Path, remote_path: str) -
             headers={**_auth(token), "Content-Type": "application/octet-stream"},
             data=content,
             timeout=300,
+            retry_statuses=_TRANSIENT_STATUSES,
         )
         r.raise_for_status()
         return True
     except requests.exceptions.RequestException as e:
         _log_sp_failure("upload_file", remote_path, response=getattr(e, "response", None), exc=e)
+        return False
+
+
+# Chunk-level resilience (added 2026-10-06 after an HTTP 503 from SharePoint
+# in the middle of a chunked upload abandoned the whole file with no retry).
+# 416 = our chunk range no longer matches what the session expects, which
+# happens right after a 5xx whose request the server had actually received.
+_CHUNK_RETRY_STATUSES = (416, 429, 500, 502, 503, 504)
+_CHUNK_RETRY_DELAYS = [5, 15, 45, 90]
+
+
+def _upload_session_next_start(upload_url: str) -> Optional[int]:
+    """Where an open Graph upload session expects the next byte, or None if
+    that can't be determined (session finished or expired, network error).
+    The uploadUrl is pre-authenticated, so no Authorization header."""
+    try:
+        r = requests.get(upload_url, timeout=60)
+        if r.status_code != 200:
+            return None
+        ranges = (r.json() or {}).get("nextExpectedRanges") or []
+        if not ranges:
+            return None
+        return int(str(ranges[0]).split("-")[0])
+    except (requests.exceptions.RequestException, ValueError):
+        return None
+
+
+def _remote_size_equals(token: str, drive_id: str, remote_path: str, expected: int) -> bool:
+    """True if the item at remote_path exists and is exactly `expected` bytes."""
+    try:
+        r = requests.get(
+            f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{remote_path}?$select=size",
+            headers=_auth(token), timeout=30)
+        return r.status_code == 200 and int((r.json() or {}).get("size", -1)) == expected
+    except (requests.exceptions.RequestException, ValueError):
         return False
 
 
@@ -334,36 +378,73 @@ def _upload_large_file(token: str, drive_id: str, local_path: Path, remote_path:
             headers=_auth(token),
             json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
             timeout=60,
+            retry_statuses=_TRANSIENT_STATUSES,
         )
         session_resp.raise_for_status()
         upload_url = session_resp.json()["uploadUrl"]
 
         with open(local_path, "rb") as f:
             start = 0
+            retries = 0
             while start < file_size:
+                f.seek(start)
                 chunk = f.read(_UPLOAD_CHUNK_SIZE)
                 if not chunk:
                     break
                 end = start + len(chunk) - 1
 
-                r = _request_with_retry(
-                    "PUT",
-                    upload_url,
-                    headers={
-                        "Content-Length": str(len(chunk)),
-                        "Content-Range": f"bytes {start}-{end}/{file_size}",
-                    },
-                    data=chunk,
-                    timeout=300,
-                )
+                r = None
+                err = None
+                try:
+                    r = _request_with_retry(
+                        "PUT",
+                        upload_url,
+                        retry_statuses=(),  # retried below, with a session-status check
+                        headers={
+                            "Content-Length": str(len(chunk)),
+                            "Content-Range": f"bytes {start}-{end}/{file_size}",
+                        },
+                        data=chunk,
+                        timeout=300,
+                    )
+                except requests.exceptions.RequestException as e:
+                    err = e  # timeout / dropped connection: treated like a 5xx
 
                 # 200/201 on the final chunk (item created), 202 ("Accepted")
                 # on every chunk in between.
-                if r.status_code not in (200, 201, 202):
-                    _log_sp_failure("_upload_large_file:chunk", remote_path, response=r)
-                    return False
+                if r is not None and r.status_code in (200, 201, 202):
+                    start += len(chunk)
+                    retries = 0
+                    continue
 
-                start += len(chunk)
+                retryable = r is None or r.status_code in _CHUNK_RETRY_STATUSES
+                if retryable and retries < len(_CHUNK_RETRY_DELAYS):
+                    delay = _CHUNK_RETRY_DELAYS[retries]
+                    try:
+                        if r is not None and r.headers.get("Retry-After"):
+                            delay = max(delay, int(r.headers["Retry-After"]))
+                    except (TypeError, ValueError):
+                        pass
+                    retries += 1
+                    code = r.status_code if r is not None else type(err).__name__
+                    print(
+                        f"   [sharepoint] Upload chunk {start}-{end} of {remote_path} got {code} -- "
+                        f"retry {retries}/{len(_CHUNK_RETRY_DELAYS)} in {delay}s...",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    # Ask the session where it actually is: if the server did
+                    # receive our chunk before the error, resume after it
+                    # instead of re-sending (which would 416).
+                    nxt = _upload_session_next_start(upload_url)
+                    if nxt is not None:
+                        start = nxt
+                    elif _remote_size_equals(token, drive_id, remote_path, file_size):
+                        return True  # session is gone because the upload had already completed
+                    continue
+
+                _log_sp_failure("_upload_large_file:chunk", remote_path, response=r, exc=err)
+                return False
 
         return True
     except requests.exceptions.RequestException as e:

@@ -181,8 +181,8 @@ def _read_parquet_low_memory(path, filters=None) -> pd.DataFrame:
     return df
 
 from pathlib import Path
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Union
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Optional, Set, Union
 
 
 # ============================================================
@@ -337,7 +337,81 @@ SP_RAW_FOLDER = "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/raw_st
 # removed.
 SP_RAW_VERSIONS_TO_KEEP = 1
 
+# Set SP_PARTITION_UPLOAD_ALL=1 to switch the changed-years-only upload of a
+# partitioned form's year files (see _partition_needs_upload()) back to the
+# original behaviour of re-uploading every year on every run.
+SP_PARTITION_UPLOAD_ALL = os.environ.get("SP_PARTITION_UPLOAD_ALL", "").strip().lower() in ("1", "true", "yes")
+
 _sp_session = {"tried": False, "token": None, "drive_id": None, "folder_ready": False}
+
+
+def _parse_graph_time(value) -> Optional[datetime]:
+    """Graph's lastModifiedDateTime ("2026-10-06T09:41:00Z", optionally with
+    fractional seconds or a +hh:mm offset) as a timezone-aware datetime, or
+    None if it can't be read."""
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})?$",
+                 str(value or "").strip())
+    if not m:
+        return None
+    parsed = datetime.fromisoformat(m.group(1)).replace(tzinfo=timezone.utc)
+    offset = m.group(2)
+    if offset and offset != "Z":
+        sign = 1 if offset[0] == "+" else -1
+        parsed = parsed.replace(tzinfo=timezone(sign * timedelta(hours=int(offset[1:3]), minutes=int(offset[4:6]))))
+    return parsed
+
+
+def _remote_file_index(token: str, drive_id: str, folder: str) -> Dict[str, Dict]:
+    """{file name: {"size": bytes, "modified": datetime|None}} for the files
+    directly inside a SharePoint folder, from one Graph listing. Any listing
+    problem just yields an empty/partial index, which every caller below treats
+    as "unknown -> upload", i.e. the original behaviour."""
+    index: Dict[str, Dict] = {}
+    for item in sp.list_folder(token, drive_id, folder):
+        if "file" not in item:
+            continue
+        try:
+            size = int(item.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        index[item.get("name", "")] = {"size": size, "modified": _parse_graph_time(item.get("lastModifiedDateTime"))}
+    return index
+
+
+def _partition_needs_upload(year: str, local_size: int, remote: Optional[Dict],
+                            touched_years: Optional[Set[str]]) -> bool:
+    """Should this year's Parquet partition be (re-)uploaded?
+
+    Yes if this run changed it, if the caller doesn't know what changed
+    (touched_years is None), if SharePoint doesn't have it, or if SharePoint's
+    copy isn't the same size as ours (e.g. an earlier upload failed). Only a
+    year this run did NOT touch, that SharePoint already holds at exactly the
+    same size, is skipped -- for form 4498 that is every year but the current
+    one, ~1GB of identical bytes that used to be re-sent (and re-versioned) on
+    every single run."""
+    if SP_PARTITION_UPLOAD_ALL or touched_years is None or year in touched_years:
+        return True
+    return remote is None or remote.get("size") != local_size
+
+
+def _csv_needs_upload(year: str, remote_csv: Optional[Dict], remote_parquet: Optional[Dict],
+                      touched_years: Optional[Set[str]]) -> bool:
+    """Should this year's CSV twin be re-exported and re-uploaded?
+
+    Yes if this run changed the year (or the caller doesn't know), or if the
+    CSV on SharePoint is missing or OLDER than that year's Parquet partition on
+    SharePoint -- the CSV is always uploaded after its Parquet, so a CSV older
+    than its Parquet means an earlier CSV upload failed and still needs fixing.
+    Skipping the rest avoids even exporting them (~3.8GB of CSV for form 4498)."""
+    if SP_PARTITION_UPLOAD_ALL or touched_years is None or year in touched_years:
+        return True
+    if remote_csv is None or remote_parquet is None:
+        return True
+    csv_time, parquet_time = remote_csv.get("modified"), remote_parquet.get("modified")
+    if csv_time is None or parquet_time is None:
+        return True
+    return csv_time < parquet_time
+
 
 
 def _get_sp_session():
@@ -523,7 +597,7 @@ def _export_csv(form_id: int) -> Optional[Path]:
         return None
 
 
-def _export_csv_year_partitions(form_id: int) -> List[Path]:
+def _export_csv_year_partitions(form_id: int, only_years: Optional[Set[str]] = None) -> List[Path]:
     """Write one CSV twin per local year-partition file, for a
     partitioned ("heavy") form -- the per-year counterpart to
     _export_csv()'s single combined-file CSV. Added 2026-09-25 to
@@ -540,9 +614,14 @@ def _export_csv_year_partitions(form_id: int) -> List[Path]:
     Returns the list of CSV paths written (only for partitions that
     exported successfully); never raises -- a failure on one year's CSV
     must not block the others or fail the fetch this happened
-    alongside."""
+    alongside.
+
+    only_years limits the export to those year partitions (None = all of
+    them, the original behaviour) -- see _csv_needs_upload()."""
     partition_dir = _partition_dir(form_id)
     partition_paths = sorted(partition_dir.glob(f"{form_id}_*.parquet"))
+    if only_years is not None:
+        partition_paths = [p for p in partition_paths if p.stem.split("_")[-1] in only_years]
     if not partition_paths:
         return []
 
@@ -1660,7 +1739,7 @@ def _sp_partition_folder(form_id: int) -> str:
     return f"{SP_RAW_FOLDER}/partitions/{form_id}"
 
 
-def _upload_partitions_to_sharepoint(form_id: int) -> None:
+def _upload_partitions_to_sharepoint(form_id: int, touched_years: Optional[Set[str]] = None) -> None:
     """Push this form's year-partition files and completion marker to
     SharePoint, right after a successful recombine -- mirrors
     upload_raw_to_sharepoint()'s existing pattern for the combined file,
@@ -1687,7 +1766,12 @@ def _upload_partitions_to_sharepoint(form_id: int) -> None:
     Never raises -- same best-effort contract as the rest of this
     SharePoint layer; a failure here just means the next fresh
     container redoes the local migration instead of recovering it,
-    exactly as if this function didn't exist."""
+    exactly as if this function didn't exist.
+
+    touched_years: the year partitions this run actually changed. Years not
+    in it are skipped when SharePoint already holds a same-size copy (see
+    _partition_needs_upload()); None means "unknown", which uploads every
+    year like before."""
     token, drive_id = _get_sp_session()
     if not token:
         return
@@ -1712,11 +1796,24 @@ def _upload_partitions_to_sharepoint(form_id: int) -> None:
     # of these files can be updated on nearly every run, and without
     # pruning, SharePoint keeps a full extra copy every single time.
     partition_files = sorted(partition_dir.glob(f"{form_id}_*.parquet"))
+    remote_index = (_remote_file_index(token, drive_id, remote_folder)
+                    if touched_years is not None and not SP_PARTITION_UPLOAD_ALL else {})
     ok = True
     upload_start = time.time()
     total_bytes = 0
+    skipped = 0
+    skipped_bytes = 0
     for p in partition_files:
         file_mb = p.stat().st_size / (1024 * 1024)
+        year = p.stem.split("_")[-1]
+        if not _partition_needs_upload(year, p.stat().st_size, remote_index.get(p.name), touched_years):
+            skipped += 1
+            skipped_bytes += p.stat().st_size
+            console(
+                f"   [TIMING] Form {form_id} | Skipped {p.name} ({file_mb:.1f} MB) -- "
+                f"unchanged this run, SharePoint already has an identical copy"
+            )
+            continue
         t_file_start = time.time()
         remote_path = f"{remote_folder}/{p.name}"
         file_ok = sp.upload_file(token, drive_id, p, remote_path)
@@ -1735,8 +1832,9 @@ def _upload_partitions_to_sharepoint(form_id: int) -> None:
     total_mb = total_bytes / (1024 * 1024)
     overall_rate = total_mb / total_elapsed if total_elapsed > 0 else 0.0
     console(
-        f"   [TIMING] Form {form_id} | Uploaded {len(partition_files)} year partition(s) "
+        f"   [TIMING] Form {form_id} | Uploaded {len(partition_files) - skipped} year partition(s) "
         f"({total_mb:.1f} MB total) to SharePoint in {total_elapsed:.1f}s ({overall_rate:.2f} MB/s)"
+        + (f" | skipped {skipped} unchanged ({skipped_bytes / (1024 * 1024):.1f} MB not re-sent)" if skipped else "")
     )
 
     marker_path = _migration_marker_path(form_id)
@@ -1753,7 +1851,7 @@ def _upload_partitions_to_sharepoint(form_id: int) -> None:
         detail(f"[sharepoint] Form {form_id} | WARNING: partition sync to SharePoint failed (kept local copy only; a future run will retry).")
 
 
-def _upload_csv_partitions_to_sharepoint(form_id: int) -> None:
+def _upload_csv_partitions_to_sharepoint(form_id: int, touched_years: Optional[Set[str]] = None) -> None:
     """Export and push one CSV twin per year partition to SP_RAW_FOLDER
     (raw_state's own root) -- the per-year counterpart to
     upload_raw_to_sharepoint()'s single CSV twin, automatically applied
@@ -1782,11 +1880,33 @@ def _upload_csv_partitions_to_sharepoint(form_id: int) -> None:
     if not token:
         return
 
-    csv_paths = _export_csv_year_partitions(form_id)
+    remote_folder = SP_RAW_FOLDER
+
+    # Only re-export/re-upload the years that need it (see _csv_needs_upload()).
+    years_needed: Optional[Set[str]] = None
+    if touched_years is not None and not SP_PARTITION_UPLOAD_ALL:
+        partition_files = sorted(_partition_dir(form_id).glob(f"{form_id}_*.parquet"))
+        parquet_index = _remote_file_index(token, drive_id, _sp_partition_folder(form_id))
+        csv_index = _remote_file_index(token, drive_id, remote_folder)
+        years_needed = set()
+        for pf in partition_files:
+            year = pf.stem.split("_")[-1]
+            if _csv_needs_upload(year, csv_index.get(f"{pf.stem}.csv"), parquet_index.get(pf.name), touched_years):
+                years_needed.add(year)
+        skipped_years = len(partition_files) - len(years_needed)
+        if skipped_years:
+            console(
+                f"   [TIMING] Form {form_id} | CSV twins: skipping {skipped_years} unchanged year(s), "
+                f"re-exporting {len(years_needed)} ({', '.join(sorted(years_needed)) or 'none'})"
+            )
+        if not years_needed:
+            detail(f"[sharepoint] Form {form_id} | All CSV year partitions already current on SharePoint.")
+            return
+
+    csv_paths = _export_csv_year_partitions(form_id, only_years=years_needed)
     if not csv_paths:
         return
 
-    remote_folder = SP_RAW_FOLDER
     sp.ensure_folder(token, drive_id, remote_folder)
 
     ok = True
@@ -2243,7 +2363,8 @@ def _split_into_year_partitions(form_id: int, source_path: Path) -> Dict[str, in
 def _recombine_year_partitions(
     form_id: int,
     previous_metadata: Dict,
-    new_records_this_run: int = 0
+    new_records_this_run: int = 0,
+    touched_years: Optional[Set[str]] = None,
 ) -> Optional[Dict]:
     """Stream every year-partition file for a form back into one combined
     {form_id}.parquet -- the file every other consumer of this pipeline
@@ -2429,7 +2550,7 @@ def _recombine_year_partitions(
     console(f"   [TIMING] Form {form_id} | upload_raw_to_sharepoint() took {time.time() - t_upload_raw_start:.1f}s")
 
     t_upload_partitions_start = time.time()
-    _upload_partitions_to_sharepoint(form_id)
+    _upload_partitions_to_sharepoint(form_id, touched_years=touched_years)
     console(f"   [TIMING] Form {form_id} | _upload_partitions_to_sharepoint() took {time.time() - t_upload_partitions_start:.1f}s")
 
     # [FIX] Added 2026-09-25: upload_raw_to_sharepoint() above skips its
@@ -2438,7 +2559,7 @@ def _recombine_year_partitions(
     # "heavy" form: one CSV per year partition instead of one combined
     # CSV that would exceed Excel's row limit.
     t_upload_csv_partitions_start = time.time()
-    _upload_csv_partitions_to_sharepoint(form_id)
+    _upload_csv_partitions_to_sharepoint(form_id, touched_years=touched_years)
     console(f"   [TIMING] Form {form_id} | _upload_csv_partitions_to_sharepoint() took {time.time() - t_upload_csv_partitions_start:.1f}s")
 
     return metadata
@@ -2502,7 +2623,10 @@ def _save_incremental_partitioned(
 
     new_df["_partition_year"] = new_df["_submission_time"].astype(str).map(_submission_year)
 
+    touched_years: Set[str] = set()  # years this run rewrites -- only these need re-uploading
+
     for year, year_new_df in new_df.groupby("_partition_year", observed=True):
+        touched_years.add(str(year))
         year_new_df = year_new_df.drop(columns=["_partition_year"])
         partition_path = _partition_path(form_id, year)
         t_year_start = time.time()
@@ -2539,7 +2663,8 @@ def _save_incremental_partitioned(
     t_merge_elapsed = time.time() - t_phase_start
     t_phase_start = time.time()
 
-    result = _recombine_year_partitions(form_id, previous_metadata, new_records_this_run=len(new_data))
+    result = _recombine_year_partitions(form_id, previous_metadata, new_records_this_run=len(new_data),
+                                        touched_years=touched_years)
 
     t_recombine_elapsed = time.time() - t_phase_start
     t_total_elapsed = t_recover_elapsed + t_merge_elapsed + t_recombine_elapsed
