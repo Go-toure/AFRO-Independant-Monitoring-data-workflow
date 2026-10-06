@@ -440,6 +440,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                    path_contains=args.path_contains, exclude_paths=args.exclude_path,
                    execute=args.execute, assume_yes=args.yes, max_items=args.max_items,
                    log_dir=Path(args.log_dir))
+    except ImportError as e:
+        print(f"Missing Python package: {e}. Install with: pip install msal requests",
+              file=sys.stderr)
+        return 2
     except AbortRun as e:
         print(f"ABORTED: {e}", file=sys.stderr)
         return 2
