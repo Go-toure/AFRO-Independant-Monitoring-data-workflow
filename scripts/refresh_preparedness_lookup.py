@@ -127,6 +127,15 @@ def _try_download_lookup_from_sharepoint(base_dir, lookup_path):
         log("Recovered previous lookup.xlsx from SharePoint (no local copy existed yet).")
 
 
+def _upload_versions_to_keep():
+    """SP_UPLOAD_VERSIONS_TO_KEEP env var (default 1); negative = no pruning."""
+    import os
+    try:
+        return int(os.environ.get("SP_UPLOAD_VERSIONS_TO_KEEP", "1").strip())
+    except ValueError:
+        return 1
+
+
 def _try_upload_lookup_to_sharepoint(base_dir, lookup_path):
     """Push the freshly validated lookup.xlsx to SharePoint so the next
     run -- on this machine or a fresh cloud container -- has a
@@ -150,8 +159,21 @@ def _try_upload_lookup_to_sharepoint(base_dir, lookup_path):
         return
 
     sp.ensure_folder(token, drive_id, SP_LOOKUP_FOLDER)
-    if sp.upload_file(token, drive_id, lookup_path, f"{SP_LOOKUP_FOLDER}/lookup.xlsx"):
+    lookup_remote = f"{SP_LOOKUP_FOLDER}/lookup.xlsx"
+    if sp.upload_file(token, drive_id, lookup_path, lookup_remote):
         log("lookup.xlsx synced to SharePoint.")
+        # Every sync overwrites the same file, and SharePoint keeps the old
+        # content as a full extra version each time (and this refresh runs
+        # once per pipeline step). Trim the history -- same setting and env
+        # var as upload_to_sharepoint.py; a negative value turns it off.
+        keep = _upload_versions_to_keep()
+        if keep >= 0:
+            try:
+                pruned = sp.prune_old_versions(token, drive_id, lookup_remote, keep)
+                if pruned:
+                    log(f"Pruned {pruned} old version(s) of lookup.xlsx (kept {keep}).")
+            except Exception as e:
+                log(f"WARNING: could not prune old lookup.xlsx versions ({e}).")
     else:
         log("WARNING: could not sync lookup.xlsx to SharePoint (kept local copy only).")
 

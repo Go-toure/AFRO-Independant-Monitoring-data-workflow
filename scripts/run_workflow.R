@@ -593,6 +593,93 @@ sp_ensure_folder <- function(token, drive_id, folder_path) {
   list(ok = TRUE, error = NULL, folder = folder_path)
 }
 
+# ------------------------------------------------------------
+# Version-history pruning for files this pipeline overwrites
+# ------------------------------------------------------------
+# SharePoint keeps the PREVIOUS content of every overwritten file as a full
+# extra version in the library's Document Version History. Every backup
+# below overwrites the same file on each run, so without trimming, that
+# history grows by one full copy per run -- the same mechanism behind the
+# ~180 GB growth Fetch_im_data.py now prevents for raw_state (see
+# SP_RAW_VERSIONS_TO_KEEP there) and upload_to_sharepoint.py prevents for
+# its own uploads (SP_UPLOAD_VERSIONS_TO_KEEP, same name and same env var).
+# After each successful backup, only the newest N HISTORICAL versions are
+# kept; the live file is never touched. Override with the
+# SP_UPLOAD_VERSIONS_TO_KEEP env var; a negative value turns pruning off.
+# Best-effort like everything else here: any failure is reported with
+# message() and swallowed, so a prune problem can never fail a backup.
+# Kept in sync with the copy in scripts/sharepoint_recovery.R (that file is
+# sourced by scripts that never go through this launcher, so both need it).
+SP_UPLOAD_VERSIONS_TO_KEEP <- local({
+  v <- suppressWarnings(as.integer(trimws(Sys.getenv("SP_UPLOAD_VERSIONS_TO_KEEP", "1"))))
+  if (is.na(v)) 1L else v
+})
+
+sp_prune_old_versions <- function(token, drive_id, remote_path, keep = SP_UPLOAD_VERSIONS_TO_KEEP) {
+  # Returns the number of versions deleted (0 on nothing-to-prune or any
+  # failure). Mirrors _sharepoint_client.prune_old_versions() in Python.
+  if (is.na(keep) || keep < 0L) return(invisible(0L))
+  transient <- function(resp) httr2::resp_status(resp) %in% c(429L, 502L, 503L, 504L)
+  perform <- function(url, method = "GET") {
+    httr2::request(url) |>
+      httr2::req_method(method) |>
+      httr2::req_auth_bearer_token(token) |>
+      httr2::req_retry(max_tries = 4, is_transient = transient) |>
+      httr2::req_error(is_error = function(resp) FALSE) |>
+      httr2::req_perform()
+  }
+  name <- basename(remote_path)
+
+  tryCatch({
+    base <- sprintf("https://graph.microsoft.com/v1.0/drives/%s", drive_id)
+    item <- perform(sprintf("%s/root:/%s", base, utils::URLencode(remote_path)))
+    if (httr2::resp_status(item) == 404L) return(invisible(0L))
+    if (httr2::resp_status(item) >= 400L) {
+      message("Could not look up ", name, " to prune its old versions (HTTP ", httr2::resp_status(item), ").")
+      return(invisible(0L))
+    }
+    item_id <- httr2::resp_body_json(item)$id
+
+    versions_url <- sprintf("%s/items/%s/versions", base, item_id)
+    versions <- list()
+    url <- versions_url
+    while (!is.null(url)) {
+      resp <- perform(url)
+      if (httr2::resp_status(resp) >= 400L) {
+        message("Could not list old versions of ", name, " (HTTP ", httr2::resp_status(resp), ").")
+        return(invisible(0L))
+      }
+      body <- httr2::resp_body_json(resp)
+      versions <- c(versions, body$value)
+      url <- body[["@odata.nextLink"]]
+    }
+    if (length(versions) <= keep) return(invisible(0L))
+
+    # Newest first, sorted explicitly rather than trusting response order.
+    stamps <- vapply(versions, function(v) {
+      s <- v$lastModifiedDateTime
+      if (is.null(s)) "" else as.character(s)
+    }, character(1))
+    versions <- versions[order(stamps, decreasing = TRUE)]
+    to_delete <- versions[seq.int(keep + 1L, length(versions))]
+
+    deleted <- 0L
+    for (v in to_delete) {
+      if (is.null(v$id)) next
+      dr <- perform(sprintf("%s/%s", versions_url, utils::URLencode(v$id, reserved = TRUE)), "DELETE")
+      if (httr2::resp_status(dr) %in% c(204L, 404L)) {
+        deleted <- deleted + 1L
+      } else {
+        message("Could not delete old version ", v$id, " of ", name, " (HTTP ", httr2::resp_status(dr), ").")
+      }
+    }
+    invisible(deleted)
+  }, error = function(e) {
+    message("Could not prune old versions of ", name, ": ", conditionMessage(e))
+    invisible(0L)
+  })
+}
+
 SP_BUILD_STATE_FOLDER <- "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/build_state"
 SP_BUILD_STATE_FILE <- "Regional_IM_repository.parquet"
 # QC.csv and METADATA.xlsx are ALSO Build Repository (Step 2) outputs --
@@ -646,6 +733,8 @@ sp_backup_build_output <- function(final_dir) {
         httr2::req_body_file(local_path) |>
         httr2::req_perform()
       log_info("Backed up {fname} to SharePoint build_state (for standalone Clean Geonames/Upload runs).")
+      pruned <- sp_prune_old_versions(token, drive_id, remote_path)
+      if (pruned > 0L) log_info("Pruned {pruned} old version(s) of {fname} (kept {SP_UPLOAD_VERSIONS_TO_KEEP}).")
     }, error = function(e) {
       log_warn("Could not back up {fname} to SharePoint: {e$message}")
     })
@@ -747,6 +836,8 @@ sp_backup_clean_output <- function(final_dir) {
       httr2::req_body_file(local_path) |>
       httr2::req_perform()
     log_info("Backed up {SP_CLEAN_STATE_FILE} to SharePoint clean_state (for standalone Intelligence Engine / Report+Deck / Upload runs).")
+    pruned <- sp_prune_old_versions(token, drive_id, remote_path)
+    if (pruned > 0L) log_info("Pruned {pruned} old version(s) of {SP_CLEAN_STATE_FILE} (kept {SP_UPLOAD_VERSIONS_TO_KEEP}).")
   }, error = function(e) {
     log_warn("Could not back up {SP_CLEAN_STATE_FILE} to SharePoint: {e$message}")
   })
