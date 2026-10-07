@@ -71,6 +71,25 @@ PHASE1_INTELLIGENCE_DIR = os.path.join(BASE_DIR, "outputs/phase1_intelligence")
 INTELLIGENCE_REPORT_DIR = os.path.join(BASE_DIR, "outputs/reports/IM_Intelligence_Report")
 REPORTS_TARGET_FOLDER = "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/reports"
 
+# SharePoint keeps the PREVIOUS content of every overwritten file as a full
+# extra version in the library's Document Version History. This script
+# overwrites ~47 MB of its own files on every run (the cleaned CSV, the QC
+# CSV, the Phase 1 workbook, the report files), so without trimming that
+# history grows by that much each run -- the same mechanism that drove the
+# ~180 GB growth Fetch_im_data.py now prevents for raw_state (see
+# SP_RAW_VERSIONS_TO_KEEP there). After each successful upload, only the
+# newest N HISTORICAL versions are kept (the live file is never touched).
+# Override with the SP_UPLOAD_VERSIONS_TO_KEEP env var; a negative value
+# turns pruning off entirely.
+def _upload_versions_to_keep():
+    raw = os.environ.get("SP_UPLOAD_VERSIONS_TO_KEEP", "1").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 1
+
+SP_UPLOAD_VERSIONS_TO_KEEP = _upload_versions_to_keep()
+
 # File mappings: each entry uploads one local file to SharePoint.
 # - "source_dir" is optional; defaults to FINAL_DIR (data/final) when absent.
 # - "remote_folder" is optional; defaults to TARGET_FOLDER when absent.
@@ -285,6 +304,27 @@ def create_folder_if_not_exists(token, drive_id, folder_path):
     
     return current_path
 
+def prune_uploaded_versions(token, drive_id, remote_path):
+    """Trim SharePoint's version history of a file this script just
+    uploaded, keeping only SP_UPLOAD_VERSIONS_TO_KEEP historical versions
+    (see that constant's comment for why). Reuses
+    _sharepoint_client.prune_old_versions, the same helper the Fetch step
+    already relies on. Strictly best-effort: a failure here must never
+    turn a successful upload into a failed one, so every error is logged
+    and swallowed. Returns the number of versions deleted."""
+    keep = SP_UPLOAD_VERSIONS_TO_KEEP
+    if keep < 0:
+        return 0
+    try:
+        import _sharepoint_client as sp
+        deleted = sp.prune_old_versions(token, drive_id, remote_path, keep)
+    except Exception as e:
+        print(f"    [WARN] Version pruning skipped for {remote_path}: {e}")
+        return 0
+    if deleted:
+        print(f"    [OK] Pruned {deleted} old version(s) of {Path(remote_path).name} (kept {keep})")
+    return deleted
+
 def upload_file(token, drive_id, local_path, remote_filename, folder_path=None):
     """Upload a single file to SharePoint (overwrites if exists)"""
     
@@ -322,6 +362,7 @@ def upload_file(token, drive_id, local_path, remote_filename, folder_path=None):
     )
     
     print(f"  [OK] Uploaded: {result['name']} ({result.get('size', 0):,} bytes)")
+    prune_uploaded_versions(token, drive_id, remote_path)
     return result
 
 CLEAN_STATE_FOLDER = "7. SIA_Data/Data Repository/Cloud-Independant-Monitoring/clean_state"
