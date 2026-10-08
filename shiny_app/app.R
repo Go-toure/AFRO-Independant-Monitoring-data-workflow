@@ -392,7 +392,7 @@ ui <- page_navbar(
   ),
 
   # ── TAB 4 : PIPELINE ────────────────────────────────────────────────────────
-  nav_panel(hdr_icon("gear-fill", "Pipeline"),
+  nav_panel(hdr_icon("gear-fill", "Pipeline"), value = "pipeline",
 
     layout_columns(
       col_widths=c(3,9), gap="14px",
@@ -538,7 +538,11 @@ ui <- page_navbar(
         )
       )
     )
-  )
+  ),
+
+  # Who is signed in (+ Sign out) -- filled by output$auth_badge in the server.
+  nav_spacer(),
+  nav_item(uiOutput("auth_badge"))
 )
 
 # ── SERVER ────────────────────────────────────────────────────────────────────
@@ -548,6 +552,19 @@ server <- function(input, output, session) {
     data           = NULL,
     report_builder = NULL   # in-progress AI-generated report/deck, if any (see R/ai_report_builder.R)
   )
+
+  # ── Access control (R/access_control.R) ─────────────────────────────────────
+  # Nothing is loaded and no admin action is accepted until `user()` is set by
+  # a valid access code. Hiding UI is only a convenience for country users:
+  # every admin handler and every raw-form handler below ALSO checks the role
+  # on the server, so a hand-crafted request cannot get around the UI.
+  auth        <- ac_session_init(input, output, session)   # sign-in modal, role UI, auth_badge
+  user        <- auth$user
+  is_admin    <- auth$is_admin
+  form_ok     <- auth$form_ok
+  # Every load of the cleaned repository goes through here, so a country user
+  # only ever holds their own country's rows in memory.
+  load_scoped <- function() ac_scope_data(load_im_data(), user())
 
   # ── Fix: plotly charts render squished on tabs that weren't visible yet ─────
   # A plotlyOutput inside a nav_panel that isn't the active tab starts life at
@@ -581,6 +598,10 @@ server <- function(input, output, session) {
     })
 
     observeEvent(input$ai_chat_user_input, {
+      if (!is_admin()) {
+        shinychat::chat_append("ai_chat", "The assistant is available to the regional office only.")
+        return()
+      }
       if (is.null(ai_chat_client)) {
         shinychat::chat_append("ai_chat",
           "The AI Assistant couldn't start — check that ANTHROPIC_API_KEY in config/secrets.env is a valid key, then restart the app.")
@@ -599,7 +620,8 @@ server <- function(input, output, session) {
 
   # ── Load on startup ──────────────────────────────────────────────────────────
   observe({
-    rv$data <- load_im_data()
+    req(user())
+    rv$data <- load_scoped()
     req(rv$data)
     df <- rv$data
 
@@ -1103,10 +1125,10 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$btn_refresh, {
-    rv$data <- load_im_data(); showNotification("Data refreshed.", type="message")
+    rv$data <- load_scoped(); showNotification("Data refreshed.", type="message")
   })
   observeEvent(input$btn_rl_data, {
-    rv$data <- load_im_data(); showNotification("Data reloaded.", type="message")
+    rv$data <- load_scoped(); showNotification("Data reloaded.", type="message")
   })
 
   # ── Filtering ────────────────────────────────────────────────────────────────
@@ -2743,6 +2765,7 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$btn_stop, {
+    if (!is_admin()) return()
     pinfo <- isolate(rv_proc())
     if (is.null(pinfo) || !pinfo$proc$is_alive()) {
       showNotification("Nothing is currently running.", type="message")
@@ -2940,7 +2963,7 @@ server <- function(input, output, session) {
         rv_proc(NULL)
         q <- isolate(rv_queue())
         if (length(q) == 0L) {
-          rv$data <- load_im_data()
+          rv$data <- load_scoped()
           if (isolate(rv_soft_error())) {
             rv_stat("error")
             showNotification("Pipeline finished, but a report step failed. The repository was uploaded and the data refreshed - see the log.",
@@ -2971,27 +2994,33 @@ server <- function(input, output, session) {
   }
 
   observeEvent(input$run_fetch, {
+    if (!is_admin()) return()
     step_start(header = "[1] FETCH DATA\n")
     launch_step(1L)
   })
   observeEvent(input$run_build, {
+    if (!is_admin()) return()
     step_start(header = "[2] BUILD REPOSITORY\n")
     launch_step(2L)
   })
   observeEvent(input$run_clean, {
+    if (!is_admin()) return()
     step_start(header = "[3] CLEAN GEONAMES\n")
     launch_step(3L)
   })
   observeEvent(input$run_upload, {
+    if (!is_admin()) return()
     step_start(header = "[5] UPLOAD SHAREPOINT\n")
     launch_step(6L)
   })
   observeEvent(input$run_rpts, {
+    if (!is_admin()) return()
     step_start(header = "[4] GENERATE REPORTS (Intelligence Engine + Advocacy Report + Deck)\n")
     rv_queue(5L)
     launch_step(4L)
   })
   observeEvent(input$run_all, {
+    if (!is_admin()) return()
     step_start(header = paste0("▶  FULL PIPELINE STARTED\n── ",
                                format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
                                " ──\n"))
@@ -3001,18 +3030,19 @@ server <- function(input, output, session) {
 
   # Refresh log from file on button click ----------------------------------
   observeEvent(input$btn_rl_log, {
+    if (!is_admin()) return()
     rv_log(get_log_lines())
     rv_stat(last_run_info()$status)
   })
 
   # Reload data manually ---------------------------------------------------
   observeEvent(input$btn_rl_data, {
-    rv$data <- load_im_data()
+    rv$data <- load_scoped()
     showNotification("Data reloaded.", type="message")
   })
 
   # Outputs ----------------------------------------------------------------
-  output$log_txt <- renderText({ rv_log() })
+  output$log_txt <- renderText({ req(is_admin()); rv_log() })
 
   output$status_badge <- renderUI({
     st  <- rv_stat()
@@ -3065,7 +3095,9 @@ server <- function(input, output, session) {
   rv_dl_raw_msg <- reactiveVal(NULL)
 
   observe({
+    req(user())
     ids <- tryCatch(list_available_form_ids(), error = function(e) character(0))
+    if (length(ids)) ids <- ids[vapply(ids, form_ok, logical(1))]
     if (length(ids)) updateSelectInput(session, "dl_raw_form_id", choices = ids)
   })
 
@@ -3144,7 +3176,7 @@ server <- function(input, output, session) {
   # offered too.
   output$dl_raw_year_ui <- renderUI({
     form_id <- input$dl_raw_form_id
-    req(form_id)
+    req(form_id, form_ok(form_id))
     years <- tryCatch(list_available_years(form_id, progress = .dl_raw_log_progress),
                        error = function(e) character(0))
     choices <- c("All years" = "__ALL__")
@@ -3176,7 +3208,7 @@ server <- function(input, output, session) {
   # right after a Form ID switch).
   output$dl_raw_response_ui <- renderUI({
     form_id <- input$dl_raw_form_id
-    req(form_id)
+    req(form_id, form_ok(form_id))
     year      <- rv_dl_filters$year
     responses <- tryCatch(list_available_responses(form_id, year, progress = .dl_raw_log_progress),
                            error = function(e) character(0))
@@ -3196,7 +3228,7 @@ server <- function(input, output, session) {
   # Response's own renderUI() above.
   output$dl_raw_round_ui <- renderUI({
     form_id <- input$dl_raw_form_id
-    req(form_id)
+    req(form_id, form_ok(form_id))
     year     <- rv_dl_filters$year
     response <- rv_dl_filters$response
     rounds   <- tryCatch(list_available_rounds(form_id, year, response, progress = .dl_raw_log_progress),
@@ -3215,7 +3247,7 @@ server <- function(input, output, session) {
       response <- input$dl_raw_response
       round_nb <- input$dl_raw_round
       ext      <- switch(fmt, parquet = "parquet", xlsx = "xlsx", rds = "rds", "csv")
-      req(form_id, fmt)
+      req(form_id, fmt, form_ok(form_id))
       year_arg     <- if (!is.null(year) && nzchar(year) && year != "__ALL__") year else NULL
       response_arg <- if (!is.null(response) && nzchar(trimws(response)) && trimws(response) != "__ALL__") trimws(response) else NULL
       round_arg    <- if (!is.null(round_nb) && nzchar(trimws(round_nb)) && trimws(round_nb) != "__ALL__") trimws(round_nb) else NULL
@@ -3243,7 +3275,7 @@ server <- function(input, output, session) {
       year     <- input$dl_raw_year
       response <- input$dl_raw_response
       round_nb <- input$dl_raw_round
-      req(form_id, fmt)
+      req(form_id, fmt, form_ok(form_id))
       rv_dl_raw_msg(NULL)
       year_arg     <- if (!is.null(year) && nzchar(year) && year != "__ALL__") year else NULL
       response_arg <- if (!is.null(response) && nzchar(trimws(response)) && trimws(response) != "__ALL__") trimws(response) else NULL

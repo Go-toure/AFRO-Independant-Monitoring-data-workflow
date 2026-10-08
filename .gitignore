@@ -25,3 +25,7 @@ Thumbs.db
 desktop.ini
 *.pyc
 __pycache__/
+
+# Access codes (regional office only -- never commit)
+config/access_codes.private.csv
+*.private.csv
