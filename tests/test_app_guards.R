@@ -54,4 +54,8 @@ check("build_form_download validates its inputs", any(grepl("Invalid download re
 check("list_available_* validate form id", sum(grepl("\\.rd_form_ok\\(form_id\\)", rd)) >= 4L)
 check("every SharePoint helper uses sp_path_ok", sum(grepl("if \\(!sp_path_ok\\(", sp)) == 3L)
 
+ac_src <- readLines("shiny_app/R/access_control.R", warn = FALSE)
+check("country users are sent to the My data tab after sign-in",
+      any(grepl('bslib::nav_select\\("nav", "pipeline"', ac_src)) && any(grepl('id = "nav"', src)))
+
 cat(sprintf("\nAll %d static guard checks passed.\n", ok))

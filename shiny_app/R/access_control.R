@@ -262,6 +262,8 @@ ac_session_init <- function(input, output, session, mode = ac_mode()) {
           "if(a){a.textContent='My data';}"))
       }, error = function(e) NULL)
       tryCatch({ shinyjs::hide("ai_fab"); shinyjs::hide("ai_panel") }, error = function(e) NULL)
+      # Land on the country's own page ("My data"), not on the Overview tab.
+      tryCatch(bslib::nav_select("nav", "pipeline", session = session), error = function(e) NULL)
     }
   }
 
