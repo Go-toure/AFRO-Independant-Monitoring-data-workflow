@@ -497,6 +497,8 @@ sp_recover_raw_forms <- function(raw_dir) {
 # picked up automatically.
 
 sp_ensure_folder <- function(token, drive_id, folder_path) {
+  # Read-only mode (country runs, see scripts/run_country_workflow.R): never write to SharePoint.
+  if (identical(Sys.getenv("IM_READ_ONLY_SHAREPOINT"), "1")) return(list(ok = TRUE, error = NULL, folder = folder_path))
   # Returns list(ok = TRUE/FALSE, error = <message or NULL>, folder = <segment
   # that failed, or the full path on success>) -- a plain TRUE/FALSE used to
   # be returned here, but every caller's failure log was then reduced to a
@@ -616,6 +618,8 @@ SP_UPLOAD_VERSIONS_TO_KEEP <- local({
 })
 
 sp_prune_old_versions <- function(token, drive_id, remote_path, keep = SP_UPLOAD_VERSIONS_TO_KEEP) {
+  # Read-only mode (country runs, see scripts/run_country_workflow.R): never write to SharePoint.
+  if (identical(Sys.getenv("IM_READ_ONLY_SHAREPOINT"), "1")) return(invisible(0L))
   # Returns the number of versions deleted (0 on nothing-to-prune or any
   # failure). Mirrors _sharepoint_client.prune_old_versions() in Python.
   if (is.na(keep) || keep < 0L) return(invisible(0L))
@@ -699,6 +703,8 @@ SP_BUILD_STATE_QC_FILE       <- "Regional_IM_repository_QC.csv"
 SP_BUILD_STATE_METADATA_FILE <- "Regional_IM_repository_METADATA.xlsx"
 
 sp_backup_build_output <- function(final_dir) {
+  # Read-only mode (country runs, see scripts/run_country_workflow.R): never write to SharePoint.
+  if (identical(Sys.getenv("IM_READ_ONLY_SHAREPOINT"), "1")) return(invisible(NULL))
   if (!requireNamespace("httr2", quietly = TRUE)) return(invisible(NULL))
 
   files_to_backup <- c(SP_BUILD_STATE_FILE, SP_BUILD_STATE_QC_FILE, SP_BUILD_STATE_METADATA_FILE)
@@ -806,6 +812,8 @@ SP_CLEAN_STATE_FOLDER <- "7. SIA_Data/Data Repository/Cloud-Independant-Monitori
 SP_CLEAN_STATE_FILE <- "Regional_IM_repository_cleaned.csv"
 
 sp_backup_clean_output <- function(final_dir) {
+  # Read-only mode (country runs, see scripts/run_country_workflow.R): never write to SharePoint.
+  if (identical(Sys.getenv("IM_READ_ONLY_SHAREPOINT"), "1")) return(invisible(NULL))
   local_path <- file.path(final_dir, SP_CLEAN_STATE_FILE)
   if (!file.exists(local_path)) return(invisible(NULL))
   if (!requireNamespace("httr2", quietly = TRUE)) return(invisible(NULL))

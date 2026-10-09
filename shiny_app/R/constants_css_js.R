@@ -200,7 +200,7 @@ table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-alig
 }
 
 /* ─ Log viewer ───────────────────────────────────────── */
-#log_pre,#rpt_console,#dl_raw_log_pre{
+#log_pre,#rpt_console,#dl_raw_log_pre,#cr_log_pre{
   background:#0D1117!important; color:#C9D1D9!important;
   border:1px solid rgba(201,209,217,.15)!important; border-radius:12px!important;
   font-family:'JetBrains Mono','Fira Code','Courier New',monospace!important;
@@ -698,7 +698,7 @@ function captureExecKPI() {
 
 // Auto-scroll logs
 setInterval(function(){
-  ['log_pre','rpt_console','dl_raw_log_pre'].forEach(function(id){
+  ['log_pre','rpt_console','dl_raw_log_pre','cr_log_pre'].forEach(function(id){
     var el=document.getElementById(id); if(el) el.scrollTop=el.scrollHeight;
   });
 }, 3500);

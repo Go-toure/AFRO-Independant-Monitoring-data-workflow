@@ -3705,6 +3705,8 @@ def report_sharepoint_bin_usage() -> None:
     Never deletes anything and never fails the pipeline: any problem (missing
     credentials, missing Graph permission, network) is logged and skipped.
     """
+    if os.environ.get("IM_READ_ONLY_SHAREPOINT", "").strip().lower() in ("1", "true", "yes", "on"):
+        return          # per-country dashboard runs: no extra SharePoint calls
     try:
         import sharepoint_bin_report
         sharepoint_bin_report.run_report(print_fn=console)

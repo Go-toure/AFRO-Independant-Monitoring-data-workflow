@@ -111,6 +111,24 @@ sp_partition_folder <- function(form_id) {
   paste0(RAW_STATE_FOLDER, "/partitions/", form_id)
 }
 
+# Request values come from the browser (a selectize with create = TRUE lets a
+# visitor type anything, and a forged websocket message can send anything).
+# Validate before they are used in a SharePoint path, a file name or a regex.
+.rd_form_ok <- function(x) is.character(x) && length(x) == 1L && !is.na(x) && grepl("^[0-9]{1,8}$", x)
+.rd_year_ok <- function(x) is.null(x) || (is.character(x) && length(x) == 1L && !is.na(x) && grepl("^[0-9]{4}$", x))
+.rd_year_arg_ok <- function(x) {            # also accepts the UI's "no filter" values
+  if (is.null(x)) return(TRUE)
+  x <- as.character(x)
+  length(x) == 1L && !is.na(x) && (x %in% c("", "__ALL__") || grepl("^[0-9]{4}$", x))
+}
+.rd_text_ok <- function(x) {                # Response / Round Number free text
+  if (is.null(x)) return(TRUE)
+  isTRUE(tryCatch(is.character(x) && length(x) == 1L && !is.na(x) &&
+                    nchar(x, type = "chars") <= 100L && !grepl("[[:cntrl:]]", x),
+                  error = function(e) FALSE))
+}
+.rd_formats <- c("parquet", "csv", "xlsx", "rds")
+
 .sp_item_name <- function(item) {
   if (is.null(item$name)) "" else item$name
 }
@@ -219,6 +237,8 @@ list_partition_years <- function(form_id) {
 # before from a script, the R console, or a test that doesn't care about
 # progress reporting.
 list_available_years <- function(form_id, progress = function(detail) invisible(NULL)) {
+  form_id <- as.character(form_id)
+  if (!.rd_form_ok(form_id)) return(character(0))
   if (!sharepoint_credentials_available()) {
     progress("SharePoint credentials are not configured -- cannot look up years.")
     return(character(0))
@@ -393,6 +413,8 @@ list_available_years <- function(form_id, progress = function(detail) invisible(
 # narrowing by Year (or just switching Form ID) shows what this lookup
 # actually read and how many rows survived each filtering step.
 list_available_responses <- function(form_id, year = NULL, progress = function(detail) invisible(NULL)) {
+  form_id <- as.character(form_id)
+  if (!.rd_form_ok(form_id) || !.rd_year_arg_ok(year)) return(character(0))
   if (!sharepoint_credentials_available()) {
     progress("SharePoint credentials are not configured -- cannot look up Response values.")
     return(character(0))
@@ -447,6 +469,8 @@ list_available_responses <- function(form_id, year = NULL, progress = function(d
 # this lookup actually read and how many rows survived each step.
 list_available_rounds <- function(form_id, year = NULL, response = NULL,
                                    progress = function(detail) invisible(NULL)) {
+  form_id <- as.character(form_id)
+  if (!.rd_form_ok(form_id) || !.rd_year_arg_ok(year) || !.rd_text_ok(response)) return(character(0))
   if (!sharepoint_credentials_available()) {
     progress("SharePoint credentials are not configured -- cannot look up Round Number values.")
     return(character(0))
@@ -1215,6 +1239,10 @@ build_form_download <- function(form_id, format, progress = function(detail) inv
   year         <- .nz(year)
   response     <- .nz(response)
   round_number <- .nz(round_number)
+
+  if (!.rd_form_ok(form_id) || !is.character(format) || length(format) != 1L || !(format %in% .rd_formats) ||
+      !.rd_year_ok(year) || !.rd_text_ok(response) || !.rd_text_ok(round_number))
+    return(list(ok = FALSE, path = NULL, message = "Invalid download request."))
 
   if (!sharepoint_credentials_available())
     return(list(ok = FALSE, path = NULL, message = "SharePoint credentials are not configured."))

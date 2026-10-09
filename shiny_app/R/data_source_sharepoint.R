@@ -71,9 +71,30 @@ sp_resolve_drive_id <- function(token) {
 # list returns an empty list and download returns FALSE on any failure
 # (missing item, bad credentials, network error, ...), never an R error.
 
+# Refuses any SharePoint path that could escape the intended folder
+# (".." / "." segments, query/fragment/escape characters, backslashes, drive
+# letters, control characters, a leading slash). Every path used by this app is
+# built from constants plus a numeric form id and a 4-digit year, so a legitimate
+# path never trips this -- a forged "Year" like "x/../../../4498" does.
+sp_path_ok <- function(p) {
+  if (!is.character(p) || length(p) != 1L || is.na(p) || !nzchar(p)) return(FALSE)
+  ok <- tryCatch({
+    if (nchar(p, type = "bytes") > 400L) FALSE
+    else if (grepl("[[:cntrl:]]", p)) FALSE
+    else if (grepl("[?#%\\\\:*<>|\"]", p)) FALSE
+    else if (startsWith(p, "/") || endsWith(p, "/")) FALSE
+    else {
+      segs <- strsplit(p, "/", fixed = TRUE)[[1]]
+      !any(!nzchar(trimws(segs))) && !any(grepl("^[.]+$", trimws(segs)))
+    }
+  }, error = function(e) FALSE)
+  isTRUE(ok)
+}
+
 # Every item (files + subfolders) directly inside folder_path. Empty list
 # if the folder doesn't exist, is empty, or on any error.
 sp_list_folder <- function(token, drive_id, folder_path) {
+  if (!sp_path_ok(folder_path)) return(list())
   tryCatch({
     url <- sprintf(
       "https://graph.microsoft.com/v1.0/drives/%s/root:/%s:/children",
@@ -98,6 +119,7 @@ sp_list_folder <- function(token, drive_id, folder_path) {
 # local_path. Returns FALSE on any failure, including the file not
 # existing remotely.
 sp_download_file <- function(token, drive_id, remote_path, local_path) {
+  if (!sp_path_ok(remote_path)) return(FALSE)
   tryCatch({
     url <- sprintf(
       "https://graph.microsoft.com/v1.0/drives/%s/root:/%s:/content",
@@ -119,6 +141,7 @@ sp_download_file <- function(token, drive_id, remote_path, local_path) {
 # lastModifiedDateTime without downloading the file itself. Returns NULL on
 # any failure (missing item, bad credentials, network error, ...).
 sp_get_item_metadata <- function(token, drive_id, remote_path) {
+  if (!sp_path_ok(remote_path)) return(NULL)
   tryCatch({
     url <- sprintf(
       "https://graph.microsoft.com/v1.0/drives/%s/root:/%s",

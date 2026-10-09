@@ -17,11 +17,131 @@ never a hard dependency -- exactly like shiny_app/R/data_source_sharepoint.R
 already does on the dashboard's read side.
 """
 
+import functools
 import os
 import time
-import requests
+import requests as _requests_real
 from pathlib import Path
 from typing import Optional, List, Dict
+
+# ── READ-ONLY MODE ──────────────────────────────────────────────────────────
+# IM_READ_ONLY_SHAREPOINT=1 turns this module into a read-only client: every
+# download / listing / token call works as usual, but nothing can be written,
+# created, deleted or version-pruned on SharePoint. The dashboard sets it for
+# the per-country runs ("My data" tab), which must never change anything on
+# the regional SharePoint library -- they work in a private scratch folder and
+# only hand the result back as a download.
+#
+# Two layers, so a future change to one cannot silently re-open writes:
+#   1. the public write functions (upload_file, ensure_folder, delete_item,
+#      prune_old_versions) return immediately, quietly, as if they had worked;
+#   2. the `requests` name used throughout this module is a thin guard that
+#      REFUSES any PUT/POST/PATCH/DELETE (except the OAuth token request) while
+#      read-only, so even a write that bypassed layer 1 cannot leave the machine.
+READ_ONLY_ENV = "IM_READ_ONLY_SHAREPOINT"
+_WRITE_METHODS = ("PUT", "POST", "PATCH", "DELETE")
+_TOKEN_HOST = "login.microsoftonline.com"
+
+
+def read_only() -> bool:
+    """True when IM_READ_ONLY_SHAREPOINT is set to 1/true/yes (read at call time)."""
+    return os.environ.get(READ_ONLY_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+class ReadOnlyViolation(_requests_real.exceptions.RequestException):
+    """Raised (and caught by the callers' normal error handling) when a write
+    is attempted while read-only mode is on."""
+
+
+class _GuardedRequests:
+    """Drop-in stand-in for the `requests` module: identical API, but refuses
+    SharePoint/Graph writes in read-only mode."""
+
+    # Only these names of the real module are reachable through the guard. Anything else
+    # (Session, api, adapters, ...) could issue a write without passing _check(), so it is
+    # simply not exposed.
+    _PASS_THROUGH = frozenset({"exceptions", "Response", "codes", "get", "head", "options",
+                               "Timeout", "ConnectionError", "HTTPError", "RequestException"})
+
+    def __getattr__(self, name):
+        if name in self._PASS_THROUGH:
+            return getattr(_requests_real, name)
+        raise AttributeError(f"requests.{name} is not available through the SharePoint client guard")
+
+    @staticmethod
+    def _is_token_request(url):
+        """The one write that read-only mode still allows: the OAuth client-credentials request.
+        The host is checked with BOTH urllib.parse and urllib3 (the parser `requests` really uses),
+        so a URL the two read differently is refused."""
+        try:
+            from urllib.parse import urlparse
+            from urllib3.util import parse_url
+            url = str(url)
+            if "\\" in url or "@" in url.split("?")[0].split("//", 1)[-1].split("/", 1)[0]:
+                return False
+            u = urlparse(url)
+            v = parse_url(url)
+            return (u.scheme == "https" and v.scheme == "https"
+                    and (u.hostname or "").lower() == _TOKEN_HOST
+                    and (v.host or "").lower() == _TOKEN_HOST
+                    and u.path.endswith("/oauth2/v2.0/token"))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _check(method, url):
+        """Read-only mode: only reads (GET/HEAD/OPTIONS, str methods) and the OAuth token POST pass."""
+        if not read_only():
+            return
+        if isinstance(method, str) and method.upper() in ("GET", "HEAD", "OPTIONS"):
+            return
+        if isinstance(method, str) and method.upper() == "POST" and _GuardedRequests._is_token_request(url):
+            return
+        raise ReadOnlyViolation(
+            f"read-only mode ({READ_ONLY_ENV}=1): refused {str(method).upper()} {str(url).split('?')[0]}"
+        )
+
+    def request(self, method, url, **kwargs):
+        self._check(method, url)
+        return _requests_real.request(method, url, **kwargs)
+
+    def put(self, url, *a, **kw):
+        self._check("PUT", url)
+        return _requests_real.put(url, *a, **kw)
+
+    def post(self, url, *a, **kw):
+        self._check("POST", url)
+        return _requests_real.post(url, *a, **kw)
+
+    def patch(self, url, *a, **kw):
+        self._check("PATCH", url)
+        return _requests_real.patch(url, *a, **kw)
+
+    def delete(self, url, *a, **kw):
+        self._check("DELETE", url)
+        return _requests_real.delete(url, *a, **kw)
+
+
+requests = _GuardedRequests()
+
+_read_only_noted = set()
+
+
+def _write_op(default):
+    """Decorator for a public write function: in read-only mode skip it and
+    return `default` (the value that makes callers carry on as if it worked)."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if read_only():
+                if fn.__name__ not in _read_only_noted:
+                    _read_only_noted.add(fn.__name__)
+                    print(f"   [sharepoint] read-only mode: {fn.__name__}() skipped "
+                          f"(nothing is written to SharePoint).", flush=True)
+                return default
+            return fn(*args, **kwargs)
+        return wrapper
+    return deco
 
 # Same SharePoint site/library every script in this workflow already talks
 # to (see upload_to_sharepoint.py) -- kept here as the single place that
@@ -212,6 +332,7 @@ def list_folder(token: str, drive_id: str, folder_path: str) -> List[Dict]:
         return items
 
 
+@_write_op(True)
 def ensure_folder(token: str, drive_id: str, folder_path: str) -> bool:
     """Create folder_path (and any missing parent segments) if it doesn't
     already exist. Returns True once the folder exists (already there or
@@ -293,6 +414,7 @@ _SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024  # 4 MiB
 _UPLOAD_CHUNK_SIZE = 60 * 1024 * 1024  # 60 MiB
 
 
+@_write_op(True)
 def upload_file(token: str, drive_id: str, local_path: Path, remote_path: str) -> bool:
     """Upload local_path to remote_path (relative to the library root),
     overwriting any existing file there. Returns False (never raises) on
@@ -455,6 +577,7 @@ def _upload_large_file(token: str, drive_id: str, local_path: Path, remote_path:
         return False
 
 
+@_write_op(0)
 def prune_old_versions(token: str, drive_id: str, remote_path: str, keep_versions: int = 3) -> int:
     """Deletes all but the most recent `keep_versions` HISTORICAL versions
     of the file at remote_path (relative to the library root). Returns the
@@ -531,6 +654,7 @@ def prune_old_versions(token: str, drive_id: str, remote_path: str, keep_version
         return 0
 
 
+@_write_op(True)
 def delete_item(token: str, drive_id: str, item_path: str, permanent: bool = False) -> bool:
     """Delete an item (file, or a folder and everything under it) by its
     path, relative to the library root. Returns True once it's gone --

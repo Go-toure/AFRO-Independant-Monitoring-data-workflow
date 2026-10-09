@@ -394,6 +394,11 @@ ui <- page_navbar(
   # ── TAB 4 : PIPELINE ────────────────────────────────────────────────────────
   nav_panel(hdr_icon("gear-fill", "Pipeline"), value = "pipeline",
 
+    # Country users see this block (R/country_run.R) instead of the admin controls
+    # below; shown/hidden per role by ac_session_init() (R/access_control.R).
+    div(id = "pl_country_block", style = "display:none;", cr_ui()),
+
+    div(id = "pl_admin_block",
     layout_columns(
       col_widths=c(3,9), gap="14px",
 
@@ -432,6 +437,7 @@ ui <- page_navbar(
           textOutput("log_txt", inline=TRUE)
         )
       )
+    )
     ),
 
     card(
@@ -564,7 +570,10 @@ server <- function(input, output, session) {
   form_ok     <- auth$form_ok
   # Every load of the cleaned repository goes through here, so a country user
   # only ever holds their own country's rows in memory.
-  load_scoped <- function() ac_scope_data(load_im_data(), user())
+  load_scoped <- function() { if (is.null(user())) return(NULL); ac_scope_data(load_im_data(), user()) }
+  # "My data" tab for country users: fetch -> process -> clean in a private scratch
+  # folder with SharePoint writes disabled, download only (R/country_run.R).
+  cr_session_init(input, output, session, auth, source_home = BASE_DIR)
 
   # ── Fix: plotly charts render squished on tabs that weren't visible yet ─────
   # A plotlyOutput inside a nav_panel that isn't the active tab starts life at
@@ -838,6 +847,7 @@ server <- function(input, output, session) {
         sprintf("%s rows · %s cols", fmt_num(nrow(rv$data)), ncol(rv$data)))
   })
   output$data_freshness_mini <- renderUI({
+    req(user())
     src_file <- Filter(file.exists, c(CLEANED_RDS, CLEANED_PARQUET, CLEANED_CSV, RAW_RDS))[1]
     if (is.na(src_file)) return("—")
     format(file.mtime(src_file), "%Y-%m-%d %H:%M")
@@ -1111,7 +1121,7 @@ server <- function(input, output, session) {
   # It has no reactive dependencies, so wrapping it in reactive() computes it
   # once per session and shares that one result between the two blocks below
   # instead of each triggering its own separate round of Graph calls.
-  last_run_info_r <- reactive({ last_run_info() })
+  last_run_info_r <- reactive({ req(user()); last_run_info() })
 
   output$v_run <- renderText({
     info <- last_run_info_r()
@@ -2748,7 +2758,8 @@ server <- function(input, output, session) {
   # PIPELINE TAB
   # ═══════════════════════════════════════════════════════════════════════════
 
-  rv_log   <- reactiveVal(get_log_lines())
+  rv_log   <- reactiveVal(character(0))
+  observeEvent(user(), { if (is_admin()) rv_log(get_log_lines()) })   # nothing is read for signed-out / country sessions
   rv_stat  <- reactiveVal("idle")
   rv_steps <- reactiveVal(rep("pending", 6L))
   rv_proc  <- reactiveVal(NULL)   # list(proc, step_idx, lf, pos)
@@ -3135,11 +3146,11 @@ server <- function(input, output, session) {
   }, priority = 1000, ignoreInit = FALSE)
 
   observeEvent(input$dl_raw_year, {
-    rv_dl_filters$year <- input$dl_raw_year
+    if (.rd_year_arg_ok(input$dl_raw_year)) rv_dl_filters$year <- input$dl_raw_year
   }, ignoreNULL = TRUE)
 
   observeEvent(input$dl_raw_response, {
-    rv_dl_filters$response <- input$dl_raw_response
+    if (.rd_text_ok(input$dl_raw_response)) rv_dl_filters$response <- input$dl_raw_response
   }, ignoreNULL = TRUE)
 
   # Shared log line pusher for the #dl_raw_log_pre console -- the actual
@@ -3251,6 +3262,8 @@ server <- function(input, output, session) {
       year_arg     <- if (!is.null(year) && nzchar(year) && year != "__ALL__") year else NULL
       response_arg <- if (!is.null(response) && nzchar(trimws(response)) && trimws(response) != "__ALL__") trimws(response) else NULL
       round_arg    <- if (!is.null(round_nb) && nzchar(trimws(round_nb)) && trimws(round_nb) != "__ALL__") trimws(round_nb) else NULL
+      req(.rd_form_ok(form_id), fmt %in% .rd_formats, .rd_year_ok(year_arg),
+          .rd_text_ok(response_arg), .rd_text_ok(round_arg))
       # Any of year/Response/roundNumber being set always means exactly one
       # resulting file -- never a zip, no need to check whether the form is
       # "heavy" at all -- since each of those filters narrows down to at
@@ -3280,6 +3293,12 @@ server <- function(input, output, session) {
       year_arg     <- if (!is.null(year) && nzchar(year) && year != "__ALL__") year else NULL
       response_arg <- if (!is.null(response) && nzchar(trimws(response)) && trimws(response) != "__ALL__") trimws(response) else NULL
       round_arg    <- if (!is.null(round_nb) && nzchar(trimws(round_nb)) && trimws(round_nb) != "__ALL__") trimws(round_nb) else NULL
+      if (!.rd_form_ok(form_id) || !(fmt %in% .rd_formats) || !.rd_year_ok(year_arg) ||
+          !.rd_text_ok(response_arg) || !.rd_text_ok(round_arg)) {
+        rv_dl_raw_msg("Invalid download request.")
+        writeLines(character(0), file)
+        return(invisible())
+      }
 
       # A heavy-form download can mean several sequential SharePoint
       # round-trips (one per year partition) plus a zip step -- with
@@ -3316,6 +3335,10 @@ server <- function(input, output, session) {
       }
       rv_dl_raw_msg(NULL)
       file.copy(res$path, file, overwrite = TRUE)
+      # The build folder (can be GBs for big forms) is no longer needed once copied out.
+      wd <- dirname(res$path)
+      if (startsWith(basename(wd), "im_dl_") && identical(normalizePath(dirname(wd), mustWork = FALSE), normalizePath(tempdir(), mustWork = FALSE)))
+        unlink(wd, recursive = TRUE, force = TRUE)
     }
   )
 

@@ -82,6 +82,8 @@ sp_get_drive_id <- function(token) {
 }
 
 sp_ensure_folder <- function(token, drive_id, folder_path) {
+  # Read-only mode (country runs, see scripts/run_country_workflow.R): never write to SharePoint.
+  if (identical(Sys.getenv("IM_READ_ONLY_SHAREPOINT"), "1")) return(list(ok = TRUE, error = NULL, folder = folder_path))
   # Returns list(ok = TRUE/FALSE, error = <message or NULL>, folder = <segment
   # that failed, or the full path on success>) -- kept in sync with
   # run_workflow.R's own copy of this function (both had to exist
@@ -229,6 +231,8 @@ SP_UPLOAD_VERSIONS_TO_KEEP <- local({
 })
 
 sp_prune_old_versions <- function(token, drive_id, remote_path, keep = SP_UPLOAD_VERSIONS_TO_KEEP) {
+  # Read-only mode (country runs, see scripts/run_country_workflow.R): never write to SharePoint.
+  if (identical(Sys.getenv("IM_READ_ONLY_SHAREPOINT"), "1")) return(invisible(0L))
   # Returns the number of versions deleted (0 on nothing-to-prune or any
   # failure). Mirrors _sharepoint_client.prune_old_versions() in Python.
   if (is.na(keep) || keep < 0L) return(invisible(0L))
@@ -294,6 +298,8 @@ sp_prune_old_versions <- function(token, drive_id, remote_path, keep = SP_UPLOAD
 }
 
 sp_backup_file <- function(local_path, remote_path) {
+  # Read-only mode (country runs, see scripts/run_country_workflow.R): never write to SharePoint.
+  if (identical(Sys.getenv("IM_READ_ONLY_SHAREPOINT"), "1")) return(invisible(NULL))
   if (!file.exists(local_path)) return(invisible(NULL))
   if (!requireNamespace("httr2", quietly = TRUE)) return(invisible(NULL))
 
