@@ -951,6 +951,15 @@ server <- function(input, output, session) {
     else
       df %>% filter(afro_block==input$ov_block, !is.na(country)) %>%
              pull(country) %>% unique() %>% sort()
+    if (!is_admin() && length(ctrs) == 1L) {
+      # single-country user: the block choice never un-selects their own country
+      provs <- sort(unique(df$province[!is.na(df$province)]))
+      dists <- sort(unique(df$district[!is.na(df$district)]))
+      updateSelectInput(session,"ov_country",  choices=c("All",ctrs),  selected=ctrs)
+      updateSelectInput(session,"ov_province", choices=c("All",provs), selected="All")
+      updateSelectInput(session,"ov_district", choices=c("All",dists), selected="All")
+      return()
+    }
     updateSelectInput(session,"ov_country",  choices=c("All",ctrs), selected="All")
     updateSelectInput(session,"ov_province", choices=c("All"),       selected="All")
     updateSelectInput(session,"ov_district", choices=c("All"),       selected="All")
@@ -969,15 +978,21 @@ server <- function(input, output, session) {
       df2 <- df2[!is.na(df2$afro_block) & df2$afro_block==input$ov_block, ]
     df2 <- df2[!is.na(df2$country) & df2$country==input$ov_country, ]
     provs <- sort(unique(df2$province[!is.na(df2$province)]))
+    dists <- sort(unique(df2$district[!is.na(df2$district)]))
     updateSelectInput(session,"ov_province",choices=c("All",provs),selected="All")
-    updateSelectInput(session,"ov_district",choices=c("All"),selected="All")
+    updateSelectInput(session,"ov_district",choices=c("All",dists),selected="All")   # all districts of the country until a province is chosen
   }, ignoreInit=TRUE)
 
   # Province → District
   observeEvent(input$ov_province, {
     req(rv$data); df <- rv$data
     if (input$ov_province == "All") {
-      updateSelectInput(session,"ov_district",choices=c("All"),selected="All"); return()
+      dch <- "All"
+      if (!is.null(input$ov_country) && input$ov_country != "All" && "country" %in% names(df) && "district" %in% names(df)) {
+        d0 <- df[!is.na(df$country) & df$country == input$ov_country, ]
+        dch <- c("All", sort(unique(d0$district[!is.na(d0$district)])))
+      }
+      updateSelectInput(session,"ov_district",choices=dch,selected="All"); return()
     }
     df2 <- df
     if (!is.null(input$ov_country) && input$ov_country!="All" && "country" %in% names(df2))
@@ -998,6 +1013,10 @@ server <- function(input, output, session) {
     updateSelectInput(session,"ov_country",  choices=c("All",ctrs))
     updateSelectInput(session,"ov_province", choices=c("All"))
     updateSelectInput(session,"ov_district", choices=c("All"))
+    # A country user with a single country starts on that country, so Province and District are
+    # already filled in (country -> province -> district cascade).
+    if (!is_admin() && length(ctrs) == 1L)
+      updateSelectInput(session,"ov_country", choices=c("All",ctrs), selected=ctrs)
     updateSelectInput(session,"ov_vaccine",  choices=c("All",vacs))
     updateSelectInput(session,"ov_response", choices=c("All",resp))
     updateSelectizeInput(session,"ov_round", choices=rnds, selected=NULL)
@@ -1018,9 +1037,18 @@ server <- function(input, output, session) {
     resp <- sort(unique(df$response[!is.na(df$response)]))
     rnds <- sort(unique(as.character(df$roundnumber[!is.na(df$roundnumber)])))
     updateSelectInput(session,"ov_block",    selected="All")
-    updateSelectInput(session,"ov_country",  choices=c("All",ctrs), selected="All")
-    updateSelectInput(session,"ov_province", choices=c("All"),       selected="All")
-    updateSelectInput(session,"ov_district", choices=c("All"),       selected="All")
+    if (!is_admin() && length(ctrs) == 1L) {
+      # single-country user: reset returns to their own country with its provinces/districts listed
+      provs <- sort(unique(df$province[!is.na(df$province)]))
+      dists <- sort(unique(df$district[!is.na(df$district)]))
+      updateSelectInput(session,"ov_country",  choices=c("All",ctrs),   selected=ctrs)
+      updateSelectInput(session,"ov_province", choices=c("All",provs),  selected="All")
+      updateSelectInput(session,"ov_district", choices=c("All",dists),  selected="All")
+    } else {
+      updateSelectInput(session,"ov_country",  choices=c("All",ctrs), selected="All")
+      updateSelectInput(session,"ov_province", choices=c("All"),       selected="All")
+      updateSelectInput(session,"ov_district", choices=c("All"),       selected="All")
+    }
     updateSelectInput(session,"ov_vaccine",  choices=c("All",vacs), selected="All")
     updateSelectInput(session,"ov_response", choices=c("All",resp), selected="All")
     updateSelectizeInput(session,"ov_round", choices=rnds, selected=NULL)

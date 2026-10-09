@@ -62,4 +62,9 @@ check("country users only get their own block(s) in the AFRO Block filters",
       any(grepl("if \\(!is_admin\\(\\) && \"afro_block\" %in% names\\(df\\)\\)", src)) &&
         sum(grepl('updateSelectInput\\(session, "(ov|f)_block",  ?choices = c\\("All", blks\\)', src)) == 2L)
 
+check("single-country users keep their country selected and get cascading Province/District lists",
+      sum(grepl("if \\(!is_admin\\(\\) && length\\(ctrs\\) == 1L\\)", src)) == 3L &&
+        any(grepl("all districts of the country until a province is chosen", src)) &&
+        any(grepl('updateSelectInput\\(session,"ov_district",choices=dch,selected="All"\\)', src)))
+
 cat(sprintf("\nAll %d static guard checks passed.\n", ok))
