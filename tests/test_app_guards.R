@@ -58,4 +58,8 @@ ac_src <- readLines("shiny_app/R/access_control.R", warn = FALSE)
 check("country users are sent to the My data tab after sign-in",
       any(grepl('bslib::nav_select\\("nav", "pipeline"', ac_src)) && any(grepl('id = "nav"', src)))
 
+check("country users only get their own block(s) in the AFRO Block filters",
+      any(grepl("if \\(!is_admin\\(\\) && \"afro_block\" %in% names\\(df\\)\\)", src)) &&
+        sum(grepl('updateSelectInput\\(session, "(ov|f)_block",  ?choices = c\\("All", blks\\)', src)) == 2L)
+
 cat(sprintf("\nAll %d static guard checks passed.\n", ok))

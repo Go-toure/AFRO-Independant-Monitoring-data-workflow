@@ -643,6 +643,13 @@ server <- function(input, output, session) {
     updateSelectInput(session, "f_resp",     choices=c("All", resp))
     updateSelectInput(session, "qc_cntry",   choices=c("All", ctrs))
 
+    # Country users: the AFRO Block filters list only the block(s) their own country belongs to.
+    if (!is_admin() && "afro_block" %in% names(df)) {
+      blks <- sort(unique(as.character(df$afro_block[!is.na(df$afro_block) & nzchar(as.character(df$afro_block))])))
+      updateSelectInput(session, "ov_block", choices = c("All", blks), selected = "All")
+      updateSelectInput(session, "f_block",  choices = c("All", blks), selected = "All")
+    }
+
     dc <- date_col_of(df)
     if (!is.na(dc)) {
       v <- as.Date(df[[dc]]); v <- v[!is.na(v)]
