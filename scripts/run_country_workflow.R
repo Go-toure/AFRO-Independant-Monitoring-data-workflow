@@ -155,9 +155,9 @@ run_step <- function(label, cmd, cmd_args, log_name, timeout_min) {
     }
     if (as.numeric(difftime(Sys.time(), last_beat, units = "secs")) >= 20) {
       last_beat <- Sys.time()
-      cur <- utils::tail(sanitize_tail(logf, 1L), 1L)
-      msg <- if (length(cur) && !identical(cur, last_shown)) { last_shown <- cur; paste0(" | ", cur) } else ""
-      say(label, " ... still working (", sprintf("%.0f", el * 60), "s)", msg)
+      # Only a plain "still working" heartbeat: the child scripts' own lines (memory stats, process
+      # notes, ...) are internal detail and are not shown to country users.
+      say(label, " ... still working (", sprintf("%.0f", el * 60), "s)")
     }
   }
   st <- p$get_exit_status()
