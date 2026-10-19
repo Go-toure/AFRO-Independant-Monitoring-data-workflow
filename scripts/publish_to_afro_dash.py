@@ -2,7 +2,7 @@
 """
 Step 6b (opt-in) of the IM workflow: publish the AFRO-Dash IM data file.
 
-Commits and pushes ONLY  input/AFRO_IM_data.rds  in the AFRO-Dash repository, which
+Commits and pushes ONLY  input/AFRO_IM_data.rds  and  input/AFRO_snapshot_stats_IM.csv  in the AFRO-Dash repository, which
 makes Posit Connect Cloud redeploy the dashboard. Nothing else in that repository is
 touched (other pending changes are left alone) and it never force-pushes.
 
@@ -22,6 +22,8 @@ from pathlib import Path
 WORKFLOW = Path(os.environ.get("IM_WORKFLOW_HOME") or Path(__file__).resolve().parent.parent)
 DEFAULT_DASH = WORKFLOW.parent / "AFRO-Dash"
 TARGET = "input/AFRO_IM_data.rds"
+STATS_TARGET = "input/AFRO_snapshot_stats_IM.csv"   # raw-data counts for the Snapshot landing page
+TARGETS = [TARGET, STATS_TARGET]
 
 
 def log(msg):
@@ -32,6 +34,26 @@ def git(repo, *args):
     r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
     return r.returncode, (r.stdout or "").rstrip("\r\n"), (r.stderr or "").strip()
+
+
+def refresh_snapshot_stats(repo):
+    """Recompute the raw-data counts (submissions, settlements, facilities) for the Snapshot page.
+    Soft-fail: a problem here never blocks the IM data publish."""
+    script = repo / "tools" / "snapshot_stats.py"
+    if not script.exists():
+        log(f"WARNING: {script} not found - Snapshot raw-data counts not refreshed.")
+        return
+    cmd = [sys.executable, str(script), "--source", "IM",
+           "--raw-dir", str(WORKFLOW / "data" / "raw"),
+           "--country-forms", str(WORKFLOW / "config" / "country_forms.csv"),
+           "--out", str(repo / STATS_TARGET)]
+    log("Refreshing Snapshot raw-data counts (IM)...")
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    tail = (r.stdout or "").strip().splitlines()[-3:]
+    for line in tail:
+        log("  " + line)
+    if r.returncode != 0:
+        log(f"WARNING: snapshot_stats.py failed ({(r.stderr or '').strip()[-300:]}) - keeping the previous counts.")
 
 
 def main(argv=None):
@@ -58,12 +80,16 @@ def main(argv=None):
         log(f"ERROR: AFRO-Dash is on branch '{branch}', expected '{args.branch}'. Nothing published.")
         return 1
 
-    rc, status, err = git(repo, "status", "--porcelain", "--", TARGET)
+    if not args.dry_run:
+        refresh_snapshot_stats(repo)
+
+    existing = [t for t in TARGETS if (repo / t).exists()]
+    rc, status, err = git(repo, "status", "--porcelain", "--", *existing)
     if rc != 0:
         log(f"ERROR: git status failed: {err}")
         return 1
     if not status.strip():
-        log("IM data file unchanged - nothing to publish.")
+        log("IM data and Snapshot counts unchanged - nothing to publish.")
         return 0
     log(f"Changed: {status.strip()}")
     if args.dry_run:
@@ -71,7 +97,7 @@ def main(argv=None):
         return 0
 
     msg = args.message or f"Refresh IM Overview data (automated {datetime.now():%Y-%m-%d %H:%M})"
-    for step in (("add", "--", TARGET), ("commit", "-m", msg, "--", TARGET)):
+    for step in (("add", "--", *existing), ("commit", "-m", msg, "--", *existing)):
         rc, out, err = git(repo, *step)
         if rc != 0:
             log(f"ERROR: git {step[0]} failed: {err or out}")
