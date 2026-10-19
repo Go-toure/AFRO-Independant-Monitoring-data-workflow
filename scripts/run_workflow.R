@@ -90,6 +90,9 @@ skip_lookup_refresh <- "--skip-lookup-refresh" %in% args
 force_fetch <- "--force-fetch" %in% args
 upload_only <- "--upload-only" %in% args
 force_upload <- "--force-upload" %in% args
+# Step 6 (opt-in): export the cleaned repository for the AFRO-Dash "IM Overview" tab
+# and push it to the AFRO-Dash repository (Posit Connect Cloud then redeploys).
+push_afro_dash <- "--push-afro-dash" %in% args || identical(Sys.getenv("IM_PUSH_AFRO_DASH"), "1")
 
 log_info("Options:")
 log_info("  Skip lookup refresh: {skip_lookup_refresh}")
@@ -101,6 +104,7 @@ log_info("  Skip reports: {skip_reports}")
 log_info("  Force fetch: {force_fetch}")
 log_info("  Upload only: {upload_only}")
 log_info("  Force upload (even if clean failed): {force_upload}")
+log_info("  Push to AFRO-Dash (step 6): {push_afro_dash}")
 
 # Record start time
 start_time <- Sys.time()
@@ -132,7 +136,8 @@ step_status <- list(
   build          = if (skip_build) "skipped" else "pending",
   clean          = if (skip_clean) "skipped" else "pending",
   upload         = if (skip_upload) "skipped" else "pending",
-  reports        = if (skip_reports) "skipped" else "pending"
+  reports        = if (skip_reports) "skipped" else "pending",
+  afro_dash      = if (push_afro_dash) "pending" else "skipped"
 )
 
 write_run_manifest <- function(overall_status, notes = "") {
@@ -1224,6 +1229,37 @@ if (!skip_upload) {
   }
 } else {
   log_info("\n[STEP 5] Skipping SharePoint upload (--skip-upload)")
+}
+
+# ============================================================
+# STEP 6: Publish to AFRO-Dash (opt-in: --push-afro-dash or IM_PUSH_AFRO_DASH=1)
+# ============================================================
+# Exports data/final/Regional_IM_repository_cleaned.rds as AFRO-Dash/input/AFRO_IM_data.rds
+# (scripts/export_afro_dash_data.R) and then commits + pushes ONLY that file
+# (scripts/publish_to_afro_dash.py). Never runs unless asked, and not when Clean Geonames
+# failed this run (that would publish the previous, stale file).
+
+if (push_afro_dash) {
+  if (!clean_ok) {
+    log_warn("Skipping AFRO-Dash publish: Clean Geonames failed this run, so data/final still holds the previous file.")
+    cat("\n[WARN] [STEP 6] Skipping AFRO-Dash publish - Clean Geonames failed this run.\n")
+    step_status$afro_dash <- "skipped_clean_failed"
+  } else {
+    export_ok <- run_r_script(file.path(SCRIPTS_DIR, "export_afro_dash_data.R"), "Export AFRO-Dash data")
+    publish_ok <- FALSE
+    if (export_ok) {
+      publish_cmd <- sprintf("%s \"%s\" 2>&1", PYTHON_CMD, file.path(SCRIPTS_DIR, "publish_to_afro_dash.py"))
+      log_info("Executing: {publish_cmd}")
+      publish_ok <- identical(as.integer(run_live(publish_cmd)), 0L)
+    }
+    step_status$afro_dash <- if (export_ok && publish_ok) "ok" else "failed_soft"
+    if (!(export_ok && publish_ok)) {
+      log_warn("AFRO-Dash publish had issues, but the workflow is otherwise complete")
+      cat("\n[WARN] [STEP 6] AFRO-Dash publish FAILED - the dashboard still shows the previous IM data.\n")
+    }
+  }
+} else {
+  log_info("\n[STEP 6] Skipping AFRO-Dash publish (use --push-afro-dash to enable)")
 }
 
 # ============================================================

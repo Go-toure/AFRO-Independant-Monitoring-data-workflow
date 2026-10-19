@@ -330,3 +330,22 @@ Double-click launchers: `scripts\run_workflow.bat` (full pipeline), `scripts\upl
 | Upload says credentials missing | Check `config\secrets.env` has the three `SHAREPOINT_*` values |
 | Reports/step failed | Open the newest `logs\workflow_*.log`; `logs\run_history.csv` has one row per run |
 | Country run says the server is busy | Wait a few minutes, or raise `IM_COUNTRY_MAX_RUNS` |
+
+---
+
+## 6. Publish the IM data to the AFRO-Dash "IM Overview" tab (opt-in)
+
+Step 6 of `scripts/run_workflow.R` writes `data\final\Regional_IM_repository_cleaned.rds` to
+`..\AFRO-Dash\input\AFRO_IM_data.rds`, then commits and pushes **only that file** so Posit Connect Cloud
+redeploys AFRO-Dash. It never runs unless asked, and it is skipped if Clean Geonames failed in the same run.
+
+```powershell
+Rscript scripts\run_workflow.R --push-afro-dash                 # full run, then publish to AFRO-Dash
+Rscript scripts\run_workflow.R --skip-lookup-refresh --skip-fetch --skip-build --skip-clean --skip-reports --skip-upload --push-afro-dash   # publish what is already on disk
+Rscript scripts\export_afro_dash_data.R                         # export only (no git)
+python scripts\publish_to_afro_dash.py --dry-run                # show what would be pushed
+```
+
+For scheduled runs set `IM_PUSH_AFRO_DASH=1` instead of the flag. Override the AFRO-Dash folder with
+`AFRO_DASH_REPO`. The export refuses files with fewer than 1,000 rows, missing key columns, or less than half
+the rows of the file already published.
