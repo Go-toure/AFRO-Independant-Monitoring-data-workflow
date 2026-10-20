@@ -349,3 +349,14 @@ python scripts\publish_to_afro_dash.py --dry-run                # show what woul
 For scheduled runs set `IM_PUSH_AFRO_DASH=1` instead of the flag. Override the AFRO-Dash folder with
 `AFRO_DASH_REPO`. The export refuses files with fewer than 1,000 rows, missing key columns, or less than half
 the rows of the file already published.
+
+**IM Settlement Maps data (automatic).** The same step also rebuilds the settlement-level files used by the
+"IM Settlement Maps" tab: `AFRO-Dash\tools\build_settlement_inputs.py` reads `data\raw\<formid>.parquet` and writes
+`AFRO-Dash\input\<formid>.csv.gz` (one file per country; InProcess only, households summed per route, at least
+one child missed, out-of-range household values ignored). The files are byte-reproducible, so a country whose data
+did not change adds no git change; a form that fails, or would shrink to under half of the published routes, keeps
+its previous file. `manifest.json` checksums for the changed files are refreshed and committed with them, so new
+countries are deployed. If `AFRO-Dash\manifest.json` already has uncommitted edits, the settlement files and the
+manifest are skipped (a warning is logged) and only the IM data files are published. New forms listed in
+`config\country_forms.csv` are picked up automatically (Nigeria, form 7178, is skipped: different questionnaire).
+Run it by hand any time: `python AFRO-Dash\tools\build_settlement_inputs.py --raw-dir data\raw --out-dir AFRO-Dash\input`.

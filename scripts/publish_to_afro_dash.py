@@ -2,9 +2,11 @@
 """
 Step 6b (opt-in) of the IM workflow: publish the AFRO-Dash IM data file.
 
-Commits and pushes ONLY  input/AFRO_IM_data.rds  and  input/AFRO_snapshot_stats_IM.csv  in the AFRO-Dash repository, which
-makes Posit Connect Cloud redeploy the dashboard. Nothing else in that repository is
-touched (other pending changes are left alone) and it never force-pushes.
+Commits and pushes ONLY the IM data files in the AFRO-Dash repository, which makes Posit Connect Cloud redeploy
+the dashboard:  input/AFRO_IM_data.rds,  input/AFRO_snapshot_stats_IM.csv,  the per-country settlement files
+input/<formid>.csv.gz (rebuilt here from data/raw by AFRO-Dash/tools/build_settlement_inputs.py) and manifest.json
+(checksums refreshed for exactly those files). Nothing else in that repository is touched (other pending changes
+are left alone) and it never force-pushes.
 
 Runs only when requested:  Rscript scripts/run_workflow.R --push-afro-dash
 (or IM_PUSH_AFRO_DASH=1 for scheduled runs).  Try it first with --dry-run.
@@ -13,6 +15,9 @@ Runs only when requested:  Rscript scripts/run_workflow.R --push-afro-dash
 """
 
 import argparse
+import glob
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -56,6 +61,52 @@ def refresh_snapshot_stats(repo):
         log(f"WARNING: snapshot_stats.py failed ({(r.stderr or '').strip()[-300:]}) - keeping the previous counts.")
 
 
+def refresh_settlement_inputs(repo):
+    """Rebuild input/<formid>.csv.gz (IM Settlement Maps tab) from the raw parquet files.
+    Soft-fail: a problem here never blocks the IM data publish; forms that fail keep their previous file."""
+    script = repo / "tools" / "build_settlement_inputs.py"
+    if not script.exists():
+        log(f"WARNING: {script} not found - settlement files not refreshed.")
+        return
+    cmd = [sys.executable, str(script),
+           "--raw-dir", str(WORKFLOW / "data" / "raw"), "--out-dir", str(repo / "input")]
+    cf = WORKFLOW / "config" / "country_forms.csv"
+    if cf.exists():
+        cmd += ["--country-forms", str(cf)]
+    log("Rebuilding the settlement-level files (IM Settlement Maps)...")
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    lines = (r.stdout or "").strip().splitlines()
+    for line in [l for l in lines if "FAILED" in l or "REFUSED" in l or l.startswith("done")][-12:]:
+        log("  " + line.strip())
+    if r.returncode != 0:
+        log(f"WARNING: build_settlement_inputs.py failed ({(r.stderr or '').strip()[-300:]}) - keeping the previous files.")
+
+
+def settlement_files(repo):
+    return sorted(p.relative_to(repo).as_posix() for p in (repo / "input").glob("*.csv.gz") if p.name[:-7].isdigit())
+
+
+def update_manifest(repo, paths):
+    """Refresh the Posit Connect manifest.json checksums of `paths` (added if missing). Returns True if the file changed."""
+    mf = repo / "manifest.json"
+    if not mf.exists():
+        return False
+    raw = mf.read_text(encoding="utf-8")
+    m = json.loads(raw)
+    files = m.setdefault("files", {})
+    for rel in paths:
+        f = repo / rel
+        if f.exists():
+            files[rel] = {"checksum": hashlib.md5(f.read_bytes()).hexdigest()}
+    m["files"] = dict(sorted(files.items()))
+    new = json.dumps(m, indent=2) + ("\n" if raw.endswith("\n") else "")
+    if new == raw:
+        return False
+    with open(mf, "w", encoding="utf-8", newline="") as fh:
+        fh.write(new)
+    return True
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=f"Commit and push {TARGET} only.")
     ap.add_argument("--repo", default=os.environ.get("AFRO_DASH_REPO") or str(DEFAULT_DASH))
@@ -80,10 +131,24 @@ def main(argv=None):
         log(f"ERROR: AFRO-Dash is on branch '{branch}', expected '{args.branch}'. Nothing published.")
         return 1
 
+    # manifest.json is committed whole, so it must not carry someone else's pending edits: if it is already modified
+    # (e.g. app.R was changed and not yet committed), publish only the IM data files and leave the settlement files alone.
+    rc, mstat, _ = git(repo, "status", "--porcelain", "--", "manifest.json")
+    manifest_clean = rc == 0 and not mstat.strip()
+    if not manifest_clean:
+        log("WARNING: AFRO-Dash/manifest.json has uncommitted changes - settlement files and the manifest are NOT "
+            "published this time (commit or discard the manifest changes first).")
+
     if not args.dry_run:
         refresh_snapshot_stats(repo)
+        if manifest_clean:
+            refresh_settlement_inputs(repo)
 
-    existing = [t for t in TARGETS if (repo / t).exists()]
+    data_targets = [t for t in TARGETS if (repo / t).exists()]
+    extra = (settlement_files(repo) + ["manifest.json"]) if manifest_clean and (repo / "manifest.json").exists() else []
+    if manifest_clean and not args.dry_run and update_manifest(repo, data_targets + [e for e in extra if e != "manifest.json"]):
+        log("manifest.json checksums refreshed.")
+    existing = data_targets + extra
     rc, status, err = git(repo, "status", "--porcelain", "--", *existing)
     if rc != 0:
         log(f"ERROR: git status failed: {err}")
