@@ -162,7 +162,24 @@ def credentials_available() -> bool:
     ])
 
 
+# Graph app-only tokens are short-lived (a long fetch, e.g. form 4498 at ~10 minutes, outlived the one taken at
+# start-up and every later upload failed with HTTP 401 "Invalid token lifetime"). Callers keep passing the token
+# they got from get_token(); _auth() quietly swaps in a fresh one once it is older than _TOKEN_MAX_AGE_S.
+import threading as _threading
+_TOKEN_LOCK = _threading.Lock()
+_TOKEN_STATE = {"token": None, "at": 0.0, "max_age": 480.0}
+_TOKEN_ISSUED = set()
+
+
 def _auth(token: str) -> Dict[str, str]:
+    with _TOKEN_LOCK:
+        st = _TOKEN_STATE
+        if token in _TOKEN_ISSUED and st["token"]:
+            if time.time() - st["at"] > st["max_age"]:
+                fresh = _acquire_token()           # (token, expires_in) or None
+                if fresh:
+                    _store_token(*fresh)
+            token = st["token"]
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -264,8 +281,8 @@ def _request_with_retry(
     return response
 
 
-def get_token() -> Optional[str]:
-    """Get a Microsoft Graph app-only access token, or None on any failure
+def _acquire_token():
+    """Ask Azure AD for an app-only Graph token: (access_token, expires_in_seconds) or None on any failure
     (missing credentials, network error, bad credentials, ...)."""
     tenant_id = os.environ.get("SHAREPOINT_TENANT_ID", "")
     client_id = os.environ.get("SHAREPOINT_CLIENT_ID", "")
@@ -285,9 +302,37 @@ def get_token() -> Optional[str]:
     try:
         r = requests.post(url, data=data, timeout=30)
         r.raise_for_status()
-        return r.json().get("access_token")
+        j = r.json()
+        tok = j.get("access_token")
+        if not tok:
+            return None
+        try:
+            exp = float(j.get("expires_in") or 0)
+        except (TypeError, ValueError):
+            exp = 0.0
+        return tok, exp
     except requests.exceptions.RequestException:
         return None
+
+
+def _store_token(tok, expires_in):
+    _TOKEN_STATE["token"] = tok
+    _TOKEN_STATE["at"] = time.time()
+    # refresh well before expiry, and at the latest after 8 minutes
+    _TOKEN_STATE["max_age"] = max(60.0, min(480.0, (expires_in or 600.0) - 300.0))
+    _TOKEN_ISSUED.add(tok)
+
+
+def get_token() -> Optional[str]:
+    """Get a Microsoft Graph app-only access token, or None on any failure
+    (missing credentials, network error, bad credentials, ...). The token is renewed automatically by
+    _auth() during long runs, so callers can keep using the one returned here."""
+    res = _acquire_token()
+    if not res:
+        return None
+    with _TOKEN_LOCK:
+        _store_token(*res)
+    return res[0]
 
 
 def get_drive_id(token: str) -> Optional[str]:
