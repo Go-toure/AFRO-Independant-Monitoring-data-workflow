@@ -1248,7 +1248,7 @@ if (push_afro_dash) {
     export_ok <- run_r_script(file.path(SCRIPTS_DIR, "export_afro_dash_data.R"), "Export AFRO-Dash data")
     publish_ok <- FALSE
     if (export_ok) {
-      publish_cmd <- sprintf("%s \"%s\" 2>&1", PYTHON_CMD, file.path(SCRIPTS_DIR, "publish_to_afro_dash.py"))
+      publish_cmd <- sprintf("%s \"%s\"", PYTHON_CMD, file.path(SCRIPTS_DIR, "publish_to_afro_dash.py"))
       log_info("Executing: {publish_cmd}")
       publish_ok <- identical(as.integer(run_live(publish_cmd)), 0L)
     }
