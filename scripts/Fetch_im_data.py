@@ -1546,6 +1546,16 @@ def save_incremental(
 _ISOLATE_MERGE_ROW_THRESHOLD = 500_000
 
 
+# Hard limit for the isolated merge child (the process that merges new records into a huge form such as 4498,
+# recovers its year partitions from SharePoint, rewrites them and uploads). It was 20 minutes; the 20 Oct 2026 run
+# needed about 19-21 minutes for 4498 (680 s just to download 1.3 GB of partitions), was killed right after writing
+# the combined file, and therefore never finished the upload/metadata step. Override with IM_MERGE_TIMEOUT_S.
+try:
+    _ISOLATED_MERGE_TIMEOUT_S = int(os.environ.get("IM_MERGE_TIMEOUT_S") or 3600)
+except ValueError:
+    _ISOLATED_MERGE_TIMEOUT_S = 3600
+
+
 def _merge_incremental_isolated(
     form_id: int,
     new_data: List[Dict],
@@ -1584,9 +1594,9 @@ def _merge_incremental_isolated(
         detail(f"Form {form_id} | Launching isolated merge subprocess: {cmd}")
 
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_ISOLATED_MERGE_TIMEOUT_S)
         except subprocess.TimeoutExpired as e:
-            console(f"   \u26a0\ufe0f  Form {form_id} | Isolated merge subprocess timed out after 20 minutes.")
+            console(f"   \u26a0\ufe0f  Form {form_id} | Isolated merge subprocess timed out after {_ISOLATED_MERGE_TIMEOUT_S // 60} minutes.")
 
             # [TIMING] Fix added 2026-09-24: Python's subprocess.run()
             # DOES populate TimeoutExpired.stdout/.stderr with whatever
