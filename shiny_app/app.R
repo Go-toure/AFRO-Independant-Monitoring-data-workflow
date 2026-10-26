@@ -83,11 +83,11 @@ ui <- page_navbar(
       layout_columns(
         col_widths=c(6,6), gap="14px",
         card(full_screen=TRUE,
-             card_header(hdr_icon("bullseye", "CV vs Missed Children")),
-             plotlyOutput("chart_scatter", height="320px")),
+             card_header(hdr_icon("bar-chart-fill", "Coverage Bands")),
+             plotlyOutput("chart_cov_bands", height="380px")),
         card(full_screen=TRUE,
              card_header(hdr_icon("bar-chart-steps", "Top Missed-Child Reasons")),
-             plotlyOutput("chart_reasons", height="320px"))
+             plotlyOutput("chart_reasons", height="380px"))
       ),
 
       card(
@@ -505,23 +505,59 @@ server <- function(input, output, session) {
     fmt_num(nrow(df))
   })
 
-  output$chart_scatter <- renderPlotly({
+  # Coverage bands: for every area, what share of the records fall in each
+  # coverage band (<80%, 80-89%, 90-94%, >=95%). One bar per country -- or, when
+  # the data is already narrowed to a single country, one bar per province.
+  # Worst areas (largest share below 80%) are listed first.
+  output$chart_cov_bands <- renderPlotly({
     df <- active(); req(df)
     if (!all(c("u5_fm","u5_present") %in% names(df))) return(NULL)
-    df2 <- df %>%
-      mutate(cv = as.numeric(u5_fm) / pmax(as.numeric(u5_present), 1),
-             missed = pmax(as.numeric(u5_present) - as.numeric(u5_fm), 0)) %>%
-      filter(!is.na(cv))
-    grp <- intersect(c("country","afro_block"), names(df2))[1]
-    col_var <- if (!is.na(grp)) df2[[grp]] else rep("All", nrow(df2))
-    plot_ly(df2, x=~cv, y=~missed, type="scatter", mode="markers",
-            color=col_var,
-            marker=list(size=7, opacity=0.7, line=list(width=0)),
-            text=if (!is.na(grp)) ~.data[[grp]] else NULL,
-            hovertemplate="CV: %{x:.1%}<br>Missed: %{y:,}<extra></extra>") %>%
-      im_layout(.title="CV vs Missed Children", .filename="IM_scatter",
-                xaxis=list(title="Coverage Rate", tickformat=".0%"),
-                yaxis=list(title="Missed Children"))
+    lvl <- if ("country" %in% names(df) && n_distinct(df$country, na.rm = TRUE) == 1 && "province" %in% names(df))
+             "province" else "country"
+    if (!lvl %in% names(df)) return(NULL)
+    bands <- c("Below 80%", "80\u201389%", "90\u201394%", "95% and above")
+    d <- data.frame(area    = as.character(df[[lvl]]),
+                    present = as.numeric(df$u5_present),
+                    fm      = as.numeric(df$u5_fm), stringsAsFactors = FALSE)
+    d <- d[!is.na(d$area) & nzchar(d$area) & !is.na(d$present) & d$present > 0 & !is.na(d$fm), , drop = FALSE]
+    req(nrow(d) > 0)
+    d$cv     <- d$fm / d$present
+    d$missed <- pmax(d$present - d$fm, 0)
+    d$band   <- cut(d$cv, breaks = c(-Inf, 0.80, 0.90, 0.95, Inf), labels = bands, right = FALSE)
+    tot <- d %>% group_by(area) %>%
+      summarise(total = n(), missed = sum(missed), low = mean(cv < 0.80), .groups = "drop") %>%
+      arrange(desc(low), desc(total))
+    shown_all <- nrow(tot)
+    tot <- head(tot, 25)
+    cnt <- as.data.frame(table(area = d$area, band = d$band), stringsAsFactors = FALSE)
+    cnt <- merge(cnt, tot, by = "area")
+    cnt$share <- cnt$Freq / cnt$total
+    cnt$band  <- factor(cnt$band, levels = bands)
+    cols  <- c("#C0392B", "#F0A04B", "#8DB9D9", "#2E8B57")
+    tcols <- c("#FFFFFF", "#1A2637", "#1A2637", "#FFFFFF")
+    p <- plot_ly()
+    for (i in seq_along(bands)) {
+      s_i <- cnt[cnt$band == bands[i], , drop = FALSE]
+      p <- p %>% add_bars(
+        data = s_i, x = ~share, y = ~area, name = bands[i], orientation = "h",
+        marker = list(color = cols[i], line = list(color = "#FFFFFF", width = 1)),
+        text = ifelse(s_i$share >= 0.08, scales::percent(s_i$share, accuracy = 1), ""),
+        textposition = "inside", insidetextanchor = "middle",
+        textfont = list(color = tcols[i], size = 11),
+        customdata = cbind(s_i$Freq, s_i$total, round(s_i$missed)),
+        hovertemplate = paste0("<b>%{y}</b><br>", bands[i], ": %{x:.0%} of records",
+                               " (%{customdata[0]:,} of %{customdata[1]:,})",
+                               "<br>Missed children in this area: %{customdata[2]:,}<extra></extra>"))
+    }
+    ttl <- paste0("Share of records by coverage band, by ", lvl,
+                  if (shown_all > nrow(tot)) paste0(" (", nrow(tot), " lowest of ", shown_all, ")") else "")
+    p %>% im_layout(.title = ttl, .filename = "IM_coverage_bands",
+                    barmode = "stack",
+                    xaxis = list(title = "Share of records", tickformat = ".0%", range = c(0, 1)),
+                    yaxis = list(title = "", categoryorder = "array", categoryarray = rev(tot$area)),
+                    margin = list(l = 130, r = 20, t = 46, b = 70)) %>%
+      layout(legend = list(orientation = "h", x = 0, y = -0.16, traceorder = "normal",
+                           bgcolor = "rgba(0,0,0,0)", bordercolor = "rgba(0,0,0,0)"))
   })
 
   output$chart_reasons <- renderPlotly({
