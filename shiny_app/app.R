@@ -534,13 +534,11 @@ server <- function(input, output, session) {
     n_ctry <- if ("country"  %in% names(df)) n_distinct(df$country,  na.rm = TRUE) else NA
     n_resp <- if ("response" %in% names(df)) n_distinct(df$response, na.rm = TRUE) else NA
     n_rnd  <- if ("roundnumber" %in% names(df)) n_distinct(df$roundnumber, na.rm = TRUE) else NA
-    div(class = "row row-cols-2 row-cols-md-5 g-2 mb-3",
+    div(class = "row row-cols-2 row-cols-md-4 g-2 mb-3",
       k("Children vaccinated", if (tp > 0) scales::percent(tf / tp, accuracy = 0.1) else "\u2014",
         paste0(fmt_num(tf), " of ", fmt_num(tp), " checked"), "#005C97"),
       k("Districts at 95%+", if (n > 0) scales::percent(mean(cv_row >= 0.95), accuracy = 0.1) else "\u2014",
         paste0(fmt_num(sum(cv_row >= 0.95)), " of ", fmt_num(n), " district results"), "#27AE60"),
-      k("Districts below 80%", if (n > 0) scales::percent(mean(cv_row < 0.80), accuracy = 0.1) else "\u2014",
-        paste0(fmt_num(sum(cv_row < 0.80)), " need attention"), "#C0392B"),
       k("Children missed", fmt_num(sum(pmax(pres - fmv, 0))), "not found vaccinated", "#E8730A"),
       k("Countries", if (is.na(n_ctry)) "\u2014" else fmt_num(n_ctry),
         paste0(if (!is.na(n_resp)) paste0(fmt_num(n_resp), " responses") else "",
