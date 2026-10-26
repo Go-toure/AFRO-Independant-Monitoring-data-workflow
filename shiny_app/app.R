@@ -80,10 +80,21 @@ ui <- page_navbar(
           downloadButton("dl_csv", tagList(bs_icon("download", class="me-1"), "Download CSV"), class="btn-outline-success btn-sm"))
       ),
 
+      # Headline numbers for whatever is currently filtered
+      uiOutput("ex_kpis"),
+
       layout_columns(
         col_widths=c(6,6), gap="14px",
         card(full_screen=TRUE,
              card_header(hdr_icon("bar-chart-fill", "Vaccination Coverage")),
+             div(class="d-flex flex-wrap column-gap-4 px-3 pt-2",
+                 style="font-size:.82rem;",
+                 radioButtons("ex_by", "Show by",
+                              choices = c("Country" = "area", "Response" = "response", "Round" = "round"),
+                              selected = "area", inline = TRUE, width = "auto"),
+                 radioButtons("ex_measure", "Measure",
+                              choices = c("Children vaccinated (%)" = "cv", "Districts at 95%+ (%)" = "p95"),
+                              selected = "cv", inline = TRUE, width = "auto")),
              plotlyOutput("chart_cov_bands", height="380px")),
         card(full_screen=TRUE,
              card_header(hdr_icon("bar-chart-steps", "Top Missed-Child Reasons")),
@@ -505,16 +516,54 @@ server <- function(input, output, session) {
     fmt_num(nrow(df))
   })
 
-  # Coverage by area: one bar per country (or per province when the data is
-  # already narrowed to one country) showing the % of children checked who were
-  # found vaccinated. Lowest coverage first, bars coloured by how good the
-  # coverage is, dotted line at the 95% target.
+  # Headline numbers for the current Explorer filters ------------------------
+  output$ex_kpis <- renderUI({
+    df <- active(); req(df)
+    if (!all(c("u5_fm","u5_present") %in% names(df))) return(NULL)
+    present <- as.numeric(df$u5_present); fm <- as.numeric(df$u5_fm)
+    ok   <- !is.na(present) & present > 0 & !is.na(fm)
+    pres <- present[ok]; fmv <- fm[ok]
+    n    <- length(pres)
+    cv_row <- round(pmin(fmv / pres, 1), 3)
+    tp <- sum(pres); tf <- sum(fmv)
+    k <- function(label, value, sub, accent)
+      div(class = "col", div(class = "kpi2", style = paste0("--kpi-accent:", accent, ";"),
+        div(class = "kpi2-label", label),
+        div(class = "kpi2-body", div(class = "kpi2-val", value),
+            div(style = "font-size:.67rem;color:var(--muted);margin-top:3px;position:relative;z-index:1;", sub))))
+    n_ctry <- if ("country"  %in% names(df)) n_distinct(df$country,  na.rm = TRUE) else NA
+    n_resp <- if ("response" %in% names(df)) n_distinct(df$response, na.rm = TRUE) else NA
+    n_rnd  <- if ("roundnumber" %in% names(df)) n_distinct(df$roundnumber, na.rm = TRUE) else NA
+    div(class = "row row-cols-2 row-cols-md-5 g-2 mb-3",
+      k("Children vaccinated", if (tp > 0) scales::percent(tf / tp, accuracy = 0.1) else "\u2014",
+        paste0(fmt_num(tf), " of ", fmt_num(tp), " checked"), "#005C97"),
+      k("Districts at 95%+", if (n > 0) scales::percent(mean(cv_row >= 0.95), accuracy = 0.1) else "\u2014",
+        paste0(fmt_num(sum(cv_row >= 0.95)), " of ", fmt_num(n), " district results"), "#27AE60"),
+      k("Districts below 80%", if (n > 0) scales::percent(mean(cv_row < 0.80), accuracy = 0.1) else "\u2014",
+        paste0(fmt_num(sum(cv_row < 0.80)), " need attention"), "#C0392B"),
+      k("Children missed", fmt_num(sum(pmax(pres - fmv, 0))), "not found vaccinated", "#E8730A"),
+      k("Countries", if (is.na(n_ctry)) "\u2014" else fmt_num(n_ctry),
+        paste0(if (!is.na(n_resp)) paste0(fmt_num(n_resp), " responses") else "",
+               if (!is.na(n_resp) && !is.na(n_rnd)) " \u00b7 " else "",
+               if (!is.na(n_rnd)) paste0(fmt_num(n_rnd), " rounds") else ""), "#00908F"))
+  })
+
+  # Coverage chart ---------------------------------------------------------------
+  # One bar per group (country -- or province once the data is narrowed to a single
+  # country -- or response, or round number). Measure: % of children found
+  # vaccinated, or % of districts that reached 95% coverage.
   output$chart_cov_bands <- renderPlotly({
     df <- active(); req(df)
     if (!all(c("u5_fm","u5_present") %in% names(df))) return(NULL)
-    lvl <- if ("country" %in% names(df) && n_distinct(df$country, na.rm = TRUE) == 1 && "province" %in% names(df))
-             "province" else "country"
+    by      <- if (is.null(input$ex_by)) "area" else input$ex_by
+    measure <- if (is.null(input$ex_measure)) "cv" else input$ex_measure
+    lvl <- switch(by,
+      response = "response",
+      round    = "roundnumber",
+      if ("country" %in% names(df) && n_distinct(df$country, na.rm = TRUE) == 1 && "province" %in% names(df))
+        "province" else "country")
     if (!lvl %in% names(df)) return(NULL)
+    lvl_name <- switch(lvl, roundnumber = "round", lvl)
     bands <- c("Below 80%", "80\u201389%", "90\u201394%", "95% or more")
     cols  <- c("#C0392B", "#F0A04B", "#8DB9D9", "#2E8B57")
     d <- data.frame(area    = as.character(df[[lvl]]),
@@ -523,40 +572,58 @@ server <- function(input, output, session) {
     d <- d[!is.na(d$area) & nzchar(d$area) & !is.na(d$present) & d$present > 0 & !is.na(d$fm), , drop = FALSE]
     req(nrow(d) > 0)
     d$missed <- pmax(d$present - d$fm, 0)
+    d$hit95  <- round(pmin(d$fm / d$present, 1), 3) >= 0.95
     tot <- d %>% group_by(area) %>%
-      summarise(present = sum(present), fm = sum(fm), missed = sum(missed), .groups = "drop") %>%
-      mutate(cv = pmin(fm / present, 1)) %>%
-      arrange(cv)
+      summarise(present = sum(present), fm = sum(fm), missed = sum(missed),
+                n = n(), n95 = sum(hit95), .groups = "drop") %>%
+      mutate(cv = pmin(fm / present, 1), p95 = n95 / n,
+             val = if (measure == "p95") p95 else cv)
+    tot <- if (by == "round") tot[order(suppressWarnings(as.numeric(gsub("\\D", "", tot$area))), tot$area), , drop = FALSE]
+           else tot[order(tot$val), , drop = FALSE]
     shown_all <- nrow(tot)
     tot <- head(tot, 30)
-    tot$band <- cut(round(tot$cv, 3), breaks = c(-Inf, 0.80, 0.90, 0.95, Inf), labels = bands, right = FALSE)
+    what <- if (measure == "p95") "Districts that reached 95% coverage (%)" else "Children found vaccinated (%)"
+    ttl  <- paste0(what, ", by ", lvl_name,
+                   if (shown_all > nrow(tot)) paste0(" \u2013 ", nrow(tot), " of ", shown_all, " shown") else "")
+    hov <- if (measure == "p95")
+      "<b>%{y}</b><br>%{x:.1%} of districts reached 95%<br>(%{customdata[0]:,} of %{customdata[1]:,} district results)<extra></extra>"
+    else
+      "<b>%{y}</b><br>%{x:.1%} of the children checked were vaccinated<br>Children missed: %{customdata[0]:,}<br>Children checked: %{customdata[1]:,}<extra></extra>"
+    cd <- if (measure == "p95") cbind(tot$n95, tot$n) else cbind(round(tot$missed), round(tot$present))
     p <- plot_ly()
-    for (i in seq_along(bands)) {
-      s_i <- tot[tot$band == bands[i], , drop = FALSE]
-      if (!nrow(s_i)) next
-      p <- p %>% add_bars(
-        data = s_i, x = ~cv, y = ~area, name = bands[i], orientation = "h",
-        marker = list(color = cols[i]),
-        text = scales::percent(round(s_i$cv, 3), accuracy = 0.1), textposition = "outside", cliponaxis = FALSE,
-        textfont = list(size = 11, color = "#1A2637"),
-        customdata = cbind(round(s_i$missed), round(s_i$present)),
-        hovertemplate = paste0("<b>%{y}</b><br>%{x:.1%} of the children checked were vaccinated",
-                               "<br>Children missed: %{customdata[0]:,}",
-                               "<br>Children checked: %{customdata[1]:,}<extra></extra>"))
+    if (measure == "p95") {
+      p <- p %>% add_bars(x = tot$val, y = tot$area, orientation = "h", showlegend = FALSE,
+                          marker = list(color = "#005C97"),
+                          text = scales::percent(round(tot$val, 3), accuracy = 0.1), textposition = "outside",
+                          cliponaxis = FALSE, textfont = list(size = 11, color = "#1A2637"),
+                          customdata = cd, hovertemplate = hov)
+    } else {
+      tot$band <- cut(round(tot$val, 3), breaks = c(-Inf, 0.80, 0.90, 0.95, Inf), labels = bands, right = FALSE)
+      for (i in seq_along(bands)) {
+        idx <- which(tot$band == bands[i]); if (!length(idx)) next
+        p <- p %>% add_bars(x = tot$val[idx], y = tot$area[idx], name = bands[i], orientation = "h",
+                            marker = list(color = cols[i]),
+                            text = scales::percent(round(tot$val[idx], 3), accuracy = 0.1), textposition = "outside",
+                            cliponaxis = FALSE, textfont = list(size = 11, color = "#1A2637"),
+                            customdata = cd[idx, , drop = FALSE], hovertemplate = hov)
+      }
     }
-    ttl <- paste0("Children found vaccinated (%), by ", lvl,
-                  if (shown_all > nrow(tot)) paste0(" \u2013 lowest ", nrow(tot), " of ", shown_all) else "")
-    p %>% im_layout(.title = ttl, .filename = "IM_coverage",
+    p <- p %>% im_layout(.title = ttl, .filename = "IM_coverage",
                     xaxis = list(title = "", tickformat = ".0%", range = c(0, 1.1),
                                  tickvals = c(0, .2, .4, .6, .8, 1)),
-                    yaxis = list(title = "", categoryorder = "array", categoryarray = rev(tot$area)),
-                    margin = list(l = 130, r = 20, t = 46, b = 70)) %>%
-      layout(legend = list(orientation = "h", x = 0, y = -0.12, traceorder = "normal",
-                           bgcolor = "rgba(0,0,0,0)", bordercolor = "rgba(0,0,0,0)"),
-             shapes = list(list(type = "line", x0 = 0.95, x1 = 0.95, y0 = 0, y1 = 1, yref = "paper",
-                                line = list(color = "#6C7A8D", width = 1, dash = "dot"))),
-             annotations = list(list(x = 0.95, y = 1, yref = "paper", text = "95% target", showarrow = FALSE,
-                                     xanchor = "right", yanchor = "bottom", font = list(size = 10, color = "#6C7A8D"))))
+                    yaxis = list(title = "", automargin = TRUE, categoryorder = "array",
+                                 categoryarray = rev(tot$area)),
+                    margin = list(l = 20, r = 20, t = 46, b = 70))
+    if (measure == "cv") {
+      p <- p %>% layout(legend = list(orientation = "h", x = 0, y = -0.12, traceorder = "normal",
+                                      bgcolor = "rgba(0,0,0,0)", bordercolor = "rgba(0,0,0,0)"),
+                        shapes = list(list(type = "line", x0 = 0.95, x1 = 0.95, y0 = 0, y1 = 1, yref = "paper",
+                                           line = list(color = "#6C7A8D", width = 1, dash = "dot"))),
+                        annotations = list(list(x = 0.95, y = 1, yref = "paper", text = "95% target", showarrow = FALSE,
+                                                xanchor = "right", yanchor = "bottom",
+                                                font = list(size = 10, color = "#6C7A8D"))))
+    }
+    p
   })
 
   output$chart_reasons <- renderPlotly({
