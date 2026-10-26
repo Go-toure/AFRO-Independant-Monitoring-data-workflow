@@ -67,7 +67,7 @@ ui <- page_navbar(
         selectInput("f_vaccine", "Vaccine Type",  "All"),
         selectInput("f_resp",    "Response",      "All"),
         dateRangeInput("f_dates","Date Range",
-                       start=Sys.Date()-365, end=Sys.Date()),
+                       start=as.Date("2015-01-01"), end=Sys.Date()+366),
         selectInput("f_qc","QC Status", c("All","Clean only","Flagged only")),
 
         hr(),
@@ -489,6 +489,11 @@ server <- function(input, output, session) {
     updateSelectInput(session, "f_qc",      selected="All")
     # Restore full country list
     req(rv$data)
+    dc <- date_col_of(rv$data)
+    if (!is.na(dc)) {
+      v <- as.Date(rv$data[[dc]]); v <- v[!is.na(v)]
+      if (length(v)) updateDateRangeInput(session, "f_dates", start=min(v), end=max(v))
+    }
     ctrs <- sort(unique(rv$data$country[!is.na(rv$data$country)]))
     updateSelectInput(session, "f_country", choices=c("All", ctrs), selected="All")
   })
