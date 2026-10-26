@@ -657,9 +657,12 @@ server <- function(input, output, session) {
                              "vaccine_type","response","u5_present","u5_fm",
                              "qc_flag","reconciliation_flag"),
                            names(df))
+    # One continuous scrolling table (no page 1, 2, 3 ...). The Scroller extension
+    # only draws the rows in view, so all rows stay fast to scroll.
     DT::datatable(df[, show_cols, drop=FALSE],
-      options=list(pageLength=15, scrollX=TRUE,
-                   dom="Bfrtip", buttons=c("csv","excel")),
+      extensions="Scroller",
+      options=list(scrollY="520px", scrollX=TRUE, scroller=TRUE, deferRender=TRUE,
+                   scrollCollapse=TRUE, dom="frti"),
       rownames=FALSE, filter="top",
       class="table table-sm table-striped")
   })
