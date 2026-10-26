@@ -31,12 +31,13 @@ ui <- page_navbar(
     bs_icon("globe-europe-africa", size="1.5rem", style="color:#fff;"),
     div(
       div(style="color:#fff;font-weight:800;font-size:1.05rem;letter-spacing:-.01em;",
-          "AFRO IM Dashboard"),
+          "SIA Data Operation Center"),
       div(style="color:rgba(255,255,255,.55);font-size:.68rem;font-weight:500;letter-spacing:.05em;margin-top:-2px;",
           "WHO AFRO INDEPENDENT MONITORING")
     )
   ),
   theme  = who_theme, id = "nav",
+  window_title = "SIA Data Operation Center",
   header = tagList(
     useShinyjs(),
     tags$head(

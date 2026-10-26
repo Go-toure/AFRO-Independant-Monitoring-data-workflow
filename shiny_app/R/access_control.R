@@ -227,13 +227,13 @@ ac_session_init <- function(input, output, session, mode = ac_mode()) {
   show_login <- function(msg = NULL, locked_secs = 0) {
     if (identical(mode, "unconfigured")) {
       shiny::showModal(shiny::modalDialog(
-        title = shiny::div(style = "font-weight:800;", "AFRO IM Dashboard"),
+        title = shiny::div(style = "font-weight:800;", "SIA Data Operation Center"),
         shiny::p("Access has not been configured on this server yet. Please contact the regional office."),
         footer = NULL, easyClose = FALSE, size = "s"))
       return(invisible())
     }
     shiny::showModal(shiny::modalDialog(
-      title = shiny::div(style = "font-weight:800;", "AFRO IM Dashboard"),
+      title = shiny::div(style = "font-weight:800;", "SIA Data Operation Center"),
       shiny::p(style = "font-size:.85rem;color:#6C7A8D;",
                "Enter your access code to continue. Country users see their own country's data only."),
       shiny::passwordInput("auth_code", "Access code", width = "100%"),
