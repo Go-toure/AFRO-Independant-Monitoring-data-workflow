@@ -151,7 +151,7 @@ ui <- page_navbar(
         selectInput("qc_cntry","Country","All"),
         div()
       ),
-      DTOutput("qc_tbl")
+      div(class="im-light-tbl", DTOutput("qc_tbl"))
     )
   ),
 
@@ -751,9 +751,12 @@ server <- function(input, output, session) {
                              "vaccine_type","qc_flag","reconciliation_flag",
                              "sm_gap_flag","sm_priority_flag","u5_present","u5_fm"),
                            names(df))
+    # One continuous scrolling table (no pages); Scroller only draws the rows in view.
     DT::datatable(df[, show_cols, drop=FALSE],
-      options=list(pageLength=15, scrollX=TRUE, dom="Bfrtip"),
-      rownames=FALSE, class="table table-sm")
+      extensions="Scroller",
+      options=list(scrollY="520px", scrollX=TRUE, scroller=TRUE, deferRender=TRUE,
+                   scrollCollapse=TRUE, dom="frti"),
+      rownames=FALSE, class="table table-sm table-striped")
   })
 
   observeEvent(rv$data, {
