@@ -145,6 +145,24 @@ table.dataTable tbody tr:hover{background:rgba(0,92,151,.05)!important;}
 table.dataTable tbody td{border-color:rgba(0,92,151,.05)!important;vertical-align:middle!important;}
 .dataTables_wrapper .dataTables_filter input{border-radius:10px!important;border:1.5px solid rgba(0,92,151,.2)!important;padding:6px 12px!important;font-size:.83rem!important;}
 .dataTables_wrapper .dataTables_length select{border-radius:8px!important;border:1.5px solid rgba(0,92,151,.2)!important;}
+/* Light variant (Explorer > Records): pale header instead of the solid blue band */
+.im-light-tbl table.dataTable thead th{
+  background:#F5F8FB!important; color:#4A5B6C!important; font-weight:600!important;
+  font-size:.72rem!important; letter-spacing:.03em!important; text-transform:none!important;
+  padding:9px 10px!important; border-bottom:1px solid #DCE5EE!important;
+}
+.im-light-tbl table.dataTable thead th:hover{background:#EAF1F8!important;}
+.im-light-tbl table.dataTable thead tr:nth-child(2) th{background:#FFFFFF!important; padding:4px 6px!important; border-bottom:1px solid #E6EDF4!important;}
+.im-light-tbl table.dataTable tbody td{font-size:.82rem!important; color:#2F3E4D!important; padding:6px 10px!important; border-color:#EEF2F6!important;}
+.im-light-tbl table.dataTable.table-striped>tbody>tr:nth-of-type(odd)>*{--bs-table-accent-bg:#FAFCFE!important; box-shadow:none!important;}
+.im-light-tbl table.dataTable tbody tr:hover{background:#EEF5FB!important;}
+.im-light-tbl .dataTables_scrollBody{border-bottom:1px solid #E6EDF4!important;}
+.im-light-tbl table.dataTable thead .form-control-feedback{display:none!important;}
+.im-light-tbl table.dataTable thead td{background:#FFFFFF!important; padding:4px 6px!important; border-bottom:1px solid #DCE5EE!important;}
+.im-light-tbl table.dataTable, .im-light-tbl table.dataTable.no-footer{border-bottom:1px solid #DCE5EE!important;}
+.im-light-tbl table.dataTable thead .form-control{font-size:.74rem!important; padding:3px 8px!important; height:auto!important; border-radius:6px!important;}
+.im-light-tbl table.dataTable.table-striped>tbody>tr:nth-of-type(odd)>*{background-color:#FAFCFE!important;}
+.im-light-tbl table.dataTable.table-striped>tbody>tr:nth-of-type(even)>*{background-color:#FFFFFF!important;}
 
 /* ─ Form inputs ──────────────────────────────────────── */
 .form-select,.form-control{

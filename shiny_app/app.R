@@ -111,7 +111,7 @@ ui <- page_navbar(
                       textOutput("rec_count", inline=TRUE))
           )
         ),
-        DTOutput("data_tbl")
+        div(class="im-light-tbl", DTOutput("data_tbl"))
       )
     )
   ),
