@@ -178,6 +178,33 @@ def _try_upload_lookup_to_sharepoint(base_dir, lookup_path):
         log("WARNING: could not sync lookup.xlsx to SharePoint (kept local copy only).")
 
 
+# Other repositories that need the campaign lookup next to their own scripts (e.g. the admin data
+# co-administration script, which uses it as its primary reference). After every successful refresh
+# lookup.xlsx is copied into each folder listed here. Override with the LOOKUP_COPY_TO environment
+# variable (folders separated by ";"), empty value = no copies. A missing folder is skipped.
+DEFAULT_LOOKUP_COPY_TO = ["C:/Users/TOURE/Documents/Gith_repositories/Admin_data_coadministration"]
+
+
+def _copy_lookup_to_repos(lookup_path):
+    """Copy the freshly validated lookup.xlsx into the other repositories that read it. Never raises."""
+    import os
+    raw = os.environ.get("LOOKUP_COPY_TO")
+    dests = DEFAULT_LOOKUP_COPY_TO if raw is None else [d.strip() for d in raw.split(";") if d.strip()]
+    for d in dests:
+        try:
+            dest_dir = Path(d)
+            if not dest_dir.is_dir():
+                log(f"lookup copy skipped (folder not found): {dest_dir}")
+                continue
+            target = dest_dir / "lookup.xlsx"
+            tmp = dest_dir / "lookup.xlsx.tmp"
+            shutil.copy2(lookup_path, tmp)
+            os.replace(tmp, target)
+            log(f"lookup.xlsx copied to {target}")
+        except Exception as e:
+            log(f"WARNING: could not copy lookup.xlsx to {d} ({e}).")
+
+
 def log(msg):
     print(f"[refresh_preparedness_lookup] {msg}", flush=True)
 
@@ -347,6 +374,7 @@ def run(base_dir: Path, debug: bool) -> bool:
     ok = validate_and_install(tmp_path, lookup_path, backup_dir)
     if ok:
         _try_upload_lookup_to_sharepoint(base_dir, lookup_path)
+        _copy_lookup_to_repos(lookup_path)
     return ok
 
 
