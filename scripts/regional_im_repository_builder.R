@@ -5676,6 +5676,64 @@ build_regional_im_repository <- function(processed_results, regional_repository_
 # fresh Rscript startups, each reloading the same tidyverse/arrow
 # packages, instead of one long-running session) -- worth it while this
 # step can't otherwise complete at all.
+# ============================================================
+# PER-FORM RESULT CACHE (data/processed/country)
+# ============================================================
+# Every form used to be rebuilt on every run. Now the finished result of each
+# form (the list process_im_file() returns: data, qc, summary) is saved in
+# data/processed/country/<form>_result.rds, together with a fingerprint
+# (<form>_fingerprint.rds) made of the md5 of: the raw file, the campaign
+# calendar (data/lookup/lookup.xlsx) and this builder script. On the next run a
+# form is reused as-is when all three are unchanged and its data/final/<form>.csv
+# and QC file still exist; otherwise it is rebuilt. A change to this script or to
+# the calendar therefore rebuilds every form.
+#   Force a full rebuild :  set IM_REBUILD_ALL=1 before running (or delete
+#                           data/processed/country/*_fingerprint.rds)
+IM_CACHE_DIR <- file.path(base_dir, "data/processed/country")
+IM_REBUILD_ALL <- tolower(Sys.getenv("IM_REBUILD_ALL", "")) %in% c("1", "true", "yes")
+
+im_cache_paths <- function(f) {
+  id <- tools::file_path_sans_ext(basename(f))
+  list(
+    id = id,
+    res = file.path(IM_CACHE_DIR, paste0(id, "_result.rds")),
+    fp = file.path(IM_CACHE_DIR, paste0(id, "_fingerprint.rds")),
+    final = file.path(output_folder, paste0(id, ".csv")),
+    qc = file.path(qc_output_folder, paste0(id, "_QC.csv"))
+  )
+}
+
+im_cache_fingerprint <- function(f) {
+  md5 <- function(p) if (!is.null(p) && length(p) == 1 && file.exists(p)) unname(as.character(tools::md5sum(p))) else NA_character_
+  list(format = 1L, raw = md5(f), calendar = md5(preparedness_file), script = md5(THIS_SCRIPT_PATH))
+}
+
+im_cache_read <- function(f, fp) {
+  if (IM_REBUILD_ALL) return(NULL)
+  p <- im_cache_paths(f)
+  if (!all(file.exists(p$res, p$fp, p$final, p$qc))) return(NULL)
+  old <- tryCatch(readRDS(p$fp), error = function(e) NULL)
+  if (is.null(old) || !identical(old, fp) || anyNA(unlist(fp))) return(NULL)
+  res <- tryCatch(readRDS(p$res), error = function(e) NULL)
+  if (is.null(res) || is.null(res$data)) return(NULL)
+  res
+}
+
+im_cache_write <- function(f, fp, res) {
+  if (is.null(res) || is.null(res$data) || anyNA(unlist(fp))) return(invisible(FALSE))
+  p <- im_cache_paths(f)
+  ok <- tryCatch({
+    dir.create(IM_CACHE_DIR, recursive = TRUE, showWarnings = FALSE)
+    unlink(p$fp)                                   # a half-written cache must never validate
+    tmp <- paste0(p$res, ".tmp")
+    saveRDS(res, tmp)
+    file.rename(tmp, p$res)
+    saveRDS(fp, p$fp)
+    TRUE
+  }, error = function(e) { message("[cache] could not save ", p$id, ": ", conditionMessage(e)); FALSE })
+  invisible(ok)
+}
+
 process_im_file_or_isolate <- function(f, output_folder, qc_output_folder, lookup_table, this_script_path) {
   failure_result <- function(msg) {
     message("ERROR in file ", basename(f), ": ", msg)
@@ -5691,6 +5749,13 @@ process_im_file_or_isolate <- function(f, output_folder, qc_output_folder, looku
         max_date = as.Date(NA)
       )
     )
+  }
+
+  im_fp <- im_cache_fingerprint(f)
+  im_cached <- im_cache_read(f, im_fp)
+  if (!is.null(im_cached)) {
+    message(sprintf("[cache] %s unchanged since the last build (raw file, calendar and builder identical) -- reusing %s_result.rds, nothing reprocessed.", basename(f), tools::file_path_sans_ext(basename(f))))
+    return(im_cached)
   }
 
   message(sprintf(
@@ -5728,6 +5793,8 @@ process_im_file_or_isolate <- function(f, output_folder, qc_output_folder, looku
   if (is.null(isolated_res)) {
     return(failure_result("isolated Rscript process finished but produced no readable result."))
   }
+
+  im_cache_write(f, im_fp, isolated_res)
 
   isolated_res
 }
