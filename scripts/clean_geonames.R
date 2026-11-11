@@ -2053,6 +2053,35 @@ run_cleaning_pipeline <- function(
   log_info("STEP 9: Standardizing output column names")
   data <- standardize_columns(data)
 
+  # STEP 9.2: Align names with the AFRO geodatabase (AFROGDB) and add geo_code
+  # Runs after the legacy cleaning, so steps 3-9 keep working with the old spellings.
+  # The reference lives in the AFRO-Geo-Reference repository (set AFRO_GEO_REFERENCE_DIR to
+  # change the location). If it is not found the run continues without geo_code.
+  # No rows are dropped: several source units can map to one geodatabase district and
+  # each has its own results, so they are only counted.
+  log_info("STEP 9.2: Aligning names with the AFRO geodatabase")
+  ref_dir <- Sys.getenv("AFRO_GEO_REFERENCE_DIR", unset = file.path(dirname(BASE_DIR), "AFRO-Geo-Reference"))
+  std_file <- file.path(ref_dir, "R", "afrogdb_standardize.R")
+  if (file.exists(std_file)) {
+    tryCatch({
+      source(std_file, local = TRUE)
+      n_before <- nrow(data)
+      data <- afrogdb_standardize(
+        data, country = "country", province = "province", district = "district",
+        ref = afrogdb_reference(ref_dir), relaxed = FALSE, replace_names = TRUE, verbose = TRUE
+      )
+      unmatched <- attr(data, "unmatched")
+      if (!is.null(unmatched) && nrow(unmatched) > 0) {
+        log_warn("{nrow(unmatched)} districts are not in the geodatabase (see AFRO-Geo-Reference/reference/crosswalk_geonames.csv)")
+      }
+      log_info("Rows kept: {nrow(data)} of {n_before}")
+    }, error = function(e) {
+      log_warn("AFROGDB alignment skipped: {conditionMessage(e)}")
+    })
+  } else {
+    log_warn("AFROGDB reference not found at {ref_dir}; geo_code not added")
+  }
+
   # STEP 9.5: Validate before publishing
   # previous_record_count is read BEFORE generate_summary_stats() (STEP 10)
   # overwrites the summary file it comes from, so it reflects the LAST
