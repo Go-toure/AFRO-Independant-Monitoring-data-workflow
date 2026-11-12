@@ -2036,6 +2036,11 @@ run_cleaning_pipeline <- function(
   # STEP 3: Standardize country names
   log_info("STEP 3: Standardizing country names")
   data <- standardize_country_names(data)
+
+  # Keep the names as they were before the province/district rename rules of steps 4-5.
+  # STEP 9.2 matches both versions against AFROGDB and keeps the better result.
+  data$province_src <- data$province
+  data$district_src <- data$district
   
   # STEP 4: Apply province mappings
   log_info("STEP 4: Applying province name corrections")
@@ -2074,10 +2079,25 @@ run_cleaning_pipeline <- function(
     tryCatch({
       source(std_file, local = TRUE)
       n_before <- nrow(data)
-      data <- afrogdb_standardize(
-        data, country = "country", province = "province", district = "district",
-        ref = afrogdb_reference(ref_dir), relaxed = FALSE, replace_names = TRUE, verbose = TRUE
-      )
+      if (exists("afrogdb_standardize_best") && all(c("province_src", "district_src") %in% names(data))) {
+        # maximum match: current names and the names before the old rename rules, best result kept
+        data <- afrogdb_standardize_best(
+          data, alt_province = data$province_src, alt_district = data$district_src,
+          country = "country", province = "province", district = "district",
+          ref = afrogdb_reference(ref_dir), relaxed = FALSE, replace_names = TRUE, verbose = TRUE
+        )
+        conflicts <- attr(data, "conflicts")
+        if (!is.null(conflicts) && nrow(conflicts) > 0) {
+          conflicts_file <- file.path(BASE_DIR, "data", "processed", "geoname_conflicts_im.csv")
+          log_warn("{nrow(conflicts)} units match two different geodatabase units (current names kept); see {conflicts_file}")
+          try(utils::write.csv(conflicts, conflicts_file, row.names = FALSE), silent = TRUE)
+        }
+      } else {
+        data <- afrogdb_standardize(
+          data, country = "country", province = "province", district = "district",
+          ref = afrogdb_reference(ref_dir), relaxed = FALSE, replace_names = TRUE, verbose = TRUE
+        )
+      }
       unmatched <- attr(data, "unmatched")
       if (!is.null(unmatched) && nrow(unmatched) > 0) {
         log_warn("{nrow(unmatched)} districts are not in the geodatabase (see AFRO-Geo-Reference/reference/crosswalk_geonames.csv)")
@@ -2089,6 +2109,7 @@ run_cleaning_pipeline <- function(
   } else {
     log_warn("AFROGDB reference not found at {ref_dir}; geo_code not added")
   }
+  data <- data %>% select(-any_of(c("province_src", "district_src")))
 
   # STEP 9.5: Validate before publishing
   # previous_record_count is read BEFORE generate_summary_stats() (STEP 10)
