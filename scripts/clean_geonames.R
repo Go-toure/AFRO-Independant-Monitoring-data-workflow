@@ -1780,12 +1780,20 @@ apply_final_transformations <- function(data, start_date = START_DATE) {
     data <- data %>% mutate(year = year(round_start_date))
   }
   
+  # Ethiopia reports at woreda level (woreda / woreda_code columns); keep one row
+  # per woreda. For every other country these columns are absent and the key is unchanged.
+  woreda_part <- if ("woreda" %in% names(data)) {
+    paste(data$woreda, if ("woreda_code" %in% names(data)) data$woreda_code else "")
+  } else {
+    ""
+  }
   data <- data %>%
     mutate(
       im_unique_key = paste(
         country,
         province,
         district,
+        woreda_part,
         response,
         roundNumber,
         `vaccine.type`,

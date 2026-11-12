@@ -2609,6 +2609,47 @@ apply_ethiopia_6839_vaccine_override <- function(df) {
 # ============================================================
 # TRANSFORMATION FUNCTIONS
 # ============================================================
+# ============================================================
+# ETHIOPIA (form 6839): report at WOREDA level, not only zone
+# ------------------------------------------------------------
+# The Ethiopia IM form asks Region > Zone ("District") > Woreda ("facility").
+# Each zone + woreda pair typed on the form is linked to the OCHA woreda name
+# and code with AFRO-Geo-Reference/reference/ethiopia_im_facility_to_woreda.csv
+# (built from the GPS points). Pairs that do not agree with GPS stay unlinked:
+# they keep the name typed on the form and get no code.
+# Adds columns Woreda and Woreda_code; the zone stays in District.
+# Other forms are not touched.
+# ============================================================
+add_ethiopia_woreda_keys <- function(data) {
+  if (!all(c("District", "facility") %in% names(data))) {
+    message("[woreda] Ethiopia 6839: District/facility column missing -- woreda not added")
+    return(data)
+  }
+  norm_txt <- function(x) stringr::str_squish(toupper(as.character(x)))
+  zone <- norm_txt(data$District)
+  fac <- norm_txt(data$facility)
+  fac[!is.na(fac) & fac == ""] <- NA_character_
+  data$Woreda <- fac
+  data$Woreda_code <- NA_character_
+
+  ref_dir <- Sys.getenv("AFRO_GEO_REFERENCE_DIR",
+                        unset = file.path(dirname(base_dir), "AFRO-Geo-Reference"))
+  xw_file <- file.path(ref_dir, "reference", "ethiopia_im_facility_to_woreda.csv")
+  if (file.exists(xw_file)) {
+    xw <- data.table::fread(xw_file, colClasses = "character", encoding = "UTF-8", data.table = FALSE)
+    m <- match(paste(zone, fac, sep = "|"), paste(xw$zone_form, xw$facility_form, sep = "|"))
+    has <- !is.na(m) & nzchar(xw$woreda_pcode[m])
+    data$Woreda[has] <- xw$woreda[m[has]]
+    data$Woreda_code[has] <- xw$woreda_pcode[m[has]]
+    message(sprintf("[woreda] Ethiopia 6839: woreda code found for %.1f%% of records",
+                    100 * mean(has)))
+  } else {
+    message("[woreda] Woreda link file not found at ", xw_file,
+            " -- woreda names kept as typed on the form, no woreda code")
+  }
+  data
+}
+
 apply_country_specific_transformations <- function(data, file_name, qc_output_folder = NULL) {
   if (startsWith(file_name, "3550") || startsWith(file_name, "3583")) {
     data <- data %>% mutate(Country = "GHA")
@@ -2642,6 +2683,7 @@ apply_country_specific_transformations <- function(data, file_name, qc_output_fo
   # "HH[n]/HH/roundNumber" column names are still intact.
   if (startsWith(file_name, "6839")) {
     data <- derive_ethiopia_6839_response_round(data, qc_output_folder)
+    data <- add_ethiopia_woreda_keys(data)
   }
 
   data
@@ -3745,6 +3787,8 @@ process_im_chunk_to_partial <- function(data, file_name, qc_output_folder, activ
   data <- rename_repetitive_columns(data)
   
   columns_to_select <- select_columns_dynamically(data, required_columns, active_hh_patterns)
+  # Ethiopia 6839: keep the woreda columns added above (absent for every other form)
+  columns_to_select <- unique(c(columns_to_select, intersect(c("Woreda", "Woreda_code"), names(data))))
 
   # NOTE ON ORDER (select BEFORE filter, not after): [MEM] diagnostics from
   # production (2026-09-17) showed peak RSS roughly doubling-to-tripling at
@@ -4416,6 +4460,8 @@ process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_
   data <- rename_repetitive_columns(data)
   
   columns_to_select <- select_columns_dynamically(data, required_columns, active_hh_patterns)
+  # Ethiopia 6839: keep the woreda columns added above (absent for every other form)
+  columns_to_select <- unique(c(columns_to_select, intersect(c("Woreda", "Woreda_code"), names(data))))
 
   # NOTE ON ORDER (select BEFORE filter, not after): [MEM] diagnostics from
   # production (2026-09-17) showed peak RSS roughly doubling-to-tripling at
@@ -4583,7 +4629,7 @@ process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_
         NA_real_
       )
     ) %>%
-    group_by(Country, Region, District, Response, Vaccine.type, roundNumber) %>%
+    group_by(across(all_of(c("Country", "Region", "District", intersect(c("Woreda", "Woreda_code"), names(GL)), "Response", "Vaccine.type", "roundNumber")))) %>%
     summarise(
       start_date = min(start_date, na.rm = TRUE),
       end_date = max(end_date, na.rm = TRUE),
@@ -4749,6 +4795,7 @@ process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_
       country = Country,
       province = Region,
       district = District,
+      any_of(c(woreda = "Woreda", woreda_code = "Woreda_code")),
       response = Response,
       vaccine.type = Vaccine.type,
       roundNumber,
