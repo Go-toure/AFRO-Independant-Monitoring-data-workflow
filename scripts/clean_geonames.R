@@ -2066,6 +2066,48 @@ run_cleaning_pipeline <- function(
   log_info("STEP 9: Standardizing output column names")
   data <- standardize_columns(data)
 
+  # STEP 9.1: one old unit that AFROGDB now holds as several units.
+  # AFRO-Geo-Reference/reference/split_unit_links.csv lists, for such a unit, each AFROGDB unit it became.
+  # The row is repeated once per unit, so the old result is drawn on every new unit.
+  # Runs before step 9.2, which then finds each repeated row by its new name.
+  log_info("STEP 9.1: Applying split-unit links")
+  tryCatch({
+    split_ref_dir <- Sys.getenv("AFRO_GEO_REFERENCE_DIR", unset = file.path(dirname(BASE_DIR), "AFRO-Geo-Reference"))
+    split_file <- file.path(split_ref_dir, "reference", "split_unit_links.csv")
+    master_file <- file.path(split_ref_dir, "reference", "afrogdb_geoname_master.csv")
+    if (file.exists(split_file) && file.exists(master_file) &&
+        all(c("country", "province_src", "district_src") %in% names(data))) {
+      links <- readr::read_csv(split_file, col_types = readr::cols(.default = "c"), show_col_types = FALSE)
+      gdb <- readr::read_csv(master_file, col_types = readr::cols(.default = "c"), show_col_types = FALSE)
+      gdb <- gdb[gdb$level %in% "district", , drop = FALSE]
+      links$province <- gdb$province[match(links$geo_code, gdb$geo_code)]
+      links$district <- gdb$district[match(links$geo_code, gdb$geo_code)]
+      links <- links[!is.na(links$district), , drop = FALSE]
+      norm_key <- function(a, b, c) paste(toupper(trimws(a)), toupper(trimws(b)), toupper(trimws(c)), sep = "|")
+      key_data <- norm_key(data$country, data$province_src, data$district_src)
+      key_link <- norm_key(links$country, links$raw_province, links$raw_district)
+      hits <- lapply(key_data, function(k) which(key_link == k))
+      n_rep <- lengths(hits)
+      if (any(n_rep > 0)) {
+        data$.ord <- seq_len(nrow(data))
+        is_split <- n_rep > 0
+        split_rows <- data[is_split, , drop = FALSE]
+        expanded <- split_rows[rep(seq_len(nrow(split_rows)), n_rep[is_split]), , drop = FALSE]
+        li <- unlist(hits[is_split])
+        expanded$province <- links$province[li]
+        expanded$district <- links$district[li]
+        expanded$province_src <- expanded$province
+        expanded$district_src <- expanded$district
+        data <- dplyr::bind_rows(data[!is_split, , drop = FALSE], expanded) %>%
+          arrange(.ord) %>%
+          select(-.ord)
+        log_info("Split units: {sum(is_split)} rows repeated into {nrow(expanded)} rows")
+      }
+    }
+  }, error = function(e) {
+    log_warn("Split-unit links skipped: {conditionMessage(e)}")
+  })
+
   # STEP 9.2: Align names with the AFRO geodatabase (AFROGDB) and add geo_code
   # Runs after the legacy cleaning, so steps 3-9 keep working with the old spellings.
   # The reference lives in the AFRO-Geo-Reference repository (set AFRO_GEO_REFERENCE_DIR to
