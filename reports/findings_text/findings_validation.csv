@@ -1,0 +1,6 @@
+theme,field,mention_and_field,mention_no_field,nomention_and_field,nomention_no_field,share_field_given_mention,share_field_given_no_mention,lift
+ABSENT,absent,17951,10049,171372,1093402,0.641,0.135,4.75
+MISSED_CHILD_REPORTED,missed,30918,5606,237188,1052660,0.847,0.184,4.6
+NOT_VISITED,missed,5095,1652,263011,1056614,0.755,0.199,3.79
+NO_TEAM,noteam,419,1571,41627,1243367,0.211,0.032,6.59
+REFUSAL,refusal,6776,6020,29690,1250288,0.53,0.023,23.04

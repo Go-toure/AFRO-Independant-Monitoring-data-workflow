@@ -29,3 +29,6 @@ __pycache__/
 # Access codes (regional office only -- never commit)
 config/access_codes.private.csv
 *.private.csv
+
+# Monitors comments can contain names (local only)
+data/findings_local/
