@@ -32,3 +32,12 @@ config/access_codes.private.csv
 
 # Monitors comments can contain names (local only)
 data/findings_local/
+
+# Patch backups and scratch files (added 16 Nov 2026)
+*.bak*
+*.done
+_to_delete/
+scripts/_test_*.py
+
+# Access codes for the Shiny app: regional office only, never commit
+IM_ADMIN_CODES.txt
